@@ -1,0 +1,39 @@
+# Architecture Decision Records
+
+This directory contains Architecture Decision Records (ADRs) for Pursecraft.
+
+## Format
+
+Each ADR uses a lightweight Nygard-style format:
+
+- **Status** — Accepted / Superseded / Deprecated
+- **Date** — when the decision was made
+- **Context** — the forces at play and the problem being solved
+- **Decision** — what we chose
+- **Alternatives considered** — what we rejected and why
+- **Consequences** — what this decision implies, including trade-offs
+
+## Numbering
+
+Files are prefixed with a 4-digit padded, zero-based sequence number (`0001-...`).
+Numbers are never reused. Superseded ADRs keep their number and gain a link to
+their replacement.
+
+## Index
+
+| ADR | Title | Status |
+| --- | ----- | ------ |
+| [0001](0001-shared-rust-core.md) | Shared Rust core across all platforms | Accepted |
+| [0002](0002-rust-backend-over-elixir.md) | Rust (Axum) backend over Elixir | Accepted |
+| [0003](0003-native-mobile-over-flutter.md) | Native mobile (SwiftUI + Jetpack Compose) over Flutter | Accepted |
+| [0004](0004-tauri-for-desktop.md) | Tauri for desktop | Accepted |
+| [0005](0005-react-spa-for-web.md) | React SPA for web, no SSR | Accepted |
+| [0006](0006-integer-money.md) | Money as integers (milliunits) | Accepted |
+| [0007](0007-oplog-sync-protocol.md) | YNAB-style op-log sync protocol | Accepted |
+| [0008](0008-multiuser-day-one.md) | Multi-user budgets from day one | Accepted |
+| [0009](0009-e2ee-opaque-payloads.md) | E2EE with opaque server payloads | Accepted |
+| [0010](0010-no-bank-import.md) | No bank import — manual-first | Accepted |
+| [0011](0011-capture-first-mobile.md) | Capture-first mobile scope | Accepted |
+| [0012](0012-api-ecosystem.md) | CLI, MCP, webhooks, and direct API access | Accepted |
+| [0013](0013-deployment-topology.md) | Domains, hosting, and single-image deployment | Accepted |
+| [0014](0014-monorepo-and-fluxvale-cloud.md) | Monorepo layout and FluxVale-hosted cloud | Accepted |
