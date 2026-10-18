@@ -206,6 +206,9 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | jq -e 'to_entries | map("\(.key): \(.value.result)") | .[]' >&2
-          echo "$NEEDS" | jq -e '.["check-changes"].result == "success" and (del(.["check-changes"]) | all(.[]; .result == "success" or .result == "skipped"))' >/dev/null \
-            && echo "All CI checks passed or were not needed" \
-            || { echo "One or more CI jobs failed or were cancelled"; exit 1; }
+          if echo "$NEEDS" | jq -e '.["check-changes"].result == "success" and (del(.["check-changes"]) | all(.[]; .result == "success" or .result == "skipped"))' >/dev/null; then
+            echo "All CI checks passed or were not needed"
+          else
+            echo "One or more CI jobs failed or were cancelled"
+            exit 1
+          fi
