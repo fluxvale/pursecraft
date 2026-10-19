@@ -191,12 +191,14 @@ jobs:
 
       - run: scripts/ci/cli.sh
 
-  # Adding an app takes THREE edits here, and skipping any one of them removes
+  # Adding an app takes FOUR edits here, and skipping any one of them removes
   # the app from the required check silently (its job never runs, or runs
-  # ungated): (a) add it to the changes filters above, (b) add its per-app job,
-  # (c) add that job to wait-for-ci.needs below. New top-level files (a future
-  # Dockerfile, compose.yaml) match no filter today — add them to every
-  # relevant filter when they land, or their changes run nothing.
+  # ungated): (a) add it to the changes filters above, repeating the shared
+  # paths the existing core-consuming filters carry; (b) export that filter in
+  # check-changes.outputs above, or its job gate reads an empty string; (c) add
+  # the per-app job; (d) add that job to wait-for-ci.needs below. New top-level
+  # files (a future Dockerfile, compose.yaml) match no filter today — add them
+  # to every relevant filter when they land, or their changes run nothing.
   #
   # The umbrella: branch protection requires THIS check. Runs regardless of
   # path gating; passes when every gated job succeeded or was skipped.

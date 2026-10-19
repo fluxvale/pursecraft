@@ -20,8 +20,10 @@ the architecture can actually support.
 
 **Local-first, end-to-end-encrypted budgeting is the deliberate
 differentiator.** The pitch is ownership: it works offline, it syncs through a
-rendezvous the operator cannot read, and it never depends on third-party
-aggregation. The open-source, self-hostable release
+rendezvous that never needs plaintext — encrypted by default, with the switch
+offered only to self-hosters
+([ADR 0009](0009-e2ee-opaque-payloads.md)) — and it never depends on
+third-party aggregation. The open-source, self-hostable release
 ([ADR 0014](0014-monorepo-and-fluxvale-cloud.md)) is part of the same claim.
 
 **Server-first plus bank-sync aggregation is a different category, not the
