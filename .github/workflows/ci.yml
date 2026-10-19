@@ -1,0 +1,214 @@
+# Monorepo CI (ADR 0014): ONE workflow, a changes job (dorny/paths-filter),
+# per-app jobs gated on its outputs, and the umbrella "Wait for CI" job that
+# ALWAYS runs. Branch protection requires only "Wait for CI" — the one check
+# guaranteed present on every PR — so a path-skipped app can never leave a
+# required check pending.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read # paths-filter lists changed PR files via the API
+
+jobs:
+  check-changes:
+    name: Check for changes
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      api: ${{ steps.filter.outputs.api }}
+      cli: ${{ steps.filter.outputs.cli }}
+    steps:
+      # persist-credentials: false — later steps run no git-authenticated ops
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # pinned to commit — mutable tags execute unreviewed code
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
+        id: filter
+        with:
+          filters: |
+            core:
+              - "apps/core/**"
+              - "scripts/ci/core.sh"
+              - "scripts/ci/rust.sh"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "mise.toml"
+              - ".github/workflows/ci.yml"
+            api:
+              - "apps/api/**"
+              - "apps/core/**" # core is shared: a core change re-runs every consumer
+              - "scripts/ci/api.sh"
+              - "scripts/ci/rust.sh"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "mise.toml"
+              - ".github/workflows/ci.yml"
+            cli:
+              - "apps/cli/**"
+              - "apps/core/**" # core is shared: a core change re-runs every consumer
+              - "scripts/ci/cli.sh"
+              - "scripts/ci/rust.sh"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "mise.toml"
+              - ".github/workflows/ci.yml"
+
+  core:
+    name: Core CI
+    needs: check-changes
+    if: needs.check-changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # mise.toml is the single source of truth for tool versions; parse
+      # (not install) so CI and local dev can't drift (ADR 0014).
+      - name: Read Rust version from mise.toml
+        id: rust
+        run: |
+          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml)"
+          echo "rust=$version"
+          test -n "$version"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          components: rustfmt, clippy
+
+      # Self-keyed cargo cache (parsed rust version + Cargo.lock). Never
+      # cache ~/.rustup: a restored install marker without the toolchain
+      # makes later runs skip the install and fail on missing components.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-
+
+      - run: scripts/ci/core.sh
+
+  api:
+    name: API CI
+    needs: check-changes
+    if: needs.check-changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # mise.toml is the single source of truth for tool versions; parse
+      # (not install) so CI and local dev can't drift (ADR 0014).
+      - name: Read Rust version from mise.toml
+        id: rust
+        run: |
+          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml)"
+          echo "rust=$version"
+          test -n "$version"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          components: rustfmt, clippy
+
+      # Self-keyed cargo cache (parsed rust version + Cargo.lock). Never
+      # cache ~/.rustup: a restored install marker without the toolchain
+      # makes later runs skip the install and fail on missing components.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-
+
+      - run: scripts/ci/api.sh
+
+  cli:
+    name: CLI CI
+    needs: check-changes
+    if: needs.check-changes.outputs.cli == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # mise.toml is the single source of truth for tool versions; parse
+      # (not install) so CI and local dev can't drift (ADR 0014).
+      - name: Read Rust version from mise.toml
+        id: rust
+        run: |
+          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml)"
+          echo "rust=$version"
+          test -n "$version"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+          components: rustfmt, clippy
+
+      # Self-keyed cargo cache (parsed rust version + Cargo.lock). Never
+      # cache ~/.rustup: a restored install marker without the toolchain
+      # makes later runs skip the install and fail on missing components.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-
+
+      - run: scripts/ci/cli.sh
+
+  # The umbrella: branch protection requires THIS check. Runs regardless of
+  # path gating; passes when every gated job succeeded or was skipped.
+  # check-changes must SUCCEED, not merely skip: if it failed, its dependents
+  # read "skipped" and the all() below would pass on zero checks run.
+  wait-for-ci:
+    name: Wait for CI
+    needs: [check-changes, core, api, cli]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -e 'to_entries | map("\(.key): \(.value.result)") | .[]' >&2
+          if echo "$NEEDS" | jq -e '.["check-changes"].result == "success" and (del(.["check-changes"]) | all(.[]; .result == "success" or .result == "skipped"))' >/dev/null; then
+            echo "All CI checks passed or were not needed"
+          else
+            echo "One or more CI jobs failed or were cancelled"
+            exit 1
+          fi

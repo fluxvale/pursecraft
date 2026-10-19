@@ -102,7 +102,7 @@ thinly.
 - **Instructions.** `AGENTS.md` is canonical. Tools with their own entry-file
   convention get a symlink (e.g. `CLAUDE.md` → `AGENTS.md`), never a copy;
   tools that read `AGENTS.md` natively need nothing.
-- **Checks.** Each automated check lives once in `scripts/checks/` as a plain
+- **Checks.** Each automated check lives once in `scripts/ci/` as a plain
   runnable script. Tool hooks and plugins are thin adapters that invoke the
   scripts — never re-implement a check inline in a tool's config.
 - **Adapters only where supported.** Wire adapters only for tools with
