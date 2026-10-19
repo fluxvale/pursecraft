@@ -80,7 +80,7 @@ jobs:
       - name: Read Rust version from mise.toml
         id: rust
         run: |
-          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml)"
+          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
           echo "rust=$version"
           test -n "$version"
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -122,7 +122,7 @@ jobs:
       - name: Read Rust version from mise.toml
         id: rust
         run: |
-          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml)"
+          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
           echo "rust=$version"
           test -n "$version"
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -164,7 +164,7 @@ jobs:
       - name: Read Rust version from mise.toml
         id: rust
         run: |
-          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml)"
+          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
           echo "rust=$version"
           test -n "$version"
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -191,6 +191,13 @@ jobs:
 
       - run: scripts/ci/cli.sh
 
+  # Adding an app takes THREE edits here, and skipping any one of them removes
+  # the app from the required check silently (its job never runs, or runs
+  # ungated): (a) add it to the changes filters above, (b) add its per-app job,
+  # (c) add that job to wait-for-ci.needs below. New top-level files (a future
+  # Dockerfile, compose.yaml) match no filter today — add them to every
+  # relevant filter when they land, or their changes run nothing.
+  #
   # The umbrella: branch protection requires THIS check. Runs regardless of
   # path gating; passes when every gated job succeeded or was skipped.
   # check-changes must SUCCEED, not merely skip: if it failed, its dependents
@@ -205,7 +212,7 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo "$NEEDS" | jq -e 'to_entries | map("\(.key): \(.value.result)") | .[]' >&2
+          echo "$NEEDS" | jq -er 'to_entries | map("\(.key): \(.value.result)") | .[]' >&2
           if echo "$NEEDS" | jq -e '.["check-changes"].result == "success" and (del(.["check-changes"]) | all(.[]; .result == "success" or .result == "skipped"))' >/dev/null; then
             echo "All CI checks passed or were not needed"
           else
