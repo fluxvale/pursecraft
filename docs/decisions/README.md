@@ -37,3 +37,4 @@ their replacement.
 | [0012](0012-api-ecosystem.md) | CLI, MCP, webhooks, and direct API access | Accepted |
 | [0013](0013-deployment-topology.md) | Domains, hosting, and single-image deployment | Accepted |
 | [0014](0014-monorepo-and-fluxvale-cloud.md) | Monorepo layout and FluxVale-hosted cloud | Accepted |
+| [0015](0015-product-positioning.md) | Product positioning: local-first and E2EE | Accepted |
