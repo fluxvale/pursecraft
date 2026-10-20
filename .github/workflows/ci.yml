@@ -42,6 +42,7 @@ jobs:
               - "apps/core/**"
               - "scripts/ci/core.sh"
               - "scripts/ci/rust.sh"
+              - "clippy.toml" # float guard (ADR 0006) applies to every Rust package
               - "Cargo.toml"
               - "Cargo.lock"
               - "mise.toml"
@@ -51,6 +52,7 @@ jobs:
               - "apps/core/**" # core is shared: a core change re-runs every consumer
               - "scripts/ci/api.sh"
               - "scripts/ci/rust.sh"
+              - "clippy.toml"
               - "Cargo.toml"
               - "Cargo.lock"
               - "mise.toml"
@@ -60,6 +62,7 @@ jobs:
               - "apps/core/**" # core is shared: a core change re-runs every consumer
               - "scripts/ci/cli.sh"
               - "scripts/ci/rust.sh"
+              - "clippy.toml"
               - "Cargo.toml"
               - "Cargo.lock"
               - "mise.toml"

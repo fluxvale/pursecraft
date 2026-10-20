@@ -1,0 +1,7 @@
+# ADR 0006: money is integer milliunits — floats are denied workspace-wide so
+# float leakage near amounts (or anywhere else) fails clippy, which CI runs
+# with -D warnings.
+disallowed-types = [
+    { path = "f32", reason = "no floats: ADR 0006 integer money" },
+    { path = "f64", reason = "no floats: ADR 0006 integer money" },
+]
