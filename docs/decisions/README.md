@@ -38,3 +38,4 @@ their replacement.
 | [0013](0013-deployment-topology.md) | Domains, hosting, and single-image deployment | Accepted |
 | [0014](0014-monorepo-and-fluxvale-cloud.md) | Monorepo layout and FluxVale-hosted cloud | Accepted |
 | [0015](0015-product-positioning.md) | Product positioning: local-first and E2EE | Accepted |
+| [0016](0016-core-domain-model.md) | Core domain model: entities, fields, and op mapping | Accepted |
