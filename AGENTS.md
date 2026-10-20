@@ -65,6 +65,9 @@ Planning and task tracking live in GitHub issues at
 - **Hostile subagent review.** Before opening a PR, start a subagent to review
   the pending work adversarially — bugs, edge cases, security issues, scope
   creep, ADR violations. Fix what it finds before the PR goes up.
+- **Re-review deltas.** Any commit pushed after the hostile review — including
+  fixes it demanded — gets a delta re-check (same reviewer, fresh diff) before
+  the merge is requested. A green CI run is not a review.
 - **Run CI locally.** Run the exact tools CI runs (lint, typecheck, format,
   tests) and make them pass before opening a PR. CI is the last check, never
   the first.
