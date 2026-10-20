@@ -47,9 +47,13 @@ pub struct EntityRecord {
     pub stamps: BTreeMap<Field, WriteStamp>,
 }
 
-/// Budget state materialized from applied ops.
+/// Budget state materialized from applied ops. A state is single-budget
+/// ([ADR 0008]): the first applied op fixes its budget, and ops scoped to
+/// any other budget are rejected — cross-budget resolution is structurally
+/// impossible (ADR 0016).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct BudgetState {
+    budget: Option<BudgetId>,
     entities: HashMap<EntityId, EntityRecord>,
     seen_ops: HashSet<OpId>,
 }
@@ -73,11 +77,11 @@ pub enum ApplyError {
     KindMismatch { kind: EntityKind, field: Field },
     /// The value type does not match the field.
     ValueMismatch { field: Field, value: Value },
-    /// The op scopes the entity into a different budget than it was
-    /// materialized in (ADR 0008).
+    /// The op is scoped to a budget other than this state's
+    /// ([ADR 0008]).
     BudgetMismatch {
         op_budget: BudgetId,
-        entity_budget: BudgetId,
+        state_budget: BudgetId,
     },
 }
 
@@ -92,9 +96,12 @@ impl fmt::Display for ApplyError {
             }
             Self::BudgetMismatch {
                 op_budget,
-                entity_budget,
+                state_budget,
             } => {
-                write!(f, "op budget {op_budget} ≠ entity budget {entity_budget}")
+                write!(
+                    f,
+                    "op budget {op_budget} does not belong to budget state {state_budget}"
+                )
             }
         }
     }
@@ -125,6 +132,15 @@ impl BudgetState {
                 value: op.value,
             });
         }
+        // Single-budget state (ADR 0008): the first applied op fixes it.
+        if let Some(state_budget) = self.budget
+            && state_budget != op.budget_id
+        {
+            return Err(ApplyError::BudgetMismatch {
+                op_budget: op.budget_id,
+                state_budget,
+            });
+        }
 
         let record = self
             .entities
@@ -137,12 +153,6 @@ impl BudgetState {
             return Err(ApplyError::KindMismatch {
                 kind: op.entity_kind,
                 field: op.field,
-            });
-        }
-        if record.entity.budget_id() != op.budget_id {
-            return Err(ApplyError::BudgetMismatch {
-                op_budget: op.budget_id,
-                entity_budget: record.entity.budget_id(),
             });
         }
 
@@ -160,6 +170,9 @@ impl BudgetState {
             record.stamps.insert(op.field, incoming);
             Applied::Applied
         };
+        if self.budget.is_none() {
+            self.budget = Some(op.budget_id);
+        }
         self.seen_ops.insert(op.op_id);
         Ok(outcome)
     }
@@ -719,6 +732,77 @@ mod tests {
             state.apply(foreign),
             Err(ApplyError::BudgetMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn state_is_single_budget() {
+        let mut state = BudgetState::new();
+        let (field, value) = amount_field(1);
+        assert_eq!(
+            state.apply(txn_op(1, 10, 0, field, value)),
+            Ok(Applied::Applied)
+        );
+        // A fresh-id op for another budget is rejected too — a BudgetState
+        // is one budget (ADR 0008), so resolution can never leak across
+        // budgets via fallback categories or accounts.
+        let mut foreign = txn_op(
+            2,
+            20,
+            0,
+            Field::Transaction(TransactionField::Memo),
+            Value::Text("x".into()),
+        );
+        foreign.entity_id = EntityId::new(v7(MS_BASE, 999)).unwrap();
+        foreign.budget_id = BudgetId::new(v7(9, 9)).unwrap();
+        assert!(matches!(
+            state.apply(foreign),
+            Err(ApplyError::BudgetMismatch { .. })
+        ));
+        assert_eq!(
+            state.entities().count(),
+            1,
+            "a foreign-budget op must not materialize anything"
+        );
+    }
+
+    #[test]
+    fn stamp_order_is_hlc_first_then_op_id() {
+        // Decorrelate op_id from HLC: the older-HLC write carries the
+        // HIGHER op_id and must still lose — op_id only breaks equal-HLC
+        // ties (ADR 0016).
+        let (field, _) = amount_field(0);
+        let mut old_hlc_big_id = txn_op(
+            9,
+            10,
+            0,
+            field,
+            Value::Milliunits(Milliunits::from_milli(1)),
+        );
+        old_hlc_big_id.op_id = OpId::new(v7(9_999, 9)).unwrap();
+        let mut new_hlc_small_id = txn_op(
+            1,
+            20,
+            0,
+            field,
+            Value::Milliunits(Milliunits::from_milli(2)),
+        );
+        new_hlc_small_id.op_id = OpId::new(v7(1, 1)).unwrap();
+        assert!(old_hlc_big_id.op_id > new_hlc_small_id.op_id);
+        assert!(old_hlc_big_id.hlc < new_hlc_small_id.hlc);
+        for order in [
+            vec![old_hlc_big_id.clone(), new_hlc_small_id.clone()],
+            vec![new_hlc_small_id.clone(), old_hlc_big_id.clone()],
+        ] {
+            let mut state = BudgetState::new();
+            for op in order {
+                state.apply(op).unwrap();
+            }
+            assert_eq!(
+                txn_entity(&state).amount,
+                Some(Milliunits::from_milli(2)),
+                "HLC must dominate the op_id tiebreak"
+            );
+        }
     }
 
     #[test]

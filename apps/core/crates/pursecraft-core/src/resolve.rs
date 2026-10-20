@@ -99,6 +99,7 @@ fn payee_alive(state: &BudgetState, id: PayeeId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::date::Month;
     use crate::domain::{
         AccountField, CategoryField, CategoryGroupField, EntityKind, Field, MonthCategoryField,
         TransactionField, Value,
@@ -407,6 +408,27 @@ mod tests {
         let mut orphan = mid.clone();
         orphan.group_id = Some(CategoryGroupId::new(v7(100, 654)).unwrap());
         assert_eq!(category_group(&fx.state, &orphan), None);
+    }
+
+    #[test]
+    fn transaction_without_an_account_is_hidden() {
+        let fx = fx_with_categories();
+        let txn = Fixture::synthetic_txn(Some(category_id(CAT_MID)));
+        assert!(!transaction_visible(&fx.state, &txn));
+    }
+
+    #[test]
+    fn month_cell_without_a_category_is_hidden() {
+        let fx = fx_with_categories();
+        let cell = MonthCategory {
+            id: MonthCategoryId::new(v7(100, CELL_RAND)).unwrap(),
+            budget_id: budget(),
+            deleted: false,
+            month: Some(Month::new(2026, 10).unwrap()),
+            category_id: None,
+            budgeted: Some(Milliunits::ZERO),
+        };
+        assert!(!month_category_visible(&fx.state, &cell));
     }
 
     #[test]

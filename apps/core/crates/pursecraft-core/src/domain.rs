@@ -141,43 +141,6 @@ impl Entity {
         }
     }
 
-    pub fn entity_id(&self) -> EntityId {
-        let uuid = match self {
-            Self::Budget(e) => e.id.as_uuid(),
-            Self::Account(e) => e.id.as_uuid(),
-            Self::CategoryGroup(e) => e.id.as_uuid(),
-            Self::Category(e) => e.id.as_uuid(),
-            Self::Payee(e) => e.id.as_uuid(),
-            Self::Transaction(e) => e.id.as_uuid(),
-            Self::MonthCategory(e) => e.id.as_uuid(),
-        };
-        EntityId::from_raw(uuid)
-    }
-
-    pub const fn budget_id(&self) -> BudgetId {
-        match self {
-            Self::Budget(e) => e.budget_id,
-            Self::Account(e) => e.budget_id,
-            Self::CategoryGroup(e) => e.budget_id,
-            Self::Category(e) => e.budget_id,
-            Self::Payee(e) => e.budget_id,
-            Self::Transaction(e) => e.budget_id,
-            Self::MonthCategory(e) => e.budget_id,
-        }
-    }
-
-    pub const fn deleted(&self) -> bool {
-        match self {
-            Self::Budget(e) => e.deleted,
-            Self::Account(e) => e.deleted,
-            Self::CategoryGroup(e) => e.deleted,
-            Self::Category(e) => e.deleted,
-            Self::Payee(e) => e.deleted,
-            Self::Transaction(e) => e.deleted,
-            Self::MonthCategory(e) => e.deleted,
-        }
-    }
-
     /// An all-`None`, not-deleted entity of `kind` — materialized by the
     /// first op that targets `id` (ADR 0016).
     pub(crate) fn shell(kind: EntityKind, id: EntityId, budget_id: BudgetId) -> Self {

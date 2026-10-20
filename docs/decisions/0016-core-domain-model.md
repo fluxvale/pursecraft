@@ -71,6 +71,10 @@ cleared). The server-visible form is metadata only (`op_id`, `device_id`,
 ### Application semantics
 
 - **Idempotence:** ops are deduplicated by `op_id`; a replayed op is a no-op.
+- **Single-budget state:** a `BudgetState` is scoped to one budget — the
+  first applied op fixes it, and ops for any other budget are rejected
+  loudly (the core-side mirror of [ADR 0008]'s server scoping, making
+  cross-budget resolution leaks structurally impossible).
 - **Per-field LWW:** each entity keeps a write stamp `(hlc, op_id)` per field.
   An op with a strictly greater stamp wins; otherwise it is stale and ignored.
   Ties on identical HLC are impossible to see twice (same `op_id` → dedupe),
@@ -78,8 +82,8 @@ cleared). The server-visible form is metadata only (`op_id`, `device_id`,
   on every device, since all replicas compare the same pairs.
 - **Materialization:** an op targeting an unknown id creates a shell entity
   of the op's kind (all fields `None`, not deleted); the field write then
-  applies. A later op whose kind or `budget_id` disagrees with the existing
-  entity is rejected loudly (corruption, not merged).
+  applies. A later op whose kind disagrees with the existing entity is
+  rejected loudly (corruption, not merged).
 - **Type mismatches** (field vs value kind, field vs entity kind) are errors,
   never silent drops.
 
@@ -155,5 +159,7 @@ storage.
   encrypt.
 - Stored state stays faithful to the op log; resolution is a pure projection,
   so it can change without migrating data.
+- Single-budget state means resolution can never re-parent into another
+  budget, whatever a buggy client feeds the core.
 - Equal-HLC ties resolve by `op_id` randomness — deterministic everywhere,
   not "fair"; accepted and documented.

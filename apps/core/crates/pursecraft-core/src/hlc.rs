@@ -15,11 +15,6 @@ pub struct Hlc {
 }
 
 impl Hlc {
-    pub const MAX: Self = Self {
-        physical_ms: u64::MAX,
-        logical: u32::MAX,
-    };
-
     pub fn now() -> Self {
         Self {
             physical_ms: unix_ms_now(),
@@ -45,20 +40,22 @@ impl Hlc {
         }
     }
 
-    /// Receive `remote`: strictly greater than both `self` and `remote`.
+    /// Receive `remote`: strictly greater than both `self` and `remote`;
+    /// when the wall clock dominates both, the logical counter resets to
+    /// zero (canonical HLC).
     pub fn merge(&mut self, remote: Hlc) {
         let now = unix_ms_now();
         let physical = self.physical_ms.max(remote.physical_ms).max(now);
-        let logical = if physical == self.physical_ms && physical == remote.physical_ms {
-            self.logical.max(remote.logical)
+        let bump = |l: u32| l.checked_add(1).expect("HLC exhausted");
+        self.logical = if physical == self.physical_ms && physical == remote.physical_ms {
+            bump(self.logical.max(remote.logical))
         } else if physical == self.physical_ms {
-            self.logical
+            bump(self.logical)
         } else if physical == remote.physical_ms {
-            remote.logical
+            bump(remote.logical)
         } else {
             0
         };
-        self.logical = logical.checked_add(1).expect("HLC exhausted");
         self.physical_ms = physical;
     }
 }
@@ -103,7 +100,6 @@ mod tests {
         };
         assert!(early < later_same_ms);
         assert!(later_same_ms < next_ms);
-        assert!(Hlc::MAX > next_ms);
     }
 
     #[test]
@@ -163,6 +159,30 @@ mod tests {
             logical: 4,
         });
         assert_eq!(a.logical, 10);
+    }
+
+    #[test]
+    fn merge_resets_logical_when_wall_clock_dominates() {
+        // Tiny synthetic clocks lose to the real wall clock, which pins the
+        // canonical reset: fresh millisecond, logical counter to zero.
+        let mut a = Hlc {
+            physical_ms: 0,
+            logical: 7,
+        };
+        let before = a;
+        a.merge(Hlc {
+            physical_ms: 0,
+            logical: 3,
+        });
+        assert!(a > before);
+        assert!(
+            a > Hlc {
+                physical_ms: 0,
+                logical: 3
+            }
+        );
+        assert_eq!(a.logical, 0);
+        assert!(a.physical_ms > 1_000_000);
     }
 
     #[test]
