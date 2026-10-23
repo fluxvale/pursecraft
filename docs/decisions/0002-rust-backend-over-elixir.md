@@ -29,6 +29,6 @@ domain logic are literally the same code as the clients.
 - One budget engine everywhere; server-side validation uses the same code as
   clients.
 - Single-binary/self-contained deployment makes self-hosting trivial — a key
-  selling point for the open-source release.
+  selling point for the source-available release.
 - Slower backend iteration; acceptable because the backend is intentionally
   thin (store, order, relay).

@@ -2,7 +2,7 @@
 
 Instructions for AI coding agents working in this repository.
 
-Pursecraft is an offline-first, open-source budgeting app (YNAB-style) with a
+Pursecraft is an offline-first, source-available budgeting app (YNAB-style) with a
 shared Rust core, native mobile apps, a React SPA, and a self-hostable Axum
 backend. Before making architectural decisions, read `docs/decisions/` — the
 ADRs record what was decided, why, and which alternatives were rejected. Do not
