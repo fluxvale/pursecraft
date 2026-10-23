@@ -26,8 +26,7 @@ frames in one file:
 - **Header** (20 bytes): magic `PCOPLOG\0`; u16 format version (1); u16
   reserved — zero today, and a future extension must set it, because
   readers refuse a set reserved word rather than misread the file; and the
-  **commit marker**: the highest committed sequence as `[seq u32][!seq
-  u32]` (see durability below).
+  **two-phase commit marker** (see durability below).
 - **Frame**: u32 body length, u64 FNV-1a-64 over the body, body.
 - **Body**: JSON `{ "seq", "meta", "payload" }` — the record's canonical
   sequence (a repair can leave gaps, so sequences cannot be re-derived
@@ -69,51 +68,73 @@ designed behavior for a bad op inside any delta (ADR 0017: the first
 failing op aborts the delta, the cursor stops, retrying reproduces the
 error). Capture mints ops through `BudgetState::apply` and cannot mint
 them; a hostile member feeding them is the transport/auth slice's
-problem — the same posture as ADR 0017's HLC poisoning.
+problem — the same posture as ADR 0017's HLC poisoning. The wedge
+localizes deterministically: applying `delta_since(0)` one op at a time
+finds the first failing op, and its sequence comes from the delta.
 
 ### Durability, atomicity, recovery
 
-- **Commit:** an append writes its frame at the log's end, writes the
-  commit marker (the sequence being assigned) into the header, and issues
-  ONE `sync_data`. Frame and marker land or neither does. The marker's
-  `[seq][!seq]` shape makes a torn marker write detectable — and safely
-  ignorable, because a torn marker means its commit never acked.
+- **Commit, in two phases.** An append writes its frame at the log's end
+  plus a PENDING marker `[seq][seq]` in the header under one `sync_data`,
+  then writes the COMMITTED marker `[seq][!seq]` under a second. fsync is
+  a durability barrier, not an atomic multi-write — the protocol does not
+  pretend otherwise — so a durable COMMITTED marker implies its frame was
+  durable first, and a PENDING or torn marker grants nothing: its commit
+  never acked. The sequence space never rewinds below what was
+  acknowledged.
 - **Torn tail vs corruption, by resync:** the first frame that is short,
-  overruns the file, or checksums bad is classified by scanning for a
-  checksum-valid frame chain that starts anywhere after it and runs
-  exactly to EOF. Such a chain proves the writer produced frames beyond
-  the damage — **mid-file corruption, loud** (`StoreError::Corrupt`, file
-  untouched). No chain after it is the crash window's uncommitted tail:
-  **truncate to the last good frame, sync, continue.** A damaged length
-  field therefore can never silently destroy the committed frames after
-  it.
+  overruns the file, or checksums bad is classified by scanning for ANY
+  checksum-valid frame starting after it. Checksum-valid framing cannot
+  occur inside a torn write's bytes or crash garbage (a 64-bit
+  collision), so one frame proves the writer produced frames beyond the
+  damage — **mid-file corruption, loud** (`StoreError::Corrupt`, file
+  untouched). No valid frame after it is the crash window's uncommitted
+  tail: **truncate to the last good frame, sync, continue.** A stray
+  trailing byte — the crash artifact delayed allocation leaves — cannot
+  disguise corruption as a torn tail, and a damaged length field can
+  never silently destroy the committed frames after it.
 - A full frame whose checksum passes but whose body does not decode is
   loud corruption — the writer never frames such bytes.
-- **Sequences are never reused.** Boot resumes the sequence space at
-  `max(loaded tip, commit marker) + 1`. A crash-torn uncommitted tail
-  leaves the marker equal to the tip — re-sequencing stays dense. Damage
-  to *committed* frames (bit rot — outside the crash model, but detected
-  by the checksums) leaves the marker above the tip: the store resumes
-  above the marker, leaving a gap at the lost sequences. A caught-up
-  client still receives everything appended after; a client behind stalls
-  visibly at the gap — ADR 0017's designed stall, whose sanctioned repair
-  is the compaction slice's bootstrap, never silent reuse.
-- **Header rules:** a strict magic prefix, a short file, or version 0
-  with no marker is a torn create — recreated, since no committed data
-  can predate the header fsync. A magic mismatch is foreign, refused,
-  never clobbered (`StoreError::Foreign`). Any other version or a set
-  reserved word is unsupported, refused loudly
-  (`StoreError::UnsupportedVersion`).
-- **Rollback:** a failed durable append restores the previous marker,
+- **Sequences are never reused.** Records carry their canonical sequence
+  (strictly increasing, 1-based, within the u32 marker's reach — boot
+  validates this and refuses tampering), and boot resumes the sequence
+  space above the maximum of the committed marker and every sequence a
+  record on disk claims. A crash-torn uncommitted tail stays dense; a
+  crash between the phases stays dense (pending grants nothing; an
+  unsynced-but-complete frame counts); damage to *committed* frames (bit
+  rot — outside the crash model, but detected by the checksums) leaves
+  the marker above the surviving records: the store resumes above it,
+  leaving a gap at the lost sequences. A caught-up client still receives
+  everything appended after; a client behind stalls visibly at the gap —
+  ADR 0017's designed stall, whose sanctioned repair is the compaction
+  slice's bootstrap, never silent reuse.
+- **Header rules:** a strict magic prefix, a short file, or a zero
+  version is a torn create — recreated, since no committed data can
+  predate the header fsync. A magic mismatch is foreign, refused, never
+  clobbered (`StoreError::Foreign`). Any other version, or a set
+  reserved word, is unsupported — refused loudly at any file length,
+  checked the moment the bytes are readable and before any recreate
+  decision (`StoreError::UnsupportedVersion`).
+- **Rollback:** a phase-one failure restores the previous marker,
   truncates to the committed boundary, and syncs; if even that fails the
-  store is poisoned and refuses appends until reopened. The in-memory log
-  never gains an op the disk refused. A file that no longer ends at the
-  committed boundary (the single-writer contract broken) is refused
-  loudly at append rather than written into.
-- **Honest residual:** a torn final write whose damaged length or marker
-  bytes happen to decode misleadingly (bounded, and requiring byte
-  patterns at the u32 extremes) can present as corruption or a phantom
-  gap — both visible failures, never silent truncation or reuse.
+  store is poisoned and refuses appends until reopened. A phase-two
+  failure keeps the durable frame — boot resolves any marker state — and
+  reports the failed ack. The in-memory log never gains an op the disk
+  refused. A file that no longer ends at the committed boundary (the
+  single-writer contract broken) is refused loudly at append rather than
+  written into.
+- **External whole-file destruction:** a file truncated into the header
+  (a partial restore or copy, not a crash state — committed bytes
+  survive crashes) destroys the sequence memory with it; the path starts
+  a fresh 1-based space. Peers that held the old log keep their state;
+  reconciling that divergence is the transport slice's epoch/freshness
+  concern.
+- **Honest residual:** a torn write whose damaged bytes happen to decode
+  misleadingly (bounded, and requiring patterns at the u32 extremes) can
+  present as corruption or a phantom gap — both visible failures, never
+  silent truncation or reuse. Crafted (not crashed) bytes can make the
+  resync scan quadratic — a local-file concern under the single-writer
+  contract, not a protocol property.
 
 Single writer per path is the caller's contract this slice (the app shell
 owns process singleness); locking is deferred with the browser/transport
@@ -152,8 +173,9 @@ extension.
 Snapshots and compaction (ADR 0007) — the frame format, reserved header
 word, and explicit record sequences do not preclude them; the browser
 storage adapter (IndexedDB over the same framed bytes); at-rest E2EE (it
-wraps the existing choke point); batched multi-op commits;
-concurrent-writer locking; server/API storage.
+wraps the existing choke point); batched multi-op commits (one
+pending/committed pair per batch would halve the syncs); concurrent-writer
+locking; server/API storage.
 
 ## Alternatives considered
 
@@ -185,11 +207,12 @@ concurrent-writer locking; server/API storage.
   bytes can hold a store.
 - `op_id` dedupe on boot collapses a duplicated record to the first — the
   E2EE-safe rule (a re-encrypted retry carries different payload bytes
-  and must dedupe). The loud same-id-different-content check lives at
-  apply time, where plaintext always exists, and fires on replicas that
-  *receive* both variants; one log's dedupe never shows both to its own
-  state. Duplicated records cannot be written through the API — only
-  tampering produces them.
+  and must dedupe). Identical duplicated bytes also collide on sequence
+  and fail the boot-time increase check loudly; the crafted
+  different-sequence shape collapses, and the space still resumes above
+  every sequence any record claimed. Duplicated records cannot be written
+  through the API — only tampering produces them.
+- An append costs two fsyncs — one per phase; batching is deferred.
 - Records are bounded by the u32 frame length (and the commit marker by
   u32 sequences); a 32-bit target, which reads the whole file at boot,
   cannot open stores approaching 4 GiB. Both limits are far beyond one

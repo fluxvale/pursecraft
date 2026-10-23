@@ -143,8 +143,9 @@ impl OpLog {
         self.ops.iter().skip_while(move |s| s.seq <= since)
     }
 
-    /// The highest assigned sequence — the high-water mark clients compare
-    /// their cursor against.
+    /// The highest sequence in the log — the high-water mark clients
+    /// compare their cursor against. (Sequences strictly increase, so
+    /// the last record holds the maximum.)
     pub fn tip(&self) -> u64 {
         self.ops.last().map(|s| s.seq).unwrap_or(0)
     }

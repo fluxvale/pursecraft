@@ -41,33 +41,56 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The commit marker: the highest sequence whose frame-and-marker write
-/// was synced (ADR 0018). Stored as `[seq][!seq]` so a torn marker write
-/// is detectable — and safely ignored, because a torn marker means the
-/// commit never acked.
-fn marker_bytes(seq: u64) -> Result<[u8; 8], StoreError> {
+/// The two-phase commit marker in the header (ADR 0018). `[seq][!seq]`
+/// commits through `seq` — and, because phase two only runs after phase
+/// one's sync, a durable committed marker implies its frame was durable
+/// first. `[seq][seq]` is phase one's PENDING marker: it grants nothing,
+/// because a crash can tear either phase (fsync is a durability barrier,
+/// not an atomic multi-write). Anything else is a torn write.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Marker {
+    Committed(u64),
+    Pending(u64),
+    Torn,
+}
+
+fn marker_bytes(marker: Marker) -> Result<[u8; 8], StoreError> {
+    let seq = match marker {
+        Marker::Committed(seq) | Marker::Pending(seq) => seq,
+        Marker::Torn => unreachable!("a torn marker is never encoded"),
+    };
     let seq = u32::try_from(seq).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "store sequence exceeds the u32 commit marker",
         )
     })?;
-    let mut marker = [0u8; 8];
-    marker[..4].copy_from_slice(&seq.to_le_bytes());
-    marker[4..].copy_from_slice(&(!seq).to_le_bytes());
-    Ok(marker)
+    let other = match marker {
+        Marker::Committed(_) => !seq,
+        Marker::Pending(_) => seq,
+        Marker::Torn => unreachable!(),
+    };
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&seq.to_le_bytes());
+    bytes[4..].copy_from_slice(&other.to_le_bytes());
+    Ok(bytes)
 }
 
-/// The commit marker, if it is intact. `None` means torn or absent — the
-/// commit it belonged to never acked, so boot resumes from the loaded
-/// frames alone (ADR 0018).
-fn parse_marker(bytes: &[u8]) -> Option<u64> {
+/// The marker, as the header holds it. `Torn` covers absent and torn
+/// writes alike — neither grants anything.
+fn parse_marker(bytes: &[u8]) -> Marker {
     if bytes.len() < 8 {
-        return None;
+        return Marker::Torn;
     }
     let seq = u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes"));
-    let inverted = u32::from_le_bytes(bytes[4..].try_into().expect("4 bytes"));
-    (seq == !inverted).then_some(u64::from(seq))
+    let other = u32::from_le_bytes(bytes[4..].try_into().expect("4 bytes"));
+    if seq == !other {
+        Marker::Committed(u64::from(seq))
+    } else if seq == other {
+        Marker::Pending(u64::from(seq))
+    } else {
+        Marker::Torn
+    }
 }
 
 /// One stored op: its canonical sequence (a repair can leave gaps, so
@@ -152,41 +175,34 @@ fn scan_frame(bytes: &[u8], offset: usize) -> Scan {
     }
 }
 
-/// Whether a checksum-valid frame chain starts somewhere after `from` and
-/// runs exactly to EOF — proof that the writer produced frames beyond
-/// `from`, so damage at `from` is mid-file corruption, not the torn tail
-/// (ADR 0018). Bodies need not decode for this decision: valid framing
-/// alone is writer structure.
-fn valid_chain_follows(bytes: &[u8], from: usize) -> bool {
-    (from..bytes.len()).any(|start| chain_reaches_eof(bytes, start))
+/// Whether a checksum-valid frame starts somewhere after `from` — proof
+/// that the writer produced frames beyond `from`, so damage at `from` is
+/// mid-file corruption, not the torn tail (ADR 0018). Checksum-valid
+/// framing cannot occur inside a torn write's bytes or crash garbage (a
+/// 64-bit collision), so ONE frame is proof — which is why a stray
+/// trailing byte, the crash artifact delayed allocation leaves, cannot
+/// disguise corruption as a torn tail.
+fn valid_frame_follows(bytes: &[u8], from: usize) -> bool {
+    (from..bytes.len()).any(|start| frame_valid_at(bytes, start))
 }
 
-fn chain_reaches_eof(bytes: &[u8], start: usize) -> bool {
-    let mut offset = start;
-    let mut frames = 0;
-    while offset < bytes.len() {
-        let remaining = bytes.len() - offset;
-        if remaining < FRAME_OVERHEAD {
-            return false;
-        }
-        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("length field"));
-        if u64::from(len) > (remaining - FRAME_OVERHEAD) as u64 {
-            return false;
-        }
-        let end = offset + FRAME_OVERHEAD + len as usize;
-        let body = &bytes[offset + FRAME_OVERHEAD..end];
-        let checksum = u64::from_le_bytes(
-            bytes[offset + 4..offset + FRAME_OVERHEAD]
-                .try_into()
-                .expect("checksum field"),
-        );
-        if fnv1a64(body) != checksum {
-            return false;
-        }
-        offset = end;
-        frames += 1;
+fn frame_valid_at(bytes: &[u8], start: usize) -> bool {
+    let remaining = bytes.len() - start;
+    if remaining < FRAME_OVERHEAD {
+        return false;
     }
-    offset == bytes.len() && frames > 0
+    let len = u32::from_le_bytes(bytes[start..start + 4].try_into().expect("length field"));
+    if u64::from(len) > (remaining - FRAME_OVERHEAD) as u64 {
+        return false;
+    }
+    let end = start + FRAME_OVERHEAD + len as usize;
+    let body = &bytes[start + FRAME_OVERHEAD..end];
+    let checksum = u64::from_le_bytes(
+        bytes[start + 4..start + FRAME_OVERHEAD]
+            .try_into()
+            .expect("checksum field"),
+    );
+    fnv1a64(body) == checksum
 }
 
 /// A store failure — foreign, corrupt, or future-version stores fail
@@ -290,7 +306,8 @@ pub struct LocalStore {
     /// The file length the last successful commit covers — the boundary a
     /// failed append rolls back to.
     durable_len: u64,
-    /// The last committed sequence — what the header marker holds.
+    /// The last acknowledged sequence — what the header's committed
+    /// marker holds (or would).
     hwm: u64,
     /// Set when a failed append could not roll back (ADR 0018).
     poisoned: bool,
@@ -320,51 +337,79 @@ impl LocalStore {
                 path: path.to_owned(),
             });
         }
-        if bytes.len() < HEADER_LEN {
-            Self::recreate(&mut file)?;
-            return Ok(Self::empty(path, file));
-        }
-        let version = u16::from_le_bytes(bytes[8..10].try_into().expect("version field"));
-        let reserved = u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field"));
-        let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
-        // Version 0 with no marker is a torn create (numbering starts at
-        // 1; a fresh file's unwritten bytes are zero). Anything else off
-        // is a format this core does not understand — loud, never
-        // clobbered (ADR 0018).
-        if version == 0 && reserved == 0 && marker.is_none() {
-            Self::recreate(&mut file)?;
-            return Ok(Self::empty(path, file));
-        }
-        if version != FORMAT_VERSION || reserved != 0 {
+        // Version and reserved are checked the moment they are readable —
+        // before any recreate decision — so a truncated file from a future
+        // format is refused, never rewritten over (ADR 0018).
+        let version = if bytes.len() >= 10 {
+            Some(u16::from_le_bytes(
+                bytes[8..10].try_into().expect("version field"),
+            ))
+        } else {
+            None
+        };
+        if let Some(version) = version
+            && version != 0
+            && version != FORMAT_VERSION
+        {
             return Err(StoreError::UnsupportedVersion {
                 path: path.to_owned(),
-                found: if version != FORMAT_VERSION {
-                    version
-                } else {
-                    reserved
-                },
+                found: version,
                 supported: FORMAT_VERSION,
             });
         }
+        if bytes.len() >= 12 {
+            let reserved = u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field"));
+            if version == Some(FORMAT_VERSION) && reserved != 0 {
+                return Err(StoreError::UnsupportedVersion {
+                    path: path.to_owned(),
+                    found: reserved,
+                    supported: FORMAT_VERSION,
+                });
+            }
+        }
+        // A short file or a zero version is a torn create (numbering
+        // starts at 1; a fresh file's unwritten bytes are zero): no
+        // committed data can predate the header fsync, so recreate
+        // (ADR 0018).
+        if bytes.len() < HEADER_LEN || version == Some(0) {
+            Self::recreate(&mut file)?;
+            return Ok(Self::empty(path, file));
+        }
+        let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
 
         let mut records = Vec::new();
         let mut offset = HEADER_LEN;
+        let mut prev_seq = 0u64;
         while offset < bytes.len() {
             match scan_frame(&bytes, offset) {
                 Scan::Op(record, end) => {
+                    // Records carry their sequences; the writer's are
+                    // strictly increasing, 1-based, within the u32
+                    // marker's reach — anything else is tampering, loud
+                    // (ADR 0018).
+                    if record.seq == 0 || record.seq <= prev_seq || record.seq > u64::from(u32::MAX)
+                    {
+                        return Err(StoreError::Corrupt {
+                            path: path.to_owned(),
+                            offset: offset as u64,
+                            reason: "record sequence must increase within 1..=u32::MAX",
+                        });
+                    }
+                    prev_seq = record.seq;
                     records.push(record);
                     offset = end;
                 }
                 Scan::Invalid => {
-                    // Classify by resync: valid frames beyond the damage
-                    // prove mid-file corruption — loud, file untouched.
-                    // No chain after it is the crash window's torn tail:
-                    // cut it and make the cut durable (ADR 0018).
-                    if valid_chain_follows(&bytes, offset + 1) {
+                    // Classify by resync: ONE checksum-valid frame beyond
+                    // the damage proves mid-file corruption — loud, file
+                    // untouched. No valid frame after it is the crash
+                    // window's torn tail: cut it and make the cut durable
+                    // (ADR 0018).
+                    if valid_frame_follows(&bytes, offset + 1) {
                         return Err(StoreError::Corrupt {
                             path: path.to_owned(),
                             offset: offset as u64,
-                            reason: "frame is invalid but valid frames follow it",
+                            reason: "frame is invalid but a valid frame follows it",
                         });
                     }
                     file.set_len(offset as u64)?;
@@ -381,15 +426,19 @@ impl LocalStore {
             }
         }
 
-        // Resume the sequence space above everything ever committed: the
-        // loaded tip, or the marker if committed frames were lost to
-        // damage — a gap then, which stalls watermarks visibly by design
-        // (ADR 0017) and never reuses a sequence a peer may have seen
-        // (ADR 0018). A torn marker means its commit never acked; the
-        // loaded frames are all that was observable.
-        let tip = records.last().map(|r| r.seq).unwrap_or(0);
-        let hwm = marker.map_or(tip, |marker| marker.max(tip));
-        let mut log = OpLog::resuming_at(hwm + 1);
+        // Resume the sequence space above everything ever acknowledged or
+        // ever claimed by a record on disk — the loaded tip, or the
+        // committed marker if committed frames were lost to damage — a
+        // gap then, which stalls watermarks visibly by design (ADR 0017)
+        // and never reuses a sequence a peer may have seen (ADR 0018). A
+        // pending or torn marker grants nothing: its commit never acked,
+        // so the loaded frames are all that was observable.
+        let file_max = prev_seq;
+        let acked = match marker {
+            Marker::Committed(committed) => committed.max(file_max),
+            Marker::Pending(_) | Marker::Torn => file_max,
+        };
+        let mut log = OpLog::resuming_at(acked + 1);
         for record in records {
             log.append_sequenced(record.seq, record.op)
                 .map_err(StoreError::Scope)?;
@@ -399,7 +448,7 @@ impl LocalStore {
             path: path.to_owned(),
             file,
             durable_len: offset as u64,
-            hwm,
+            hwm: acked,
             poisoned: false,
         })
     }
@@ -407,10 +456,12 @@ impl LocalStore {
     /// Append one op durably; returns its canonical sequence. Scoping and
     /// `op_id` dedupe follow the in-memory log exactly (ADR 0017): a
     /// mis-scoped op is rejected, a re-append returns the original
-    /// sequence and writes nothing. The commit point is the single
-    /// `sync_data` after the frame and the header marker land; a failed
-    /// commit rolls both back — and poisons the store if even that fails
-    /// (ADR 0018).
+    /// sequence and writes nothing. The commit is two-phase (ADR 0018):
+    /// the frame plus a PENDING marker under one sync, then the COMMITTED
+    /// marker under a second — so a durable committed marker always
+    /// implies a durable frame. A phase-one failure rolls the file back
+    /// (poisoning the store if even that fails); a phase-two failure
+    /// keeps the durable frame and reports the failed ack.
     pub fn append(&mut self, op: Op) -> Result<u64, StoreError> {
         if self.poisoned {
             return Err(StoreError::Poisoned {
@@ -440,22 +491,34 @@ impl LocalStore {
         }
         let seq = self.log.next_seq();
         let frame = encode_frame(&op, seq)?;
-        let marker = marker_bytes(seq)?;
-        let committed = self.durable_len;
-        let previous_marker = marker_bytes(self.hwm)?;
-        if let Err(e) = commit_bytes(&mut self.file, committed, &frame, &marker) {
+        let committed_len = self.durable_len;
+        let previous_marker = marker_bytes(Marker::Committed(self.hwm))?;
+        // Phase one: the frame and its PENDING marker, durable together.
+        // The pending marker grants nothing — a crash can tear either
+        // phase (ADR 0018).
+        let pending = marker_bytes(Marker::Pending(seq))?;
+        if let Err(e) = commit_frame(&mut self.file, committed_len, &frame, &pending) {
             // Restore the previous marker, drop any partial frame, and
             // make both durable; if even the rollback fails the store is
             // unusable until reopened (ADR 0018).
-            if rollback(&mut self.file, &previous_marker, committed).is_err() {
+            if rollback(&mut self.file, &previous_marker, committed_len).is_err() {
                 self.poisoned = true;
             }
             return Err(e.into());
         }
-        self.durable_len = committed + frame.len() as u64;
+        // Phase two: the COMMITTED marker — durable only after the frame
+        // is, so a durable committed marker implies a durable frame.
+        let committed_marker = marker_bytes(Marker::Committed(seq))?;
+        let phase_two = commit_marker(&mut self.file, &committed_marker);
+        self.durable_len = committed_len + frame.len() as u64;
         self.hwm = seq;
         // Scope and dedupe were checked above; this append cannot fail.
-        self.log.append(op).map_err(StoreError::Scope)
+        // A phase-two failure still leaves the frame durable and the log
+        // consistent — boot resolves any marker state — so the append
+        // stands and the error reports the failed ack (ADR 0018).
+        let assigned = self.log.append(op).map_err(StoreError::Scope)?;
+        phase_two?;
+        Ok(assigned)
     }
 
     /// The ops with sequence greater than `since`, in canonical order —
@@ -511,14 +574,21 @@ impl LocalStore {
     }
 }
 
-/// The one durable write of an append: the frame at the committed
-/// boundary, then the commit marker in the header, then a single sync —
-/// both land or neither (ADR 0018).
-fn commit_bytes(file: &mut File, at: u64, frame: &[u8], marker: &[u8; 8]) -> io::Result<()> {
+/// Phase one of a commit: the frame at the committed boundary plus the
+/// PENDING marker in the header, made durable together (ADR 0018).
+fn commit_frame(file: &mut File, at: u64, frame: &[u8], pending: &[u8; 8]) -> io::Result<()> {
     file.seek(SeekFrom::Start(at))?;
     file.write_all(frame)?;
     file.seek(SeekFrom::Start(HWM_OFFSET as u64))?;
-    file.write_all(marker)?;
+    file.write_all(pending)?;
+    file.sync_data()
+}
+
+/// Phase two: the COMMITTED marker, durable only after phase one's sync —
+/// so a durable committed marker implies a durable frame (ADR 0018).
+fn commit_marker(file: &mut File, committed: &[u8; 8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(HWM_OFFSET as u64))?;
+    file.write_all(committed)?;
     file.sync_data()
 }
 
@@ -537,7 +607,8 @@ fn header() -> [u8; HEADER_LEN] {
     header[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     // The reserved word stays zero; a future extension must set it, and
     // readers refuse non-zero rather than misread (ADR 0018).
-    header[HWM_OFFSET..HEADER_LEN].copy_from_slice(&marker_bytes(0).expect("zero marker"));
+    header[HWM_OFFSET..HEADER_LEN]
+        .copy_from_slice(&marker_bytes(Marker::Committed(0)).expect("zero marker"));
     header
 }
 
@@ -623,8 +694,8 @@ mod tests {
         );
         assert_eq!(
             parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]),
-            Some(0),
-            "a fresh store's marker reads zero"
+            Marker::Committed(0),
+            "a fresh store's marker commits through zero"
         );
         drop(store);
         assert_eq!(LocalStore::open(&path).unwrap().tip(), 0);
@@ -859,7 +930,10 @@ mod tests {
             assert_eq!(store.tip(), expected, "cut at byte {cut}");
             // All six ops were committed before the "crash": the next
             // append resumes above the marker — a gap, not a reuse
-            // (ADR 0018).
+            // (ADR 0018). A cut into the header destroys the marker
+            // with the file — external destruction, not a crash state —
+            // and the path starts a fresh 1-based space (ADR 0018's
+            // carve-out).
             let (field, value) = conv::amount(11);
             let next = store.append(conv::op(99, 99, 0, field, value)).unwrap();
             let expect_next = if cut < HEADER_LEN { 1 } else { 7 };
@@ -928,6 +1002,138 @@ mod tests {
             LocalStore::open(&path),
             Err(StoreError::Corrupt { .. })
         ));
+    }
+
+    #[test]
+    fn a_stray_tail_byte_cannot_disguise_mid_file_corruption() {
+        // Rot in a middle frame plus ONE stray crash-artifact byte at EOF:
+        // a checksum-valid frame still follows the damage, and that alone
+        // proves corruption — the resync must not demand a chain ending
+        // exactly at EOF, or the stray byte silently truncates every
+        // committed frame after the damage (ADR 0018).
+        let tmp = TempDir::new("stray-byte");
+        let path = store_path(&tmp, "src");
+        let (store, _) = filled_store(&path, 8);
+        drop(store);
+        let good = std::fs::read(&path).unwrap();
+
+        let mut starts = Vec::new();
+        let mut offset = HEADER_LEN;
+        while offset < good.len() {
+            starts.push(offset);
+            let len = u32::from_le_bytes(good[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += FRAME_OVERHEAD + len;
+        }
+
+        for damaged in [0usize, 4] {
+            let mut bytes = good.clone();
+            bytes[starts[damaged] + FRAME_OVERHEAD] ^= 0xff;
+            bytes.push(0x00);
+            let path = store_path(&tmp, &format!("stray-{damaged}"));
+            std::fs::write(&path, &bytes).unwrap();
+            match LocalStore::open(&path) {
+                Err(StoreError::Corrupt { offset, .. }) => {
+                    assert_eq!(offset, starts[damaged] as u64);
+                }
+                other => panic!("expected corruption, got {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "the loud path never rewrites the file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pending_marker_grants_nothing() {
+        // A crash between the two phases can leave a PENDING marker on
+        // disk — even one whose frame never landed, if the disk persisted
+        // the 8 marker bytes and lost the frame. Pending never grants, so
+        // boot resumes densely — the phantom-gap wedge is unreachable
+        // through the commit protocol (ADR 0018).
+        let tmp = TempDir::new("pending");
+        let src = store_path(&tmp, "src");
+        let (store, _) = filled_store(&src, 3);
+        drop(store);
+        let good = std::fs::read(&src).unwrap();
+
+        for (label, pending_seq) in [("frame-lost", 4u64), ("far-ahead", 99u64)] {
+            let mut bytes = good.clone();
+            bytes[HWM_OFFSET..HEADER_LEN]
+                .copy_from_slice(&marker_bytes(Marker::Pending(pending_seq)).unwrap());
+            let path = store_path(&tmp, label);
+            std::fs::write(&path, &bytes).unwrap();
+            let mut store = LocalStore::open(&path).unwrap();
+            assert_eq!(store.tip(), 3, "pending marker {pending_seq} adds nothing");
+            let (field, value) = conv::amount(31);
+            assert_eq!(
+                store.append(conv::op(90, 90, 0, field, value)).unwrap(),
+                4,
+                "the space resumes densely after pending marker {pending_seq}"
+            );
+            drop(store);
+            // And the appended op stands with its dense sequence.
+            let store = LocalStore::open(&path).unwrap();
+            let seqs: Vec<u64> = store.delta_since(0).map(|s| s.seq).collect();
+            assert_eq!(seqs, [1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn tampered_record_sequences_are_refused() {
+        // Records carry their sequences; the writer's are strictly
+        // increasing, 1-based, within the u32 marker's reach. Anything
+        // else is tampering — loud (ADR 0018).
+        let tmp = TempDir::new("bad-seqs");
+        let path = store_path(&tmp, "src");
+        let (store, _) = filled_store(&path, 3);
+        drop(store);
+        let good = std::fs::read(&path).unwrap();
+
+        let mut starts = Vec::new();
+        let mut offset = HEADER_LEN;
+        while offset < good.len() {
+            starts.push(offset);
+            let len = u32::from_le_bytes(good[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += FRAME_OVERHEAD + len;
+        }
+
+        let frame_body = |index: usize| -> serde_json::Value {
+            let start = starts[index] + FRAME_OVERHEAD;
+            let len = u32::from_le_bytes(good[starts[index]..starts[index] + 4].try_into().unwrap())
+                as usize;
+            serde_json::from_slice(&good[start..start + len]).unwrap()
+        };
+        let reframe = |body: &serde_json::Value| -> Vec<u8> {
+            let body = serde_json::to_vec(body).unwrap();
+            let mut frame = Vec::with_capacity(FRAME_OVERHEAD + body.len());
+            frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&fnv1a64(&body).to_le_bytes());
+            frame.extend_from_slice(&body);
+            frame
+        };
+        for (label, record_index, seq) in [
+            ("zero", 1usize, serde_json::json!(0u64)),
+            ("duplicate", 1, serde_json::json!(1u64)),
+            ("backwards", 1, serde_json::json!(99u64)),
+        ] {
+            let mut body = frame_body(record_index);
+            body["seq"] = seq;
+            let mut bytes = good[..starts[record_index]].to_vec();
+            bytes.extend_from_slice(&reframe(&body));
+            // Keep the following frames so a too-large sequence is
+            // actually observed to break the increase.
+            if record_index + 1 < starts.len() {
+                bytes.extend_from_slice(&good[starts[record_index + 1]..]);
+            }
+            let path = store_path(&tmp, label);
+            std::fs::write(&path, &bytes).unwrap();
+            match LocalStore::open(&path) {
+                Err(StoreError::Corrupt { .. }) => {}
+                other => panic!("expected corruption for {label} seq, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1115,10 +1321,13 @@ mod tests {
 
     #[test]
     fn duplicate_records_collapse_to_the_first() {
-        // Two records sharing an op_id with different content can only be
-        // written by tampering — the API dedupes — and boot resolves them
-        // the way the log must: first wins, by op_id alone (the E2EE-safe
-        // rule; a re-encrypted retry carries different bytes, ADR 0017).
+        // Two records sharing an op_id can only be written by tampering —
+        // the API dedupes — and boot resolves them the way the log must:
+        // first wins, by op_id alone (the E2EE-safe rule; a re-encrypted
+        // retry carries different payload bytes, ADR 0017). Identical
+        // duplicated bytes would also collide on sequence and fail the
+        // boot-time increase check; the crafted different-sequence shape
+        // here is the one that exercises the collapse.
         let tmp = TempDir::new("dup-records");
         let one = store_path(&tmp, "one");
         let two = store_path(&tmp, "two");
@@ -1135,17 +1344,39 @@ mod tests {
 
         let a = std::fs::read(&one).unwrap();
         let b = std::fs::read(&two).unwrap();
+        // Give store two's record a fresh sequence (2) so the splice is a
+        // pure op_id collision.
+        let len = u32::from_le_bytes(b[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+        let mut body: serde_json::Value = serde_json::from_slice(
+            &b[HEADER_LEN + FRAME_OVERHEAD..HEADER_LEN + FRAME_OVERHEAD + len],
+        )
+        .unwrap();
+        body["seq"] = serde_json::json!(2u64);
+        let body = serde_json::to_vec(&body).unwrap();
+        let mut reframed = Vec::with_capacity(FRAME_OVERHEAD + body.len());
+        reframed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        reframed.extend_from_slice(&fnv1a64(&body).to_le_bytes());
+        reframed.extend_from_slice(&body);
+
         let mut spliced = a[..HEADER_LEN].to_vec();
-        // Store one's frame, then store two's.
         spliced.extend_from_slice(&a[HEADER_LEN..]);
-        spliced.extend_from_slice(&b[HEADER_LEN..]);
+        spliced.extend_from_slice(&reframed);
         let spliced_path = store_path(&tmp, "spliced");
         std::fs::write(&spliced_path, &spliced).unwrap();
 
-        let store = LocalStore::open(&spliced_path).unwrap();
-        assert_eq!(store.tip(), 1, "the second record collapses");
+        let mut store = LocalStore::open(&spliced_path).unwrap();
+        assert_eq!(store.tip(), 1, "one op serves, at its own sequence");
+        let seqs: Vec<u64> = store.delta_since(0).map(|s| s.seq).collect();
+        assert_eq!(seqs, [1]);
         let ops: Vec<Op> = store.delta_since(0).map(|s| s.op.clone()).collect();
         assert_eq!(ops[0].value, conv::amount(111).1, "first record wins");
+        // The collapsed record still claimed sequence 2 on disk, so the
+        // space resumes above it — a later append cannot collide and
+        // corrupt the next reopen.
+        let (field, value) = conv::amount(41);
+        assert_eq!(store.append(conv::op(70, 70, 0, field, value)).unwrap(), 3);
+        drop(store);
+        LocalStore::open(&spliced_path).unwrap();
     }
 
     #[test]
@@ -1163,19 +1394,33 @@ mod tests {
             b"definitely not a pursecraft store",
             "refused, not clobbered"
         );
-        // A header from a future format version.
+        // A header from a future format version — refused even when the
+        // file is too short to hold the full header (ADR 0018).
         let future = store_path(&tmp, "future");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&MAGIC);
         bytes.extend_from_slice(&9u16.to_le_bytes());
         bytes.extend_from_slice(&[0, 0]);
-        bytes.extend_from_slice(&marker_bytes(0).unwrap());
+        bytes.extend_from_slice(&marker_bytes(Marker::Committed(0)).unwrap());
         std::fs::write(&future, &bytes).unwrap();
         match LocalStore::open(&future) {
             Err(StoreError::UnsupportedVersion { found: 9, .. }) => {}
             other => panic!("expected a version rejection, got {other:?}"),
         }
         assert_eq!(bytes, std::fs::read(&future).unwrap(), "untouched");
+        // A truncated future header: magic + version 9 + reserved, 12
+        // bytes — refused, not recreated over.
+        let short = store_path(&tmp, "short-future");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&9u16.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        std::fs::write(&short, &bytes).unwrap();
+        match LocalStore::open(&short) {
+            Err(StoreError::UnsupportedVersion { found: 9, .. }) => {}
+            other => panic!("expected a version rejection, got {other:?}"),
+        }
+        assert_eq!(bytes, std::fs::read(&short).unwrap(), "untouched");
         // A set reserved word: a format extension this core must not
         // misread as a plain log.
         let extended = store_path(&tmp, "extended");
@@ -1183,7 +1428,7 @@ mod tests {
         bytes.extend_from_slice(&MAGIC);
         bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
-        bytes.extend_from_slice(&marker_bytes(0).unwrap());
+        bytes.extend_from_slice(&marker_bytes(Marker::Committed(0)).unwrap());
         std::fs::write(&extended, &bytes).unwrap();
         match LocalStore::open(&extended) {
             Err(StoreError::UnsupportedVersion { .. }) => {}
