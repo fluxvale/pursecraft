@@ -5,13 +5,42 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 /// A hybrid logical clock timestamp.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Hlc {
     /// Wall-clock milliseconds since the Unix epoch.
     pub physical_ms: u64,
     /// Monotonic counter within the same millisecond.
     pub logical: u32,
+}
+
+/// The wire shape of [`Hlc`], deserialized before validation.
+#[derive(Deserialize)]
+struct HlcWire {
+    physical_ms: u64,
+    logical: u32,
+}
+
+impl<'de> Deserialize<'de> for Hlc {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = HlcWire::deserialize(deserializer)?;
+        // Boundary rule (ADR 0017): stamps off the u64 cliff are rejected
+        // so `merge` can always bump the logical counter and `tick` can
+        // always borrow the next millisecond — a wire value can never
+        // exhaust the clock (corruption is a loud error, not a panic,
+        // ADR 0016). `physical_ms` beyond i64::MAX is not a wall clock.
+        if wire.physical_ms > i64::MAX as u64 || wire.logical == u32::MAX {
+            return Err(serde::de::Error::custom(
+                "hlc out of range: physical_ms must be <= i64::MAX and logical < u32::MAX",
+            ));
+        }
+        Ok(Self {
+            physical_ms: wire.physical_ms,
+            logical: wire.logical,
+        })
+    }
 }
 
 impl Hlc {
@@ -23,6 +52,10 @@ impl Hlc {
     }
 
     /// Local event: strictly greater than the previous value of `self`.
+    /// The top logical counter value is reserved (see [`Self::merge`]); a
+    /// saturating counter borrows the next millisecond instead of
+    /// producing it, so every stamp a device mints is decodable
+    /// everywhere (ADR 0017).
     pub fn tick(&mut self) {
         let now = unix_ms_now();
         if now > self.physical_ms {
@@ -30,33 +63,49 @@ impl Hlc {
             self.logical = 0;
             return;
         }
-        match self.logical.checked_add(1) {
-            Some(l) => self.logical = l,
-            None => {
-                // 2^32 events within one millisecond: borrow the next ms.
-                self.physical_ms = self.physical_ms.checked_add(1).expect("HLC exhausted");
-                self.logical = 0;
-            }
+        if self.logical >= u32::MAX - 1 {
+            // At (or past) the reserved top counter: borrow the next ms —
+            // 2^32 events within one millisecond, or a sentinel stamp.
+            self.physical_ms = self.physical_ms.checked_add(1).expect("HLC exhausted");
+            self.logical = 0;
+        } else {
+            self.logical += 1;
         }
     }
 
     /// Receive `remote`: strictly greater than both `self` and `remote`;
     /// when the wall clock dominates both, the logical counter resets to
-    /// zero (canonical HLC).
+    /// zero (canonical HLC). Receiving can never panic and never produces
+    /// the reserved top counter value: at saturation it borrows the next
+    /// millisecond like [`Self::tick`] — one validator-legal op delivered
+    /// twice (at-least-once, ADR 0007) must never exhaust the clock
+    /// (ADR 0017).
     pub fn merge(&mut self, remote: Hlc) {
         let now = unix_ms_now();
         let physical = self.physical_ms.max(remote.physical_ms).max(now);
-        let bump = |l: u32| l.checked_add(1).expect("HLC exhausted");
-        self.logical = if physical == self.physical_ms && physical == remote.physical_ms {
-            bump(self.logical.max(remote.logical))
+        if physical > self.physical_ms && physical > remote.physical_ms {
+            // The wall clock dominates both: canonical reset (ADR 0016).
+            self.physical_ms = physical;
+            self.logical = 0;
+            return;
+        }
+        let merged = if physical == self.physical_ms && physical == remote.physical_ms {
+            self.logical.max(remote.logical)
         } else if physical == self.physical_ms {
-            bump(self.logical)
-        } else if physical == remote.physical_ms {
-            bump(remote.logical)
+            self.logical
         } else {
-            0
+            remote.logical
         };
-        self.physical_ms = physical;
+        if merged >= u32::MAX - 1 {
+            // The bump would hit the reserved top counter: borrow the
+            // next millisecond instead of producing it — receiving one
+            // validator-legal op twice must never exhaust the clock.
+            self.physical_ms = physical.checked_add(1).expect("HLC exhausted");
+            self.logical = 0;
+        } else {
+            self.logical = merged + 1;
+            self.physical_ms = physical;
+        }
     }
 }
 
@@ -159,6 +208,38 @@ mod tests {
             logical: 4,
         });
         assert_eq!(a.logical, 10);
+    }
+
+    #[test]
+    fn merging_a_saturating_remote_repeatedly_borrows_rather_than_panicking() {
+        // One validator-legal op (logical = u32::MAX - 1) delivered twice
+        // — at-least-once delivery, ADR 0007 — must not exhaust the
+        // clock, and no merge or tick may produce the reserved top
+        // counter value: a stamp any device mints must stay decodable
+        // everywhere (ADR 0017).
+        let mut local = Hlc {
+            physical_ms: BASE,
+            logical: 0,
+        };
+        let remote = Hlc {
+            physical_ms: BASE,
+            logical: u32::MAX - 1,
+        };
+        let mut prev = local;
+        for _ in 0..4 {
+            local.merge(remote);
+            assert!(local > prev, "receive must stay strictly monotonic");
+            assert_ne!(local.logical, u32::MAX);
+            prev = local;
+        }
+        for _ in 0..4 {
+            local.tick();
+            assert!(local > prev, "tick must stay strictly monotonic");
+            assert_ne!(local.logical, u32::MAX);
+            prev = local;
+        }
+        // The first saturating merge borrowed exactly one millisecond.
+        assert_eq!(local.physical_ms, BASE + 1);
     }
 
     #[test]

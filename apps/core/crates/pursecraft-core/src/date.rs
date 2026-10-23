@@ -6,7 +6,9 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// A civil date, years 0000–9999.
+use serde::{Deserialize, Serialize};
+
+/// A civil date, years 0000–9999. Wire form: strict `YYYY-MM-DD` (ADR 0017).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Date {
     year: u16,
@@ -15,9 +17,12 @@ pub struct Date {
 }
 
 impl Date {
-    /// `None` unless `(year, month, day)` is a real calendar date.
+    /// `None` unless `(year, month, day)` is a real calendar date. Years
+    /// stay within 0000–9999 so `Display` is fixed-width and parses back
+    /// (ADR 0017: round-trip exact).
     pub fn new(year: u16, month: u8, day: u8) -> Option<Self> {
-        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        if year > 9999 || !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month)
+        {
             return None;
         }
         Some(Self { year, month, day })
@@ -68,6 +73,20 @@ impl fmt::Debug for Date {
     }
 }
 
+impl Serialize for Date {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Date {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Failed to parse a [`Date`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseDateError;
@@ -102,7 +121,7 @@ impl FromStr for Date {
     }
 }
 
-/// A calendar month, years 0000–9999.
+/// A calendar month, years 0000–9999. Wire form: strict `YYYY-MM` (ADR 0017).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Month {
     year: u16,
@@ -110,9 +129,10 @@ pub struct Month {
 }
 
 impl Month {
-    /// `None` unless `month` is 1–12.
+    /// `None` unless `month` is 1–12 (and the year fits the fixed-width
+    /// `YYYY` form, 0000–9999).
     pub fn new(year: u16, month: u8) -> Option<Self> {
-        if (1..=12).contains(&month) {
+        if year <= 9999 && (1..=12).contains(&month) {
             Some(Self { year, month })
         } else {
             None
@@ -137,6 +157,20 @@ impl fmt::Display for Month {
 impl fmt::Debug for Month {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Month({self})")
+    }
+}
+
+impl Serialize for Month {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Month {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
