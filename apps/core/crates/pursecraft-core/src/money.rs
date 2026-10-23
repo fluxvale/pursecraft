@@ -8,9 +8,25 @@ use std::iter::Sum;
 use std::ops::{Add, Neg, Sub};
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// A monetary amount in integer milliunits (1 unit = 1000; ADR 0006).
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Milliunits(i64);
+
+// Wire form: bare integer milliunits — never a float or decimal string
+// (ADR 0006, ADR 0017).
+impl Serialize for Milliunits {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Milliunits {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        i64::deserialize(deserializer).map(Self)
+    }
+}
 
 impl Milliunits {
     pub const ZERO: Self = Self(0);

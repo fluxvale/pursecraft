@@ -5,8 +5,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 /// A hybrid logical clock timestamp.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Hlc {
     /// Wall-clock milliseconds since the Unix epoch.
     pub physical_ms: u64,

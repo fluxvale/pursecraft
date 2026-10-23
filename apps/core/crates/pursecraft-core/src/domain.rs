@@ -7,6 +7,8 @@
 //! fields are `Option` until an op sets them — money must never default
 //! silently to zero (ADR 0016).
 
+use serde::{Deserialize, Serialize};
+
 use crate::date::{Date, Month};
 use crate::ids::{
     AccountId, BudgetId, CategoryGroupId, CategoryId, EntityId, MonthCategoryId, PayeeId,
@@ -15,7 +17,7 @@ use crate::ids::{
 use crate::money::Milliunits;
 
 /// Account kind — reference data, extend freely (ADR 0016).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum AccountKind {
     Checking,
     Savings,
@@ -30,7 +32,7 @@ pub enum AccountKind {
 }
 
 /// Manual statement-reconciliation state (ADR 0010).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Cleared {
     Uncleared,
     Cleared,
@@ -106,7 +108,7 @@ pub struct MonthCategory {
     pub budgeted: Option<Milliunits>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum EntityKind {
     Budget,
     Account,
@@ -206,7 +208,7 @@ impl Entity {
 /// Which field of which entity an op writes. Nested enums keep `match`
 /// exhaustive: adding a field is a variant plus compiler-guided arms
 /// (ADR 0016). `Deleted` applies to every entity kind.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Field {
     Deleted,
     Budget(BudgetField),
@@ -218,35 +220,35 @@ pub enum Field {
     MonthCategory(MonthCategoryField),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum BudgetField {
     Name,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum AccountField {
     Name,
     Kind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum CategoryGroupField {
     Name,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum CategoryField {
     Name,
     GroupId,
     Note,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum PayeeField {
     Name,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum TransactionField {
     AccountId,
     Date,
@@ -257,7 +259,7 @@ pub enum TransactionField {
     Cleared,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum MonthCategoryField {
     Month,
     CategoryId,
@@ -266,7 +268,7 @@ pub enum MonthCategoryField {
 
 /// A field value — the closed vocabulary the op log writes, and the future
 /// single serialization choke point (ADR 0009, ADR 0016).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Value {
     Bool(bool),
     Text(String),

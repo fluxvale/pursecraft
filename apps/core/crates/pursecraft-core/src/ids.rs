@@ -5,6 +5,8 @@
 //! ADR 0016). Device and user ids are opaque UUIDs from auth — any version.
 
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The id is not UUIDv7 where UUIDv7 is required.
@@ -72,6 +74,22 @@ macro_rules! id_newtype {
                 f.debug_tuple(stringify!($name))
                     .field(&self.0.hyphenated().to_string())
                     .finish()
+            }
+        }
+
+        // Wire form: UUID string, deserialized through the validating
+        // `new` so the id invariants hold on both sides of the boundary
+        // (ADR 0017).
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let uuid = Uuid::deserialize(deserializer)?;
+                Self::new(uuid).map_err(serde::de::Error::custom)
             }
         }
     };

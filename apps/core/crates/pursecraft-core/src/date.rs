@@ -6,7 +6,9 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// A civil date, years 0000–9999.
+use serde::{Deserialize, Serialize};
+
+/// A civil date, years 0000–9999. Wire form: strict `YYYY-MM-DD` (ADR 0017).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Date {
     year: u16,
@@ -68,6 +70,20 @@ impl fmt::Debug for Date {
     }
 }
 
+impl Serialize for Date {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Date {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <&str>::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Failed to parse a [`Date`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseDateError;
@@ -102,7 +118,7 @@ impl FromStr for Date {
     }
 }
 
-/// A calendar month, years 0000–9999.
+/// A calendar month, years 0000–9999. Wire form: strict `YYYY-MM` (ADR 0017).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Month {
     year: u16,
@@ -137,6 +153,20 @@ impl fmt::Display for Month {
 impl fmt::Debug for Month {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Month({self})")
+    }
+}
+
+impl Serialize for Month {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Month {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <&str>::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 

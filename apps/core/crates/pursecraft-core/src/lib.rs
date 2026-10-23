@@ -1,8 +1,11 @@
 //! Pursecraft core: budget engine, sync protocol, and persistence (ADR 0001).
 //!
-//! This slice covers the domain model and op semantics of ADR 0016: integer
+//! This slice covers the domain model and op semantics of ADR 0016 — integer
 //! money, ids, HLC timestamps, entities, per-field LWW op application, and
-//! deterministic referential resolution.
+//! deterministic referential resolution — plus the sync engine and op wire
+//! format of ADR 0017: the canonical op log, delta-applying sync sessions,
+//! and the metadata/payload split whose single choke point the E2EE layer
+//! will wrap.
 
 pub mod date;
 pub mod domain;
@@ -11,6 +14,8 @@ pub mod ids;
 pub mod money;
 pub mod ops;
 pub mod resolve;
+pub mod sync;
+pub mod wire;
 
 /// Deterministic helpers for the crate's own tests (never public API).
 #[cfg(test)]
