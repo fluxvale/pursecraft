@@ -7,7 +7,7 @@
 //! onto [`BudgetState`], an HLC that absorbs every received op, and a
 //! monotonic `last_seen` cursor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::hlc::Hlc;
@@ -21,8 +21,8 @@ pub struct SequencedOp {
     pub op: Op,
 }
 
-/// A rejected append — corruption or a scoping violation is loud, never
-/// merged (ADRs 0008, 0017).
+/// A rejected append — a scoping violation is loud, never merged
+/// ([ADR 0008]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LogError {
     /// The op is scoped to a budget other than this log's ([ADR 0008]).
@@ -30,10 +30,6 @@ pub enum LogError {
         op_budget: BudgetId,
         log_budget: BudgetId,
     },
-    /// The same `op_id` was appended with different content. `op_id` must
-    /// uniquely identify an op or convergence breaks, so a collision is
-    /// surfaced instead of resolved (ADR 0017).
-    OpIdConflict { op_id: OpId },
 }
 
 impl fmt::Display for LogError {
@@ -46,9 +42,6 @@ impl fmt::Display for LogError {
                 f,
                 "op budget {op_budget} does not belong to op log {log_budget}"
             ),
-            Self::OpIdConflict { op_id } => {
-                write!(f, "op id {op_id} re-appended with different content")
-            }
         }
     }
 }
@@ -57,10 +50,11 @@ impl std::error::Error for LogError {}
 
 /// The append-only, per-budget canonical op log — the rendezvous model of
 /// [ADR 0007] as an in-memory type the future server drives. Sequences are
-/// dense and 1-based; append order is the canonical order. The log never
-/// interprets payload content: beyond storage, the only non-metadata touch
-/// is the duplicate/conflict equality test — the stand-in for a server
-/// comparing stored ciphertext bytes ([ADRs 0009, 0017]).
+/// dense and 1-based; append order is the canonical order. The log touches
+/// only server-visible metadata: dedupe is by `op_id` alone (content is
+/// opaque under [ADR 0009] — an encrypted retry must dedupe like an
+/// identical one), and the loud same-id-different-content check lives in
+/// [`BudgetState::apply`], where plaintext always lives (ADR 0017).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct OpLog {
     budget_id: Option<BudgetId>,
@@ -73,15 +67,13 @@ impl OpLog {
         Self::default()
     }
 
-    /// Append an op; returns its canonical sequence. Re-appending an
-    /// identical op returns the original sequence (safe retries,
-    /// [ADR 0007]). Errors leave the log untouched.
+    /// Append an op; returns its canonical sequence. Re-appending an op
+    /// whose `op_id` is already stored returns the original sequence —
+    /// safe retries ([ADR 0007]) regardless of payload bytes. Errors leave
+    /// the log untouched.
     pub fn append(&mut self, op: Op) -> Result<u64, LogError> {
         if let Some(&seq) = self.seen.get(&op.op_id) {
-            if self.ops[seq as usize - 1].op == op {
-                return Ok(seq);
-            }
-            return Err(LogError::OpIdConflict { op_id: op.op_id });
+            return Ok(seq);
         }
         if let Some(log_budget) = self.budget_id
             && log_budget != op.budget_id
@@ -134,11 +126,17 @@ pub struct DeltaSummary {
 /// One device's client side: materialized state, the device's HLC, and the
 /// `last_seen` cursor (ADR 0017). The transport-free "sync session" the
 /// future transport drives.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub struct SyncSession {
     state: BudgetState,
     clock: Hlc,
+    /// The contiguous resume watermark: every sequence up to and including
+    /// it has been processed. `delta_since(last_seen)` can never skip an
+    /// unprocessed op, whatever the arrival order (ADR 0007).
     last_seen: u64,
+    /// Sequences processed ahead of the watermark, held until their gap
+    /// fills so the watermark can advance over them.
+    pending: BTreeSet<u64>,
 }
 
 impl SyncSession {
@@ -147,13 +145,18 @@ impl SyncSession {
             state: BudgetState::new(),
             clock: Hlc::now(),
             last_seen: 0,
+            pending: BTreeSet::new(),
         }
     }
 
-    /// Apply a delta of remote ops in delivered order (ADR 0017). Every op
-    /// goes through the slice-1 idempotent LWW apply, the clock merges
-    /// every successfully processed op, and `last_seen` advances to the
-    /// maximum processed sequence — never regressing on re-delivery.
+    /// Apply a delta of remote ops in any order (ADR 0017). Every op goes
+    /// through the slice-1 idempotent LWW apply, the clock merges every
+    /// successfully processed op, and the cursor advances only across
+    /// gap-free prefixes — reordered ops apply immediately but are held
+    /// pending until the sequences below them arrive, so a later
+    /// `delta_since(last_seen)` still re-serves anything the session has
+    /// not seen. Sequence values are taken as advisory: absurd values can
+    /// stall a watermark but never wedge it past unapplied ops.
     ///
     /// The first failing op aborts the delta with its [`ApplyError`]: ops
     /// processed before it stay applied, the cursor stops at the failure,
@@ -163,10 +166,7 @@ impl SyncSession {
     where
         I: IntoIterator<Item = &'a SequencedOp>,
     {
-        let mut summary = DeltaSummary {
-            last_seen: self.last_seen,
-            ..DeltaSummary::default()
-        };
+        let mut summary = DeltaSummary::default();
         for sequenced in delta {
             match self.state.apply(sequenced.op.clone())? {
                 Applied::Applied => summary.applied += 1,
@@ -174,7 +174,15 @@ impl SyncSession {
                 Applied::Stale => summary.stale += 1,
             }
             self.clock.merge(sequenced.op.hlc);
-            self.last_seen = self.last_seen.max(sequenced.seq);
+            let seq = sequenced.seq;
+            if seq == self.last_seen.saturating_add(1) {
+                self.last_seen = seq;
+                while self.pending.remove(&self.last_seen.saturating_add(1)) {
+                    self.last_seen = self.last_seen.saturating_add(1);
+                }
+            } else if seq > self.last_seen {
+                self.pending.insert(seq);
+            }
             summary.last_seen = self.last_seen;
         }
         Ok(summary)
@@ -276,22 +284,74 @@ mod tests {
         let mut log = OpLog::new();
         let (field, value) = amount(7);
         let first = op(1, 10, 0, field, value);
-        let first_id = first.op_id;
         assert_eq!(log.append(first.clone()), Ok(1));
         assert_eq!(log.append(first), Ok(1), "a retry is a no-op");
         assert_eq!(log.tip(), 1);
-        // Same op_id, different content: corruption, loud (ADR 0017).
+        // The log dedupes by op_id alone — under E2EE a re-encrypted
+        // retry carries different payload bytes and must still dedupe
+        // (ADR 0017). The loud same-id-different-content check is the
+        // client's, exercised below.
         let mut conflict = op(2, 20, 0, amount(0).0, amount(9).1);
-        conflict.op_id = first_id;
-        conflict.hlc = Hlc {
-            physical_ms: 99,
-            logical: 9,
+        conflict.op_id = OpId::new(v7(ID_MS, 1)).unwrap();
+        assert_eq!(log.append(conflict.clone()), Ok(1));
+        assert_eq!(log.tip(), 1);
+        // Applying the colliding op is loud corruption, not divergence.
+        let mut session = SyncSession::new();
+        session
+            .apply_delta(log.delta_since(0))
+            .expect("the stored op is well-formed");
+        assert!(matches!(
+            session.apply_delta(&[SequencedOp {
+                seq: 2,
+                op: conflict
+            }]),
+            Err(ApplyError::OpIdConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn reordered_delivery_does_not_wedge_the_cursor() {
+        // Reordered arrival applies immediately but must not move the
+        // resume watermark past unprocessed sequences: after seeing only
+        // seq 3, a pull since the cursor still serves 1 and 2.
+        let mut log = OpLog::new();
+        let mut session = SyncSession::new();
+        let mut ms = 10;
+        let mut push = |i: u64, log: &mut OpLog| {
+            ms += 1;
+            log.append(op(i, ms, 0, Field::Transaction(TransactionField::Memo), {
+                Value::Text(format!("m{i}"))
+            }))
+            .unwrap()
         };
-        assert_eq!(
-            log.append(conflict),
-            Err(LogError::OpIdConflict { op_id: first_id })
-        );
-        assert_eq!(log.tip(), 1, "a rejected append stores nothing");
+        assert_eq!(push(1, &mut log), 1);
+        assert_eq!(push(2, &mut log), 2);
+        assert_eq!(push(3, &mut log), 3);
+
+        // Seq 3 arrives alone (reordered).
+        let newest = log.delta_since(2).next().cloned().unwrap();
+        let first = session.apply_delta([&newest]).unwrap();
+        assert_eq!(first.applied, 1);
+        assert_eq!(session.last_seen(), 0, "a gap pins the watermark");
+
+        // Catching up from the cursor re-serves everything: 3 is a
+        // duplicate; 1 and 2 are stale — their stamps lost to the newer
+        // write already applied — but the watermark still crosses them.
+        let catch_up: Vec<SequencedOp> = log.delta_since(session.last_seen()).cloned().collect();
+        assert_eq!(catch_up.len(), 3);
+        let summary = session.apply_delta(&catch_up).unwrap();
+        assert_eq!(summary.applied, 0);
+        assert_eq!(summary.stale, 2, "the older memos lose the field");
+        assert_eq!(summary.duplicates, 1);
+        assert_eq!(session.last_seen(), 3);
+        let txn = match session
+            .state()
+            .entity(&EntityId::new(v7(ID_MS, 50)).unwrap())
+        {
+            Some(crate::domain::Entity::Transaction(t)) => t.clone(),
+            other => panic!("expected transaction, got {other:?}"),
+        };
+        assert_eq!(txn.memo.as_deref(), Some("m3"));
     }
 
     #[test]
@@ -630,22 +690,113 @@ mod tests {
                 });
             }
         }
-        // Force one cross-device equal-HLC tie per seed: device 1 mirrors
-        // device 0's first target (same entity and field, identical stamp —
-        // their SKEW rows match by construction), so the op_id tie-break is
-        // exercised in every seed, not just where the shuffle happens to
-        // collide.
+        // Force an equal-HLC tie AT THE WINNING STAMP: the year-ahead
+        // device's final event carries the highest HLC of any op, so the
+        // preceding op is overwritten to mirror it — same entity, field,
+        // and stamp, its own op_id and a fresh value. No later write can
+        // mask the decision, and the convergence tests assert the tie's
+        // winner directly against the op_id order.
         let (kind, entity_id, field, hlc) = {
-            let first = &ops[0];
-            (first.entity_kind, first.entity_id, first.field, first.hlc)
+            let winner = &ops[TIE_WINNER];
+            (
+                winner.entity_kind,
+                winner.entity_id,
+                winner.field,
+                winner.hlc,
+            )
         };
-        let tie = &mut ops[OPS_PER_DEVICE];
-        tie.entity_kind = kind;
-        tie.entity_id = entity_id;
-        tie.field = field;
-        tie.value = random_value(&mut rng, field);
-        tie.hlc = hlc;
+        let mirror = &mut ops[TIE_MIRROR];
+        mirror.entity_kind = kind;
+        mirror.entity_id = entity_id;
+        mirror.field = field;
+        mirror.value = random_value(&mut rng, field);
+        mirror.hlc = hlc;
         ops
+    }
+
+    /// The op holding the global-maximum HLC (the year-ahead device's last
+    /// event) and the op mirroring it into an equal-HLC tie.
+    const TIE_WINNER: usize = 4 * OPS_PER_DEVICE - 1;
+    const TIE_MIRROR: usize = 4 * OPS_PER_DEVICE - 2;
+
+    /// The materialized value of one field — the test-side inverse of
+    /// `set_field`, so convergence assertions can read state back.
+    fn materialized(state: &BudgetState, id: EntityId, field: Field) -> Option<Value> {
+        use crate::domain::Entity;
+        match (state.entity(&id)?, field) {
+            (Entity::Budget(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+            (Entity::Budget(e), Field::Budget(BudgetField::Name)) => {
+                e.name.clone().map(Value::Text)
+            }
+            (Entity::Account(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+            (Entity::Account(e), Field::Account(AccountField::Name)) => {
+                e.name.clone().map(Value::Text)
+            }
+            (Entity::Account(e), Field::Account(AccountField::Kind)) => {
+                e.kind.map(Value::AccountKind)
+            }
+            (Entity::CategoryGroup(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+            (Entity::CategoryGroup(e), Field::CategoryGroup(CategoryGroupField::Name)) => {
+                e.name.clone().map(Value::Text)
+            }
+            (Entity::Category(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+            (Entity::Category(e), Field::Category(CategoryField::Name)) => {
+                e.name.clone().map(Value::Text)
+            }
+            (Entity::Category(e), Field::Category(CategoryField::GroupId)) => e
+                .group_id
+                .map(|g| Value::Id(EntityId::from_raw(g.as_uuid()))),
+            (Entity::Category(e), Field::Category(CategoryField::Note)) => {
+                e.note.clone().map(Value::Text)
+            }
+            (Entity::Payee(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+            (Entity::Payee(e), Field::Payee(PayeeField::Name)) => e.name.clone().map(Value::Text),
+            (Entity::Transaction(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+            (Entity::Transaction(e), Field::Transaction(TransactionField::AccountId)) => e
+                .account_id
+                .map(|v| Value::Id(EntityId::from_raw(v.as_uuid()))),
+            (Entity::Transaction(e), Field::Transaction(TransactionField::Date)) => {
+                e.date.map(Value::Date)
+            }
+            (Entity::Transaction(e), Field::Transaction(TransactionField::Amount)) => {
+                e.amount.map(Value::Milliunits)
+            }
+            (Entity::Transaction(e), Field::Transaction(TransactionField::PayeeId)) => e
+                .payee_id
+                .map(|v| Value::Id(EntityId::from_raw(v.as_uuid()))),
+            (Entity::Transaction(e), Field::Transaction(TransactionField::CategoryId)) => e
+                .category_id
+                .map(|v| Value::Id(EntityId::from_raw(v.as_uuid()))),
+            (Entity::Transaction(e), Field::Transaction(TransactionField::Memo)) => {
+                e.memo.clone().map(Value::Text)
+            }
+            (Entity::Transaction(e), Field::Transaction(TransactionField::Cleared)) => {
+                e.cleared.map(Value::Cleared)
+            }
+            (Entity::MonthCategory(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+            (Entity::MonthCategory(e), Field::MonthCategory(MonthCategoryField::Month)) => {
+                e.month.map(Value::Month)
+            }
+            (Entity::MonthCategory(e), Field::MonthCategory(MonthCategoryField::CategoryId)) => e
+                .category_id
+                .map(|v| Value::Id(EntityId::from_raw(v.as_uuid()))),
+            (Entity::MonthCategory(e), Field::MonthCategory(MonthCategoryField::Budgeted)) => {
+                e.budgeted.map(Value::Milliunits)
+            }
+            _ => None,
+        }
+    }
+
+    /// The forced tie's independently computed expectation: the value of
+    /// whichever tied op carries the greater `op_id` (ADR 0016's
+    /// equal-HLC rule).
+    fn expected_tie_value(ops: &[Op]) -> (EntityId, Field, Value) {
+        let winner = if ops[TIE_WINNER].op_id > ops[TIE_MIRROR].op_id {
+            &ops[TIE_WINNER]
+        } else {
+            &ops[TIE_MIRROR]
+        };
+        (winner.entity_id, winner.field, winner.value.clone())
     }
 
     fn shuffle<T>(rng: &mut Rng, slice: &mut [T]) {
@@ -725,6 +876,30 @@ mod tests {
                 .expect("generated ops are well-formed");
             assert_eq!(canonical.state(), &reference, "seed {seed}");
             assert_eq!(log.tip(), (DEVICES as usize * OPS_PER_DEVICE) as u64);
+
+            // The forced equal-HLC tie at the winning stamp: every
+            // replica's materialized value must be the op_id tie-break's
+            // pick — asserted directly, not just via state equality.
+            let (tie_entity, tie_field, tie_value) = expected_tie_value(&ops);
+            let mut replicas = sessions.iter().map(|s| s.state());
+            let first_tie = materialized(
+                replicas.next().expect("at least one session"),
+                tie_entity,
+                tie_field,
+            );
+            assert_eq!(first_tie, Some(tie_value), "seed {seed}");
+            for state in replicas {
+                assert_eq!(
+                    materialized(state, tie_entity, tie_field),
+                    first_tie,
+                    "seed {seed}"
+                );
+            }
+            assert_eq!(
+                materialized(canonical.state(), tie_entity, tie_field),
+                first_tie,
+                "seed {seed}"
+            );
         }
     }
 
@@ -735,6 +910,7 @@ mod tests {
     fn n_devices_converge_from_shuffled_duplicated_delivery() {
         for seed in 1..=SEEDS {
             let ops = generate_ops(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+            let (tie_entity, tie_field, tie_value) = expected_tie_value(&ops);
             let mut reference = BudgetState::new();
             for op in &ops {
                 reference
@@ -772,7 +948,17 @@ mod tests {
                     "device {device} diverged (seed {seed})"
                 );
                 assert_eq!(session.last_seen(), ops.len() as u64);
+                assert_eq!(
+                    materialized(session.state(), tie_entity, tie_field),
+                    Some(tie_value.clone()),
+                    "device {device} tie-break (seed {seed})"
+                );
             }
+            assert_eq!(
+                materialized(&reference, tie_entity, tie_field),
+                Some(tie_value),
+                "reference tie-break (seed {seed})"
+            );
         }
     }
 }

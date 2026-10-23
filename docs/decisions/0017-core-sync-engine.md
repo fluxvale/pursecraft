@@ -25,14 +25,17 @@ server:
 - `append(op) -> seq`: sequences are dense, 1-based, and append order is the
   canonical order per budget (ADR 0007). The first append fixes the budget;
   foreign-budget appends are rejected, mirroring `BudgetState`.
-- The log never interprets payload content: apart from storage, the only
-  place it touches an op beyond metadata is the duplicate/conflict test,
-  which compares whole ops for equality — exactly as a server compares
-  stored ciphertext bytes. Re-appending an identical op returns its
-  original sequence (safe retries on flaky links); re-appending the same
-  `op_id` with different content is a loud `OpIdConflict` error —
-  convergence depends on `op_id` uniquely identifying an op, so a collision
-  must surface, not silently resolve per-arrival-order.
+- The log touches only server-visible metadata. Dedupe is by `op_id`
+  alone: re-appending an op whose id is already stored returns the
+  original sequence — safe retries ([ADR 0007]) — and this must hold
+  under [ADR 0009] encryption, where a re-encrypted retry carries
+  different payload bytes. The log therefore never compares content.
+- `op_id` is 1:1 with op content, and the loud check for a violation
+  lives in [`BudgetState::apply`] — where plaintext always exists, on
+  every replica. The state fingerprints every applied op by `op_id`;
+  replaying identical content is a no-op, while reusing an id for
+  different content is an `OpIdConflict` error, because replicas fed the
+  two variants would otherwise diverge silently.
 - `delta_since(seq)` serves ops with sequence greater than `seq`, in
   canonical order; `tip()` is the high-water mark a client compares its
   cursor against.
@@ -41,7 +44,7 @@ server:
 
 A session is one device's `BudgetState` plus its `Hlc` clock plus a
 `last_seen` cursor (0 = nothing seen). `apply_delta(ops)` processes ops in
-delivered order:
+any order:
 
 - every op goes through the slice-1 idempotent LWW apply — duplicate
   `op_id`s are no-ops, stale stamps lose, arrival order does not matter;
@@ -49,8 +52,13 @@ delivered order:
   receive path — so after any delta the clock dominates every received
   stamp, and a subsequent local tick outranks all of them, whatever the
   device skews were (skew heals on receive, ADR 0007);
-- `last_seen` is the monotonic high-water mark of processed sequences —
-  overlapping or reordered re-delivery can advance it, never regress it;
+- `last_seen` is a **contiguous resume watermark**: it advances only
+  across gap-free prefixes of processed sequences. Reordered ops apply
+  immediately but are held pending until the sequences below them arrive,
+  so `delta_since(last_seen)` can never skip an unprocessed op — the
+  wedge a max-seq cursor would have. Sequence values are advisory input:
+  absurd values can stall a watermark but never move it past unapplied
+  ops;
 - the first failing op aborts the delta with its `ApplyError`: ops
   processed before it stay applied, the cursor stops at the failure, and
   retrying the same delta reproduces the same error. Corruption is loud;
@@ -72,9 +80,11 @@ see (ADR 0009):
 `Op::into_parts()` / `Op::from_parts()` convert. The **single serialization
 choke point** is the `encode_payload` / `decode_payload` pair (serde_json
 today): the E2EE layer wraps exactly this pair, and a future format change
-touches exactly this pair. JSON over a binary format: self-describing,
-debuggable on the wire, and matching the third-party API surface ADR 0012
-wants.
+touches exactly this pair. `OpPayload` carries no public serde impls — the
+wire shape is a private type inside the choke point — so there is no way
+around it; `OpMeta` is plain serde, being exactly the part the server may
+see. JSON over a binary format: self-describing, debuggable on the wire,
+and matching the third-party API surface ADR 0012 wants.
 
 Encoding rules, all round-trip exact:
 
@@ -83,9 +93,21 @@ Encoding rules, all round-trip exact:
 - money: integer milliunits (`i64`) — never a float or a decimal string
   (ADR 0006; the workspace float guard polices everything around it);
 - dates and months: strict fixed-width strings (`2026-10-23`, `2026-10`) —
-  the existing `Display`/`FromStr` pair, already proven inverse;
+  the existing `Display`/`FromStr` pair, already proven inverse, with the
+  constructor domain narrowed to the 0000–9999 years the fixed width can
+  round-trip;
+- HLC stamps: validated on deserialize — `physical_ms` beyond `i64::MAX`
+  is not a wall clock, and `logical == u32::MAX` is reserved so `merge`
+  can always bump and `tick` can always borrow the next millisecond; a
+  wire value can never exhaust a session's clock (loud error, never a
+  panic, ADR 0016);
 - enums: serde's default external tagging; `Hlc` as
   `{ "physical_ms", "logical" }`.
+
+The decoder is deliberately lenient about shapes this core does not own:
+alternative UUID string formats and unknown JSON keys are accepted. The
+canonical form is what we emit; strictness and canonicalization tighten at
+the versioned protocol freeze the transport slice brings (ADR 0012).
 
 ### Convergence: statement and proof method
 
@@ -98,13 +120,18 @@ identical states — regardless of shuffle, duplication, batching, or clock
 skew. Completeness of delivery is the (future) transport's contract.
 
 **Tests** (deterministic xorshift loops, ADR 0016 convention — no new test
-dependencies): N devices with fixed skew offsets — two sharing a clock to
-force equal-HLC ties, one running a year ahead — writing ops across every
-entity kind with tombstone/resurrection races and references to missing
-entities; delivered (a) through the rendezvous loop — shuffled pushes,
-random-sized pulls, overlapping at-least-once re-pulls — and (b) as direct
-shuffled deliveries with injected duplicates; every device must equal the
-canonical-order reference, across many seeds.
+dependencies): N devices with fixed skew offsets — two sharing a clock, one
+running a year ahead — writing ops across every entity kind with
+tombstone/resurrection races and references to missing entities; delivered
+(a) through the rendezvous loop — shuffled pushes, random-sized pulls,
+overlapping at-least-once re-pulls — and (b) as direct shuffled deliveries
+with injected duplicates; every device must equal the canonical-order
+reference, across many seeds. An equal-HLC tie is forced at the winning
+stamp every seed — the year-ahead device's final op mirrored onto a twin
+with the same entity, field, and HLC but its own `op_id` — and every
+replica's materialized value for that field is asserted against the
+independently computed `op_id`-max winner, so the tie-break's decision is
+observed directly, not just carried along inside equal states.
 
 ## Deferred (deliberately out of this slice)
 
@@ -140,6 +167,6 @@ paging, auth and membership.
   well-formed; violations of either surface as errors, never as divergence.
 - The wire format is now load-bearing: it must be versioned and frozen
   before external clients depend on it (ADR 0012).
-- `OpIdConflict` makes `op_id` reuse a loud rendezvous-side event — a buggy
-  client minting colliding ids is caught at the log, not by silent
-  divergence between devices.
+- `op_id` reuse with different content is loud on every replica at apply
+  time — a broken client minting colliding ids is caught wherever the
+  colliding op lands, never by silent divergence between devices.

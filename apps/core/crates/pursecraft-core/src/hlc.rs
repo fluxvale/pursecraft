@@ -8,12 +8,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 /// A hybrid logical clock timestamp.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Hlc {
     /// Wall-clock milliseconds since the Unix epoch.
     pub physical_ms: u64,
     /// Monotonic counter within the same millisecond.
     pub logical: u32,
+}
+
+/// The wire shape of [`Hlc`], deserialized before validation.
+#[derive(Deserialize)]
+struct HlcWire {
+    physical_ms: u64,
+    logical: u32,
+}
+
+impl<'de> Deserialize<'de> for Hlc {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = HlcWire::deserialize(deserializer)?;
+        // Boundary rule (ADR 0017): stamps off the u64 cliff are rejected
+        // so `merge` can always bump the logical counter and `tick` can
+        // always borrow the next millisecond — a wire value can never
+        // exhaust the clock (corruption is a loud error, not a panic,
+        // ADR 0016). `physical_ms` beyond i64::MAX is not a wall clock.
+        if wire.physical_ms > i64::MAX as u64 || wire.logical == u32::MAX {
+            return Err(serde::de::Error::custom(
+                "hlc out of range: physical_ms must be <= i64::MAX and logical < u32::MAX",
+            ));
+        }
+        Ok(Self {
+            physical_ms: wire.physical_ms,
+            logical: wire.logical,
+        })
+    }
 }
 
 impl Hlc {

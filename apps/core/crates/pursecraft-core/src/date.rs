@@ -17,9 +17,12 @@ pub struct Date {
 }
 
 impl Date {
-    /// `None` unless `(year, month, day)` is a real calendar date.
+    /// `None` unless `(year, month, day)` is a real calendar date. Years
+    /// stay within 0000–9999 so `Display` is fixed-width and parses back
+    /// (ADR 0017: round-trip exact).
     pub fn new(year: u16, month: u8, day: u8) -> Option<Self> {
-        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        if year > 9999 || !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month)
+        {
             return None;
         }
         Some(Self { year, month, day })
@@ -78,7 +81,7 @@ impl Serialize for Date {
 
 impl<'de> Deserialize<'de> for Date {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        <&str>::deserialize(deserializer)?
+        String::deserialize(deserializer)?
             .parse()
             .map_err(serde::de::Error::custom)
     }
@@ -126,9 +129,10 @@ pub struct Month {
 }
 
 impl Month {
-    /// `None` unless `month` is 1–12.
+    /// `None` unless `month` is 1–12 (and the year fits the fixed-width
+    /// `YYYY` form, 0000–9999).
     pub fn new(year: u16, month: u8) -> Option<Self> {
-        if (1..=12).contains(&month) {
+        if year <= 9999 && (1..=12).contains(&month) {
             Some(Self { year, month })
         } else {
             None
@@ -164,7 +168,7 @@ impl Serialize for Month {
 
 impl<'de> Deserialize<'de> for Month {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        <&str>::deserialize(deserializer)?
+        String::deserialize(deserializer)?
             .parse()
             .map_err(serde::de::Error::custom)
     }

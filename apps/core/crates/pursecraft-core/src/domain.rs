@@ -268,7 +268,7 @@ pub enum MonthCategoryField {
 
 /// A field value — the closed vocabulary the op log writes, and the future
 /// single serialization choke point (ADR 0009, ADR 0016).
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Value {
     Bool(bool),
     Text(String),

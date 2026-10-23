@@ -5,8 +5,9 @@
 //! payload, and only `op_id`, `budget_id`, `device_id`, `user_id`, and the
 //! HLC timestamp are server-visible metadata.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use crate::domain::{
     AccountField, BudgetField, CategoryField, CategoryGroupField, Entity, EntityKind, Field,
@@ -55,7 +56,11 @@ pub struct EntityRecord {
 pub struct BudgetState {
     budget: Option<BudgetId>,
     entities: HashMap<EntityId, EntityRecord>,
-    seen_ops: HashSet<OpId>,
+    /// Every applied op's id with a content fingerprint: `op_id` must be
+    /// 1:1 with op content (ADR 0017) — an id reused for different
+    /// content is loud corruption here, where plaintext always lives,
+    /// not silent per-device divergence.
+    seen_ops: HashMap<OpId, u64>,
 }
 
 /// How [`BudgetState::apply`] disposed of an op.
@@ -77,12 +82,15 @@ pub enum ApplyError {
     KindMismatch { kind: EntityKind, field: Field },
     /// The value type does not match the field.
     ValueMismatch { field: Field, value: Value },
-    /// The op is scoped to a budget other than this state's
-    /// ([ADR 0008]).
+    /// Budget mismatch against this state's single budget ([ADR 0008]).
     BudgetMismatch {
         op_budget: BudgetId,
         state_budget: BudgetId,
     },
+    /// The `op_id` was already applied with different content — `op_id`
+    /// must uniquely identify an op or replicas diverge silently, so the
+    /// collision is loud (ADR 0017).
+    OpIdConflict { op_id: OpId },
 }
 
 impl fmt::Display for ApplyError {
@@ -103,6 +111,9 @@ impl fmt::Display for ApplyError {
                     "op budget {op_budget} does not belong to budget state {state_budget}"
                 )
             }
+            Self::OpIdConflict { op_id } => {
+                write!(f, "op id {op_id} re-applied with different content")
+            }
         }
     }
 }
@@ -114,11 +125,17 @@ impl BudgetState {
         Self::default()
     }
 
-    /// Apply one op: idempotent by `op_id`, per-field LWW by
-    /// `(hlc, op_id)` (ADR 0016). Errors leave the state untouched.
+    /// Apply one op: idempotent by `op_id` (identical content replays as a
+    /// no-op; a reused id with different content is an [`ApplyError::
+    /// OpIdConflict`]), per-field LWW by `(hlc, op_id)` (ADR 0016, ADR
+    /// 0017). Errors leave the state untouched.
     pub fn apply(&mut self, op: Op) -> Result<Applied, ApplyError> {
-        if self.seen_ops.contains(&op.op_id) {
-            return Ok(Applied::Duplicate);
+        let fingerprint = op_fingerprint(&op);
+        if let Some(&seen) = self.seen_ops.get(&op.op_id) {
+            if seen == fingerprint {
+                return Ok(Applied::Duplicate);
+            }
+            return Err(ApplyError::OpIdConflict { op_id: op.op_id });
         }
         if !field_valid_for(op.entity_kind, op.field) {
             return Err(ApplyError::KindMismatch {
@@ -173,7 +190,7 @@ impl BudgetState {
         if self.budget.is_none() {
             self.budget = Some(op.budget_id);
         }
-        self.seen_ops.insert(op.op_id);
+        self.seen_ops.insert(op.op_id, fingerprint);
         Ok(outcome)
     }
 
@@ -184,6 +201,24 @@ impl BudgetState {
     pub fn entities(&self) -> impl Iterator<Item = &Entity> {
         self.entities.values().map(|r| &r.entity)
     }
+}
+
+/// A content fingerprint for one op (everything but the `op_id`, which is
+/// the key it is stored under). Deterministic within a process — it is
+/// never serialized, only compared against the stored entry for the same
+/// `op_id` (ADR 0017).
+fn op_fingerprint(op: &Op) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    op.budget_id.hash(&mut hasher);
+    op.device_id.hash(&mut hasher);
+    op.user_id.hash(&mut hasher);
+    op.entity_kind.hash(&mut hasher);
+    op.entity_id.hash(&mut hasher);
+    op.field.hash(&mut hasher);
+    op.value.hash(&mut hasher);
+    op.hlc.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Whether `field` can be written on `kind` — checked before any mutation.
@@ -390,15 +425,30 @@ mod tests {
         let before = state.clone();
         assert_eq!(state.apply(first.clone()), Ok(Applied::Duplicate));
         assert_eq!(state, before, "duplicate replays must not touch state");
-        // Same op_id with a newer HLC is still the same op — deduped.
-        let mut replay = txn_op(6, 99, 9, field, amount_field(1_000).1);
-        replay.op_id = first.op_id;
-        replay.hlc = Hlc {
-            physical_ms: 99,
-            logical: 9,
-        };
-        assert_eq!(state.apply(replay), Ok(Applied::Duplicate));
-        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn reused_op_id_with_different_content_is_loud() {
+        let mut state = BudgetState::new();
+        let (field, _) = amount_field(1_000);
+        let first = txn_op(5, 10, 0, field, amount_field(1_000).1);
+        state.apply(first.clone()).unwrap();
+        let before = state.clone();
+        // Same op_id, any changed field — hlc here, value there — is
+        // corruption: two replicas fed the two variants would otherwise
+        // diverge silently (ADR 0017).
+        let restamped = txn_op(5, 99, 9, field, amount_field(1_000).1);
+        let revalued = txn_op(5, 10, 0, Field::Deleted, Value::Bool(true));
+        for mut mutated in [restamped, revalued] {
+            mutated.op_id = first.op_id;
+            assert_eq!(
+                state.apply(mutated),
+                Err(ApplyError::OpIdConflict { op_id: first.op_id })
+            );
+        }
+        assert_eq!(state, before, "a rejected op must not touch state");
+        // Identical replay is still a silent no-op.
+        assert_eq!(state.apply(first), Ok(Applied::Duplicate));
     }
 
     #[test]

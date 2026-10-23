@@ -24,14 +24,49 @@ pub struct OpMeta {
     pub hlc: Hlc,
 }
 
-/// The opaque op payload (ADR 0009): encrypted in transit in a later slice;
-/// here it is data the core serializes through one choke point.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// The opaque op payload (ADR 0009): encrypted in transit in a later
+/// layer; here it is data the core serializes through one choke point.
+/// Deliberately NOT `Serialize`/`Deserialize` in public form —
+/// [`encode_payload`] / [`decode_payload`] are the only serialization
+/// surface, so the future E2EE layer cannot be bypassed around (ADR 0017).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OpPayload {
     pub entity_kind: EntityKind,
     pub entity_id: EntityId,
     pub field: Field,
     pub value: Value,
+}
+
+/// The private wire shape of [`OpPayload`] — serde lives here, one step
+/// inside the choke point.
+#[derive(Serialize, Deserialize)]
+struct PayloadWire {
+    entity_kind: EntityKind,
+    entity_id: EntityId,
+    field: Field,
+    value: Value,
+}
+
+impl From<&OpPayload> for PayloadWire {
+    fn from(payload: &OpPayload) -> Self {
+        Self {
+            entity_kind: payload.entity_kind,
+            entity_id: payload.entity_id,
+            field: payload.field,
+            value: payload.value.clone(),
+        }
+    }
+}
+
+impl From<PayloadWire> for OpPayload {
+    fn from(wire: PayloadWire) -> Self {
+        Self {
+            entity_kind: wire.entity_kind,
+            entity_id: wire.entity_id,
+            field: wire.field,
+            value: wire.value,
+        }
+    }
 }
 
 impl Op {
@@ -74,12 +109,12 @@ impl Op {
 /// ciphertext here when the E2EE layer lands; change format here if it ever
 /// changes.
 pub fn encode_payload(payload: &OpPayload) -> Result<String, serde_json::Error> {
-    serde_json::to_string(payload)
+    serde_json::to_string(&PayloadWire::from(payload))
 }
 
 /// The decode half of the choke point.
 pub fn decode_payload(wire: &str) -> Result<OpPayload, serde_json::Error> {
-    serde_json::from_str(wire)
+    serde_json::from_str::<PayloadWire>(wire).map(OpPayload::from)
 }
 
 #[cfg(test)]
@@ -329,18 +364,88 @@ mod tests {
     }
 
     #[test]
-    fn parts_split_covers_the_whole_op() {
-        // from_parts ∘ into_parts is identity on a fully populated op; the
-        // smoke check that every field of `Op` lives in exactly one part.
+    fn hostile_hlc_stamps_are_rejected_before_they_can_exhaust_the_clock() {
+        // One wire op with logical == u32::MAX would panic `Hlc::merge` in
+        // the receive path; physical_ms past i64::MAX is not a wall clock
+        // and lets later ticks run off the u64 cliff. Both are rejected at
+        // decode (ADR 0017).
+        let meta = op(
+            EntityKind::Transaction,
+            6,
+            Field::Deleted,
+            Value::Bool(true),
+        )
+        .into_parts()
+        .0;
+        for bad in [
+            r#"{"physical_ms":0,"logical":4294967295}"#,
+            r#"{"physical_ms":18446744073709551615,"logical":0}"#,
+            r#"{"physical_ms":9223372036854775808,"logical":0}"#,
+        ] {
+            let mut hostile = serde_json::to_value(&meta).unwrap();
+            hostile["hlc"] = serde_json::from_str(bad).unwrap();
+            assert!(
+                serde_json::from_value::<OpMeta>(hostile).is_err(),
+                "accepted hostile hlc {bad}"
+            );
+        }
+        // The boundary values just inside the rule are fine — and applying
+        // such an op then ticking the session clock cannot panic.
+        let mut extreme = serde_json::to_value(&meta).unwrap();
+        extreme["hlc"] =
+            serde_json::from_str(r#"{"physical_ms":9223372036854775807,"logical":4294967294}"#)
+                .unwrap();
+        let meta: OpMeta = serde_json::from_value(extreme).unwrap();
+        let mut session = crate::sync::SyncSession::new();
+        let payload = OpPayload {
+            entity_kind: EntityKind::Transaction,
+            entity_id: EntityId::new(v7(MS, 6)).unwrap(),
+            field: Field::Deleted,
+            value: Value::Bool(true),
+        };
+        session
+            .apply_delta(&[crate::sync::SequencedOp {
+                seq: 1,
+                op: Op::from_parts(meta, payload),
+            }])
+            .unwrap();
+        let mut clock = session.clock();
+        clock.tick();
+    }
+
+    #[test]
+    fn dates_and_months_decode_from_any_serde_source() {
+        // String-based deserialization must work for from_value and
+        // from_reader too, not only from_str (ADR 0017: the choke point is
+        // transport-ready).
+        let payload = OpPayload {
+            entity_kind: EntityKind::Transaction,
+            entity_id: EntityId::new(v7(MS, 6)).unwrap(),
+            field: Field::Transaction(TransactionField::Date),
+            value: Value::Date(Date::new(2026, 10, 23).unwrap()),
+        };
+        let wire = serde_json::to_value(PayloadWire::from(&payload)).unwrap();
+        let back: PayloadWire = serde_json::from_value(wire).unwrap();
+        assert_eq!(OpPayload::from(back), payload);
+    }
+
+    #[test]
+    fn parts_assign_every_op_field_to_exactly_one_side() {
         let op = every_variant().pop().unwrap();
         let (meta, payload) = op.clone().into_parts();
-        assert_eq!(Op::from_parts(meta, payload.clone()), op);
-        let entity = TransactionId::new(v7(MS, 6)).unwrap();
-        assert_eq!(payload.entity_id.as_uuid(), entity.as_uuid());
-        assert_eq!(
-            payload.value,
-            Value::Bool(true),
-            "the last variant op is the tombstone"
-        );
+        // The five metadata fields live in OpMeta and only there.
+        assert_eq!(meta.op_id, op.op_id);
+        assert_eq!(meta.budget_id, op.budget_id);
+        assert_eq!(meta.device_id, op.device_id);
+        assert_eq!(meta.user_id, op.user_id);
+        assert_eq!(meta.hlc, op.hlc);
+        // The four payload fields live in OpPayload and only there.
+        assert_eq!(payload.entity_kind, op.entity_kind);
+        assert_eq!(payload.entity_id, op.entity_id);
+        assert_eq!(payload.field, op.field);
+        assert_eq!(payload.value, op.value);
+        // Rejoining rebuilds the op bit for bit.
+        assert_eq!(Op::from_parts(meta, payload), op);
+        let _ = TransactionId::new(v7(MS, 6)).unwrap();
     }
 }
