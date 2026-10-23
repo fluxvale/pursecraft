@@ -61,7 +61,8 @@ pub(crate) mod testkit {
     }
 
     /// A per-test scratch directory under the system temp dir, removed on
-    /// drop (best effort). No tempfile dependency (ADR 0016: zero test
+    /// drop (best effort — a panicking test leaks its scratch dir, which
+    /// is harmless). No tempfile dependency (ADR 0016: zero test
     /// dependencies).
     pub(crate) struct TempDir(PathBuf);
 

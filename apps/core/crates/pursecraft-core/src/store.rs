@@ -1,11 +1,12 @@
 //! The durable local oplog store (ADRs 0007, 0009, 0017, 0018): the
 //! append-only framed file a real client boots the engine from.
 //!
-//! [`LocalStore`] wraps the 0017 [`OpLog`] — file order is canonical order,
-//! the `op_id` dedupe index is rebuilt on boot, and an append commits when
-//! `sync_data` returns. Applied state is never persisted: boot is replay
-//! through the ordinary [`crate::sync::SyncSession`] path, so
-//! boot-from-store equals in-memory replay by construction (ADR 0018).
+//! [`LocalStore`] wraps the 0017 [`OpLog`] — records carry their canonical
+//! sequences, the `op_id` dedupe index is rebuilt on boot, and an append
+//! commits when its frame and the header's commit marker land under one
+//! `sync_data`. Applied state is never persisted: boot is replay through
+//! the ordinary [`crate::sync::SyncSession`] path, so boot-from-store
+//! equals in-memory replay by construction (ADR 0018).
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -22,8 +23,10 @@ use crate::wire::{self, OpMeta};
 /// File magic; a strict prefix of it is a torn create (ADR 0018).
 const MAGIC: [u8; 8] = *b"PCOPLOG\0";
 const FORMAT_VERSION: u16 = 1;
-/// magic (8) + version (2) + reserved for the snapshot extension (2).
-const HEADER_LEN: usize = 12;
+/// magic (8) + version (2) + reserved (2) + commit marker (8).
+const HEADER_LEN: usize = 20;
+/// Offset of the commit marker within the header.
+const HWM_OFFSET: usize = 12;
 /// Frame overhead: body length (4) + checksum (8).
 const FRAME_OVERHEAD: usize = 12;
 
@@ -38,24 +41,63 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     })
 }
 
-/// One stored op: server-visible metadata verbatim plus the payload as the
-/// choke-point string (ADRs 0009, 0018) — the future at-rest encryption
-/// layer changes what that string holds, not this shape.
+/// The commit marker: the highest sequence whose frame-and-marker write
+/// was synced (ADR 0018). Stored as `[seq][!seq]` so a torn marker write
+/// is detectable — and safely ignored, because a torn marker means the
+/// commit never acked.
+fn marker_bytes(seq: u64) -> Result<[u8; 8], StoreError> {
+    let seq = u32::try_from(seq).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "store sequence exceeds the u32 commit marker",
+        )
+    })?;
+    let mut marker = [0u8; 8];
+    marker[..4].copy_from_slice(&seq.to_le_bytes());
+    marker[4..].copy_from_slice(&(!seq).to_le_bytes());
+    Ok(marker)
+}
+
+/// The commit marker, if it is intact. `None` means torn or absent — the
+/// commit it belonged to never acked, so boot resumes from the loaded
+/// frames alone (ADR 0018).
+fn parse_marker(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let seq = u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes"));
+    let inverted = u32::from_le_bytes(bytes[4..].try_into().expect("4 bytes"));
+    (seq == !inverted).then_some(u64::from(seq))
+}
+
+/// One stored op: its canonical sequence (a repair can leave gaps, so
+/// sequences cannot be re-derived from position), the server-visible
+/// metadata verbatim, and the payload as the choke-point string (ADRs
+/// 0009, 0018) — the future at-rest encryption layer changes what that
+/// string holds, not this shape.
 #[derive(Serialize, Deserialize)]
 struct StoredOp {
+    seq: u64,
     meta: OpMeta,
     payload: String,
 }
 
-/// Serialize one op into its frame (ADR 0018).
-fn encode_frame(op: &Op) -> Result<Vec<u8>, serde_json::Error> {
+/// Serialize one op into its frame under `seq` (ADR 0018).
+fn encode_frame(op: &Op, seq: u64) -> Result<Vec<u8>, StoreError> {
     let (meta, payload) = op.clone().into_parts();
     let body = serde_json::to_vec(&StoredOp {
+        seq,
         meta,
         payload: wire::encode_payload(&payload)?,
     })?;
+    let len = u32::try_from(body.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stored record exceeds the u32 frame length",
+        )
+    })?;
     let mut frame = Vec::with_capacity(body.len() + FRAME_OVERHEAD);
-    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&len.to_le_bytes());
     frame.extend_from_slice(&fnv1a64(&body).to_le_bytes());
     frame.extend_from_slice(&body);
     Ok(frame)
@@ -63,23 +105,26 @@ fn encode_frame(op: &Op) -> Result<Vec<u8>, serde_json::Error> {
 
 /// What the boot scan found at one offset.
 enum Scan {
-    /// A valid frame, decoded; the offset just past it.
-    Op(Op, usize),
-    /// An uncommitted torn tail — nothing complete here (ADR 0018).
-    Torn,
-    /// Bytes our writer cannot have produced — loud corruption.
+    /// A valid frame, decoded with its recorded sequence; the offset just
+    /// past it.
+    Op(SequencedOp, usize),
+    /// Structurally incomplete or checksum-failed — a torn tail or
+    /// mid-file damage; the caller classifies by resync (ADR 0018).
+    Invalid,
+    /// Checksum-valid bytes that cannot be a stored op — the writer never
+    /// frames such bytes; loud without resync.
     Corrupt(&'static str),
 }
 
-/// Validate and decode the frame at `offset` (ADR 0018's recovery rules).
+/// Validate and decode the frame at `offset` (ADR 0018's framing rules).
 fn scan_frame(bytes: &[u8], offset: usize) -> Scan {
     let remaining = bytes.len() - offset;
     if remaining < FRAME_OVERHEAD {
-        return Scan::Torn;
+        return Scan::Invalid;
     }
     let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("length field"));
     if u64::from(len) > (remaining - FRAME_OVERHEAD) as u64 {
-        return Scan::Torn;
+        return Scan::Invalid;
     }
     let end = offset + FRAME_OVERHEAD + len as usize;
     let body = &bytes[offset + FRAME_OVERHEAD..end];
@@ -89,23 +134,59 @@ fn scan_frame(bytes: &[u8], offset: usize) -> Scan {
             .expect("checksum field"),
     );
     if fnv1a64(body) != checksum {
-        // A bad checksum is a torn write only as the physical last frame:
-        // bad bytes followed by valid ones cannot come from the write
-        // protocol (single writer, sequential appends) — corruption.
-        return if end == bytes.len() {
-            Scan::Torn
-        } else {
-            Scan::Corrupt("frame checksum mismatch")
-        };
+        return Scan::Invalid;
     }
     let stored: StoredOp = match serde_json::from_slice(body) {
         Ok(stored) => stored,
         Err(_) => return Scan::Corrupt("stored op does not decode"),
     };
     match wire::decode_payload(&stored.payload) {
-        Ok(payload) => Scan::Op(Op::from_parts(stored.meta, payload), end),
+        Ok(payload) => Scan::Op(
+            SequencedOp {
+                seq: stored.seq,
+                op: Op::from_parts(stored.meta, payload),
+            },
+            end,
+        ),
         Err(_) => Scan::Corrupt("op payload does not decode"),
     }
+}
+
+/// Whether a checksum-valid frame chain starts somewhere after `from` and
+/// runs exactly to EOF — proof that the writer produced frames beyond
+/// `from`, so damage at `from` is mid-file corruption, not the torn tail
+/// (ADR 0018). Bodies need not decode for this decision: valid framing
+/// alone is writer structure.
+fn valid_chain_follows(bytes: &[u8], from: usize) -> bool {
+    (from..bytes.len()).any(|start| chain_reaches_eof(bytes, start))
+}
+
+fn chain_reaches_eof(bytes: &[u8], start: usize) -> bool {
+    let mut offset = start;
+    let mut frames = 0;
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        if remaining < FRAME_OVERHEAD {
+            return false;
+        }
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("length field"));
+        if u64::from(len) > (remaining - FRAME_OVERHEAD) as u64 {
+            return false;
+        }
+        let end = offset + FRAME_OVERHEAD + len as usize;
+        let body = &bytes[offset + FRAME_OVERHEAD..end];
+        let checksum = u64::from_le_bytes(
+            bytes[offset + 4..offset + FRAME_OVERHEAD]
+                .try_into()
+                .expect("checksum field"),
+        );
+        if fnv1a64(body) != checksum {
+            return false;
+        }
+        offset = end;
+        frames += 1;
+    }
+    offset == bytes.len() && frames > 0
 }
 
 /// A store failure — foreign, corrupt, or future-version stores fail
@@ -119,13 +200,13 @@ pub enum StoreError {
     Foreign {
         path: PathBuf,
     },
-    /// A store written by a future format version.
+    /// A store using format features this core does not support.
     UnsupportedVersion {
         path: PathBuf,
         found: u16,
         supported: u16,
     },
-    /// Structural corruption at `offset`; boot is refused.
+    /// Structural damage at `offset`; boot is refused.
     Corrupt {
         path: PathBuf,
         offset: u64,
@@ -151,7 +232,7 @@ impl fmt::Display for StoreError {
                 supported,
             } => write!(
                 f,
-                "{path:?} is store format {found}; this core supports {supported}"
+                "{path:?} uses store format features this core does not support (found {found}, supported {supported})"
             ),
             Self::Corrupt {
                 path,
@@ -162,7 +243,7 @@ impl fmt::Display for StoreError {
                 f,
                 "{path:?} was left unusable by a failed append; reopen it to recover"
             ),
-            Self::Scope(e) => write!(f, "append rejected: {e}"),
+            Self::Scope(e) => write!(f, "op rejected by the log: {e}"),
         }
     }
 }
@@ -199,7 +280,8 @@ impl From<LogError> for StoreError {
 /// The durable local oplog store (ADR 0018): the 0017 [`OpLog`] with an
 /// append-only framed file under it. File order is canonical order; ops
 /// dedupe by `op_id` exactly as in memory; the commit point of an append
-/// is `sync_data` returning.
+/// is its frame and the header's commit marker landing under one
+/// `sync_data`.
 #[derive(Debug)]
 pub struct LocalStore {
     log: OpLog,
@@ -208,6 +290,8 @@ pub struct LocalStore {
     /// The file length the last successful commit covers — the boundary a
     /// failed append rolls back to.
     durable_len: u64,
+    /// The last committed sequence — what the header marker holds.
+    hwm: u64,
     /// Set when a failed append could not roll back (ADR 0018).
     poisoned: bool,
 }
@@ -215,7 +299,8 @@ pub struct LocalStore {
 impl LocalStore {
     /// Open (creating if absent) the store at `path`, rebuilding the
     /// in-memory log from disk. An uncommitted torn tail is repaired;
-    /// foreign, corrupt, and future-version files fail loudly (ADR 0018).
+    /// foreign, corrupt, and unsupported files fail loudly; committed
+    /// sequences are never reused (ADR 0018).
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let mut file = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(file) => file,
@@ -239,26 +324,51 @@ impl LocalStore {
             Self::recreate(&mut file)?;
             return Ok(Self::empty(path, file));
         }
-        let found = u16::from_le_bytes(bytes[8..10].try_into().expect("version field"));
-        if found != FORMAT_VERSION {
+        let version = u16::from_le_bytes(bytes[8..10].try_into().expect("version field"));
+        let reserved = u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field"));
+        let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
+        // Version 0 with no marker is a torn create (numbering starts at
+        // 1; a fresh file's unwritten bytes are zero). Anything else off
+        // is a format this core does not understand — loud, never
+        // clobbered (ADR 0018).
+        if version == 0 && reserved == 0 && marker.is_none() {
+            Self::recreate(&mut file)?;
+            return Ok(Self::empty(path, file));
+        }
+        if version != FORMAT_VERSION || reserved != 0 {
             return Err(StoreError::UnsupportedVersion {
                 path: path.to_owned(),
-                found,
+                found: if version != FORMAT_VERSION {
+                    version
+                } else {
+                    reserved
+                },
                 supported: FORMAT_VERSION,
             });
         }
-        let mut log = OpLog::new();
+
+        let mut records = Vec::new();
         let mut offset = HEADER_LEN;
         while offset < bytes.len() {
             match scan_frame(&bytes, offset) {
-                Scan::Op(op, end) => {
-                    log.append(op).map_err(StoreError::Scope)?;
+                Scan::Op(record, end) => {
+                    records.push(record);
                     offset = end;
                 }
-                Scan::Torn => {
-                    // An uncommitted tail: cut it and make the cut durable.
+                Scan::Invalid => {
+                    // Classify by resync: valid frames beyond the damage
+                    // prove mid-file corruption — loud, file untouched.
+                    // No chain after it is the crash window's torn tail:
+                    // cut it and make the cut durable (ADR 0018).
+                    if valid_chain_follows(&bytes, offset + 1) {
+                        return Err(StoreError::Corrupt {
+                            path: path.to_owned(),
+                            offset: offset as u64,
+                            reason: "frame is invalid but valid frames follow it",
+                        });
+                    }
                     file.set_len(offset as u64)?;
-                    file.sync_data()?;
+                    file.sync_all()?;
                     break;
                 }
                 Scan::Corrupt(reason) => {
@@ -270,11 +380,26 @@ impl LocalStore {
                 }
             }
         }
+
+        // Resume the sequence space above everything ever committed: the
+        // loaded tip, or the marker if committed frames were lost to
+        // damage — a gap then, which stalls watermarks visibly by design
+        // (ADR 0017) and never reuses a sequence a peer may have seen
+        // (ADR 0018). A torn marker means its commit never acked; the
+        // loaded frames are all that was observable.
+        let tip = records.last().map(|r| r.seq).unwrap_or(0);
+        let hwm = marker.map_or(tip, |marker| marker.max(tip));
+        let mut log = OpLog::resuming_at(hwm + 1);
+        for record in records {
+            log.append_sequenced(record.seq, record.op)
+                .map_err(StoreError::Scope)?;
+        }
         Ok(Self {
             log,
             path: path.to_owned(),
             file,
             durable_len: offset as u64,
+            hwm,
             poisoned: false,
         })
     }
@@ -282,13 +407,23 @@ impl LocalStore {
     /// Append one op durably; returns its canonical sequence. Scoping and
     /// `op_id` dedupe follow the in-memory log exactly (ADR 0017): a
     /// mis-scoped op is rejected, a re-append returns the original
-    /// sequence and writes nothing. The commit point is `sync_data`
-    /// returning; a failed durable write rolls the file back to the last
-    /// commit — and poisons the store if even that fails (ADR 0018).
+    /// sequence and writes nothing. The commit point is the single
+    /// `sync_data` after the frame and the header marker land; a failed
+    /// commit rolls both back — and poisons the store if even that fails
+    /// (ADR 0018).
     pub fn append(&mut self, op: Op) -> Result<u64, StoreError> {
         if self.poisoned {
             return Err(StoreError::Poisoned {
                 path: self.path.clone(),
+            });
+        }
+        // The single-writer contract: the file must still end where the
+        // last commit left it.
+        if self.file.metadata()?.len() != self.durable_len {
+            return Err(StoreError::Corrupt {
+                path: self.path.clone(),
+                offset: self.durable_len,
+                reason: "file no longer ends at the committed boundary (single-writer contract violated)",
             });
         }
         if let Some(log_budget) = self.log.budget_id()
@@ -303,28 +438,22 @@ impl LocalStore {
         if let Some(seq) = self.log.seq_of(&op.op_id) {
             return Ok(seq);
         }
-        let frame = encode_frame(&op)?;
+        let seq = self.log.next_seq();
+        let frame = encode_frame(&op, seq)?;
+        let marker = marker_bytes(seq)?;
         let committed = self.durable_len;
-        self.file.seek(SeekFrom::Start(committed))?;
-        if let Err(e) = self
-            .file
-            .write_all(&frame)
-            .and_then(|()| self.file.sync_data())
-        {
-            // Drop any partial frame so the tail stays frame-aligned; if
-            // even the rollback fails the store is unusable until
-            // reopened (ADR 0018's poison rule).
-            if self
-                .file
-                .set_len(committed)
-                .and_then(|()| self.file.sync_all())
-                .is_err()
-            {
+        let previous_marker = marker_bytes(self.hwm)?;
+        if let Err(e) = commit_bytes(&mut self.file, committed, &frame, &marker) {
+            // Restore the previous marker, drop any partial frame, and
+            // make both durable; if even the rollback fails the store is
+            // unusable until reopened (ADR 0018).
+            if rollback(&mut self.file, &previous_marker, committed).is_err() {
                 self.poisoned = true;
             }
             return Err(e.into());
         }
         self.durable_len = committed + frame.len() as u64;
+        self.hwm = seq;
         // Scope and dedupe were checked above; this append cannot fail.
         self.log.append(op).map_err(StoreError::Scope)
     }
@@ -351,13 +480,15 @@ impl LocalStore {
             path: path.to_owned(),
             file,
             durable_len: HEADER_LEN as u64,
+            hwm: 0,
             poisoned: false,
         }
     }
 
-    /// Create a fresh store: the header goes down durably first, then the
-    /// directory entry (ADR 0018). The caller has just seen the path not
-    /// exist (single writer per path is the caller's contract).
+    /// Create a fresh store: the header (version, zero marker) goes down
+    /// durably first, then the directory entry (ADR 0018). The caller has
+    /// just seen the path not exist (single writer per path is the
+    /// caller's contract).
     fn create(path: &Path) -> Result<Self, StoreError> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -380,11 +511,33 @@ impl LocalStore {
     }
 }
 
+/// The one durable write of an append: the frame at the committed
+/// boundary, then the commit marker in the header, then a single sync —
+/// both land or neither (ADR 0018).
+fn commit_bytes(file: &mut File, at: u64, frame: &[u8], marker: &[u8; 8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(at))?;
+    file.write_all(frame)?;
+    file.seek(SeekFrom::Start(HWM_OFFSET as u64))?;
+    file.write_all(marker)?;
+    file.sync_data()
+}
+
+/// Undo a failed commit: previous marker back, file cut to the committed
+/// boundary, made durable (ADR 0018).
+fn rollback(file: &mut File, previous_marker: &[u8; 8], committed: u64) -> io::Result<()> {
+    file.seek(SeekFrom::Start(HWM_OFFSET as u64))?;
+    file.write_all(previous_marker)?;
+    file.set_len(committed)?;
+    file.sync_all()
+}
+
 fn header() -> [u8; HEADER_LEN] {
     let mut header = [0u8; HEADER_LEN];
     header[..MAGIC.len()].copy_from_slice(&MAGIC);
     header[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-    // [10..12] stays zero: reserved for the snapshot extension (ADR 0018).
+    // The reserved word stays zero; a future extension must set it, and
+    // readers refuse non-zero rather than misread (ADR 0018).
+    header[HWM_OFFSET..HEADER_LEN].copy_from_slice(&marker_bytes(0).expect("zero marker"));
     header
 }
 
@@ -405,7 +558,7 @@ fn sync_parent_dir(path: &Path) {
 mod tests {
     use super::*;
     use crate::domain::{Field, Value};
-    use crate::sync::{SequencedOp, SyncSession};
+    use crate::sync::SyncSession;
     use crate::testkit::conv::{self, DEVICES, OPS_PER_DEVICE};
     use crate::testkit::{Rng, TempDir, v7};
     use uuid::Uuid;
@@ -439,6 +592,19 @@ mod tests {
         tmp.path().join(format!("{label}.ops"))
     }
 
+    /// A store holding `count` deterministic ops, and the ops.
+    fn filled_store(path: &Path, count: u64) -> (LocalStore, Vec<Op>) {
+        let (field, value) = conv::amount(5);
+        let ops: Vec<Op> = (1..=count)
+            .map(|i| conv::op(i, 10 + i, 0, field, value.clone()))
+            .collect();
+        let mut store = LocalStore::open(path).unwrap();
+        for op in &ops {
+            store.append(op.clone()).unwrap();
+        }
+        (store, ops)
+    }
+
     #[test]
     fn a_fresh_store_is_an_empty_durable_log() {
         let tmp = TempDir::new("fresh");
@@ -446,12 +612,19 @@ mod tests {
         let store = LocalStore::open(&path).unwrap();
         assert_eq!(store.tip(), 0);
         assert_eq!(store.budget_id(), None);
-        // The header is on disk already, and a reopen stays empty.
+        // The header — magic, version, zero marker — is on disk already,
+        // and a reopen stays empty.
         let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), HEADER_LEN);
         assert_eq!(&bytes[..MAGIC.len()], b"PCOPLOG\0");
         assert_eq!(
             u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
             FORMAT_VERSION
+        );
+        assert_eq!(
+            parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]),
+            Some(0),
+            "a fresh store's marker reads zero"
         );
         drop(store);
         assert_eq!(LocalStore::open(&path).unwrap().tip(), 0);
@@ -531,15 +704,53 @@ mod tests {
     }
 
     #[test]
+    fn external_truncation_of_the_file_is_loud_at_append() {
+        // The single-writer contract: if anything else moves the file end,
+        // the store refuses to append rather than write into a hole.
+        let tmp = TempDir::new("external");
+        let path = store_path(&tmp, "budget");
+        let mut store = LocalStore::open(&path).unwrap();
+        let (field, value) = conv::amount(1);
+        store.append(conv::op(1, 10, 0, field, value)).unwrap();
+        drop(store);
+        // Shrink the file behind the store's back, then append.
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..HEADER_LEN + 5]).unwrap();
+        let mut store = LocalStore::open(&path).unwrap();
+        // open() repaired the torn tail; a fresh append must work.
+        assert_eq!(store.tip(), 0);
+        let (field, value) = conv::amount(2);
+        store.append(conv::op(9, 90, 0, field, value)).unwrap();
+        drop(store);
+        // Now truncate WHILE the store is open — the append must refuse.
+        let mut store = LocalStore::open(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut shorter = bytes.clone();
+        shorter.truncate(HEADER_LEN + 3);
+        std::fs::write(&path, &shorter).unwrap();
+        let (field, value) = conv::amount(3);
+        let result = store.append(conv::op(10, 99, 0, field, value));
+        assert!(
+            matches!(result, Err(StoreError::Corrupt { .. })),
+            "append into a moved file end is refused, got {result:?}"
+        );
+    }
+
+    #[test]
     fn booting_from_the_store_equals_a_fresh_in_memory_replay() {
         for seed in 1..=3u64 {
             let ops = conv::generate_ops(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let expected = in_memory_session(&ops);
             let tmp = TempDir::new("boot");
-            let mut store = LocalStore::open(&store_path(&tmp, "budget")).unwrap();
+            let path = store_path(&tmp, "budget");
+            let mut store = LocalStore::open(&path).unwrap();
             for op in &ops {
                 store.append(op.clone()).unwrap();
             }
+            // Boot from DISK, not the live handle — open() must re-read
+            // and re-validate every frame (ADR 0018).
+            drop(store);
+            let store = LocalStore::open(&path).unwrap();
             let booted = boot_session(&store);
             assert_eq!(booted.state(), expected.state(), "seed {seed}");
             assert_eq!(booted.last_seen(), store.tip());
@@ -610,13 +821,7 @@ mod tests {
     fn a_torn_tail_is_repaired_at_every_truncation_offset() {
         let tmp = TempDir::new("torn");
         let path = store_path(&tmp, "src");
-        let mut store = LocalStore::open(&path).unwrap();
-        let (field, value) = conv::amount(5);
-        for i in 1..=6u64 {
-            store
-                .append(conv::op(i, 10 + i, 0, field, value.clone()))
-                .unwrap();
-        }
+        let (store, ops) = filled_store(&path, 6);
         drop(store);
         let bytes = std::fs::read(&path).unwrap();
 
@@ -639,22 +844,31 @@ mod tests {
             frames
         };
 
-        // Crash at any byte: the store opens, and boots exactly the frames
-        // that fit — a prefix of the canonical order, never an error.
+        // Crash at any byte: the store opens, boots exactly the frames
+        // that fit — a prefix of the canonical order, never an error —
+        // and never reuses a committed sequence.
         for cut in 0..bytes.len() {
             let cut_path = tmp.path().join(format!("cut-{cut}.ops"));
             std::fs::write(&cut_path, &bytes[..cut]).unwrap();
-            let store = LocalStore::open(&cut_path).unwrap();
+            let mut store = LocalStore::open(&cut_path).unwrap();
             let expected = if cut < HEADER_LEN {
                 0
             } else {
                 complete_frames(cut)
             };
             assert_eq!(store.tip(), expected, "cut at byte {cut}");
+            // All six ops were committed before the "crash": the next
+            // append resumes above the marker — a gap, not a reuse
+            // (ADR 0018).
+            let (field, value) = conv::amount(11);
+            let next = store.append(conv::op(99, 99, 0, field, value)).unwrap();
+            let expect_next = if cut < HEADER_LEN { 1 } else { 7 };
+            assert_eq!(next, expect_next, "cut at byte {cut}");
+            drop(store);
         }
 
-        // Cutting inside the last frame loses only that uncommitted op,
-        // and the repaired store re-delivers cleanly.
+        // Cutting inside the last frame loses only that op, and the
+        // repaired store re-delivers cleanly.
         let cut = bytes.len() - 7;
         let cut_path = tmp.path().join("tail-cut.ops");
         std::fs::write(&cut_path, &bytes[..cut]).unwrap();
@@ -662,19 +876,150 @@ mod tests {
         assert_eq!(store.tip(), 5, "the torn frame is the only loss");
         let session = boot_session(&store);
         assert_eq!(session.last_seen(), 5);
+        assert_eq!(ops.len(), 6);
+    }
+
+    #[test]
+    fn a_damaged_length_field_is_corruption_not_a_torn_tail() {
+        // One flipped bit in a MIDDLE frame's length field must not
+        // silently truncate every committed frame after it: valid frames
+        // follow the damage, so the resync classifier fails loudly
+        // (ADR 0018).
+        let tmp = TempDir::new("length-rot");
+        let path = store_path(&tmp, "src");
+        let (store, _) = filled_store(&path, 6);
+        drop(store);
+        let good = std::fs::read(&path).unwrap();
+
+        let mut starts = Vec::new();
+        let mut offset = HEADER_LEN;
+        while offset < good.len() {
+            starts.push(offset);
+            let len = u32::from_le_bytes(good[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += FRAME_OVERHEAD + len;
+        }
+        assert_eq!(starts.len(), 6);
+
+        for &(frame, byte) in &[(0usize, 2usize), (2, 0), (3, 3)] {
+            let mut bytes = good.clone();
+            // A bit flip in the length field: 414-ish becomes 65950-ish.
+            bytes[starts[frame] + byte] ^= 0x40;
+            let path = store_path(&tmp, &format!("flip-{frame}-{byte}"));
+            std::fs::write(&path, &bytes).unwrap();
+            match LocalStore::open(&path) {
+                Err(StoreError::Corrupt { offset, .. }) => {
+                    assert_eq!(offset, starts[frame] as u64);
+                }
+                other => panic!("expected corruption, got {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "the loud path never rewrites the file"
+            );
+        }
+
+        // An absurd length anywhere but the last frame is the same class.
+        let mut bytes = good.clone();
+        bytes[starts[2]..starts[2] + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let path = store_path(&tmp, "huge-length");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            LocalStore::open(&path),
+            Err(StoreError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn an_appended_garbage_tail_is_repaired_as_torn() {
+        // A crash's delayed allocation can leave stray zero bytes after
+        // the last frame: no valid chain follows, so it is the torn tail
+        // — repaired, not corruption (ADR 0018).
+        let tmp = TempDir::new("garbage-tail");
+        let path = store_path(&tmp, "src");
+        let (store, _) = filled_store(&path, 6);
+        drop(store);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let good_len = bytes.len();
+        bytes.extend_from_slice(&[0u8; 13]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let store = LocalStore::open(&path).unwrap();
+        assert_eq!(store.tip(), 6, "all committed ops survive");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            good_len,
+            "the stray tail is cut"
+        );
+    }
+
+    #[test]
+    fn sequences_are_never_reused_after_a_repair_drops_a_committed_op() {
+        // Bit rot on the LAST committed frame: the checksum fails at the
+        // physical tail, the repair drops it — and the store must resume
+        // above the commit marker, never reusing the lost sequence. A
+        // caught-up peer (cursor at the marker) keeps receiving; a peer
+        // behind stalls visibly at the gap (ADR 0017's designed stall).
+        let tmp = TempDir::new("no-reuse");
+        let path = store_path(&tmp, "src");
+        let (store, _) = filled_store(&path, 5);
+        drop(store);
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        // A peer pulls everything before the damage.
+        let mut caught_up = boot_session(&LocalStore::open(&path).unwrap());
+        assert_eq!(caught_up.last_seen(), 5);
+
+        // Rot the last frame's body: checksum failure at the tail.
+        let mut offset = HEADER_LEN;
+        let mut last_frame = 0;
+        while offset < bytes.len() {
+            last_frame = offset;
+            let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += FRAME_OVERHEAD + len;
+        }
+        bytes[last_frame + FRAME_OVERHEAD] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut store = LocalStore::open(&path).unwrap();
+        assert_eq!(store.tip(), 4, "the rotted frame is gone");
+        let (field, value) = conv::amount(21);
+        let replacement = conv::op(50, 50, 0, field, value);
+        assert_eq!(
+            store.append(replacement.clone()).unwrap(),
+            6,
+            "the lost sequence 5 is never reused"
+        );
+        // The caught-up peer still receives the new op.
+        caught_up
+            .apply_delta(store.delta_since(caught_up.last_seen()))
+            .unwrap();
+        assert!(caught_up.state().entity(&replacement.entity_id).is_some());
+        assert_eq!(caught_up.last_seen(), 6);
+
+        // A peer that had only reached the gap stalls visibly on it.
+        let mut stalled = SyncSession::new();
+        let prefix: Vec<SequencedOp> = store.delta_since(0).take(4).cloned().collect();
+        stalled.apply_delta(&prefix).unwrap();
+        assert_eq!(stalled.last_seen(), 4);
+        stalled.apply_delta(store.delta_since(4)).unwrap();
+        assert_eq!(stalled.last_seen(), 4, "the watermark cannot cross the gap");
+        assert_eq!(stalled.pending_len(), 1, "the stall is visible");
+
+        // And the gap survives a reopen: the record carries its sequence.
+        drop(store);
+        let mut store = LocalStore::open(&path).unwrap();
+        let seqs: Vec<u64> = store.delta_since(0).map(|s| s.seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4, 6], "the gap persists across reopens");
+        let (field, value) = conv::amount(22);
+        assert_eq!(store.append(conv::op(51, 51, 0, field, value)).unwrap(), 7);
     }
 
     #[test]
     fn mid_file_corruption_fails_loudly() {
         let tmp = TempDir::new("corrupt");
         let path = store_path(&tmp, "src");
-        let mut store = LocalStore::open(&path).unwrap();
-        let (field, value) = conv::amount(5);
-        for i in 1..=4u64 {
-            store
-                .append(conv::op(i, 10 + i, 0, field, value.clone()))
-                .unwrap();
-        }
+        let (store, _) = filled_store(&path, 4);
         drop(store);
         let good = std::fs::read(&path).unwrap();
 
@@ -769,6 +1114,41 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_records_collapse_to_the_first() {
+        // Two records sharing an op_id with different content can only be
+        // written by tampering — the API dedupes — and boot resolves them
+        // the way the log must: first wins, by op_id alone (the E2EE-safe
+        // rule; a re-encrypted retry carries different bytes, ADR 0017).
+        let tmp = TempDir::new("dup-records");
+        let one = store_path(&tmp, "one");
+        let two = store_path(&tmp, "two");
+        let (field, _) = conv::amount(0);
+        let op_a = conv::op(1, 10, 0, field, conv::amount(111).1);
+        let mut op_b = op_a.clone();
+        op_b.value = conv::amount(222).1;
+        let mut store = LocalStore::open(&one).unwrap();
+        store.append(op_a).unwrap();
+        drop(store);
+        let mut store = LocalStore::open(&two).unwrap();
+        store.append(op_b).unwrap();
+        drop(store);
+
+        let a = std::fs::read(&one).unwrap();
+        let b = std::fs::read(&two).unwrap();
+        let mut spliced = a[..HEADER_LEN].to_vec();
+        // Store one's frame, then store two's.
+        spliced.extend_from_slice(&a[HEADER_LEN..]);
+        spliced.extend_from_slice(&b[HEADER_LEN..]);
+        let spliced_path = store_path(&tmp, "spliced");
+        std::fs::write(&spliced_path, &spliced).unwrap();
+
+        let store = LocalStore::open(&spliced_path).unwrap();
+        assert_eq!(store.tip(), 1, "the second record collapses");
+        let ops: Vec<Op> = store.delta_since(0).map(|s| s.op.clone()).collect();
+        assert_eq!(ops[0].value, conv::amount(111).1, "first record wins");
+    }
+
+    #[test]
     fn foreign_and_future_version_files_are_refused_loudly() {
         let tmp = TempDir::new("foreign");
         // A file that is not ours.
@@ -789,19 +1169,39 @@ mod tests {
         bytes.extend_from_slice(&MAGIC);
         bytes.extend_from_slice(&9u16.to_le_bytes());
         bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&marker_bytes(0).unwrap());
         std::fs::write(&future, &bytes).unwrap();
         match LocalStore::open(&future) {
             Err(StoreError::UnsupportedVersion { found: 9, .. }) => {}
             other => panic!("expected a version rejection, got {other:?}"),
         }
         assert_eq!(bytes, std::fs::read(&future).unwrap(), "untouched");
+        // A set reserved word: a format extension this core must not
+        // misread as a plain log.
+        let extended = store_path(&tmp, "extended");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        bytes.extend_from_slice(&marker_bytes(0).unwrap());
+        std::fs::write(&extended, &bytes).unwrap();
+        match LocalStore::open(&extended) {
+            Err(StoreError::UnsupportedVersion { .. }) => {}
+            other => panic!("expected a version rejection, got {other:?}"),
+        }
     }
 
     #[test]
     fn a_torn_create_is_recreated_empty() {
         let tmp = TempDir::new("torn-create");
-        for partial in [&b""[..], b"PCO", b"PCOPLOG\0", b"PCOPLOG\0\x01"] {
-            let path = store_path(&tmp, "partial");
+        let mut partials: Vec<Vec<u8>> = vec![b"".to_vec(), b"PCO".to_vec(), b"PCOPLOG\0".to_vec()];
+        // A power cut inside the header: full magic, zero version, zero
+        // marker (a fresh file's unwritten bytes are zero).
+        let mut torn = MAGIC.to_vec();
+        torn.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        partials.push(torn);
+        for (i, partial) in partials.into_iter().enumerate() {
+            let path = tmp.path().join(format!("partial-{i}.ops"));
             std::fs::write(&path, partial).unwrap();
             let store = LocalStore::open(&path).unwrap();
             assert_eq!(store.tip(), 0);

@@ -50,21 +50,46 @@ impl std::error::Error for LogError {}
 
 /// The append-only, per-budget canonical op log — the rendezvous model of
 /// [ADR 0007] as an in-memory type the future server drives. Sequences are
-/// dense and 1-based; append order is the canonical order. The log touches
-/// only server-visible metadata: dedupe is by `op_id` alone (content is
-/// opaque under [ADR 0009] — an encrypted retry must dedupe like an
-/// identical one), and the loud same-id-different-content check lives in
-/// [`BudgetState::apply`], where plaintext always lives (ADR 0017).
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+/// 1-based and append order is the canonical order in a fresh log. The log
+/// touches only server-visible metadata: dedupe is by `op_id` alone
+/// (content is opaque under [ADR 0009] — an encrypted retry must dedupe
+/// like an identical one), and the loud same-id-different-content check
+/// lives in [`BudgetState::apply`], where plaintext always lives
+/// (ADR 0017).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OpLog {
     budget_id: Option<BudgetId>,
     ops: Vec<SequencedOp>,
     seen: HashMap<OpId, u64>,
+    /// The sequence the next append assigns — 1 for a fresh log. A durable
+    /// store resumes it above its commit high-water so a repair never
+    /// reuses a sequence (ADR 0018).
+    next_seq: u64,
+}
+
+impl Default for OpLog {
+    fn default() -> Self {
+        Self {
+            budget_id: None,
+            ops: Vec::new(),
+            seen: HashMap::new(),
+            next_seq: 1,
+        }
+    }
 }
 
 impl OpLog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A log whose next append assigns `seq` — how a durable store resumes
+    /// its sequence space after a repair (ADR 0018).
+    pub fn resuming_at(seq: u64) -> Self {
+        Self {
+            next_seq: seq,
+            ..Self::default()
+        }
     }
 
     /// Append an op; returns its canonical sequence. Budget scoping is
@@ -73,6 +98,26 @@ impl OpLog {
     /// stored returns the original sequence — safe retries ([ADR 0007]) —
     /// regardless of payload bytes. Errors leave the log untouched.
     pub fn append(&mut self, op: Op) -> Result<u64, LogError> {
+        let seq = self.next_seq;
+        let (assigned, stored) = self.append_inner(seq, op)?;
+        if stored {
+            self.next_seq = seq + 1;
+        }
+        Ok(assigned)
+    }
+
+    /// Append `op` under an explicit sequence — the boot path of a durable
+    /// store, whose records carry the sequences they were assigned
+    /// (ADR 0018). Sequences are advisory cursors, never identity
+    /// (ADR 0017): gaps are legal and stall watermarks by design. Scoping
+    /// and `op_id` dedupe follow [`OpLog::append`] exactly.
+    pub(crate) fn append_sequenced(&mut self, seq: u64, op: Op) -> Result<u64, LogError> {
+        self.append_inner(seq, op).map(|(assigned, _)| assigned)
+    }
+
+    /// The shared append: scope check, dedupe, then store under `seq`.
+    /// Returns the op's sequence and whether it was newly stored.
+    fn append_inner(&mut self, seq: u64, op: Op) -> Result<(u64, bool), LogError> {
         if let Some(log_budget) = self.budget_id
             && log_budget != op.budget_id
         {
@@ -81,16 +126,15 @@ impl OpLog {
                 log_budget,
             });
         }
-        if let Some(&seq) = self.seen.get(&op.op_id) {
-            return Ok(seq);
+        if let Some(&seen) = self.seen.get(&op.op_id) {
+            return Ok((seen, false));
         }
         if self.budget_id.is_none() {
             self.budget_id = Some(op.budget_id);
         }
-        let seq = self.ops.len() as u64 + 1;
         self.seen.insert(op.op_id, seq);
         self.ops.push(SequencedOp { seq, op });
-        Ok(seq)
+        Ok((seq, true))
     }
 
     /// The ops with sequence greater than `since`, in canonical order
@@ -102,7 +146,7 @@ impl OpLog {
     /// The highest assigned sequence — the high-water mark clients compare
     /// their cursor against.
     pub fn tip(&self) -> u64 {
-        self.ops.len() as u64
+        self.ops.last().map(|s| s.seq).unwrap_or(0)
     }
 
     /// The budget this log is scoped to, once the first op fixes it.
@@ -115,6 +159,11 @@ impl OpLog {
     /// (ADR 0018).
     pub fn seq_of(&self, op_id: &OpId) -> Option<u64> {
         self.seen.get(op_id).copied()
+    }
+
+    /// The sequence the next [`OpLog::append`] assigns (ADR 0018).
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
     }
 }
 

@@ -23,15 +23,18 @@ it true by construction and to test it byte for byte.
 new dependency) persists ops as an append-only sequence of checksummed
 frames in one file:
 
-- **Header** (12 bytes): magic `PCOPLOG\0`, u16 format version (1), u16
-  reserved (zero today; the snapshot/compaction extension of ADR 0007
-  claims it later without a second header).
+- **Header** (20 bytes): magic `PCOPLOG\0`; u16 format version (1); u16
+  reserved — zero today, and a future extension must set it, because
+  readers refuse a set reserved word rather than misread the file; and the
+  **commit marker**: the highest committed sequence as `[seq u32][!seq
+  u32]` (see durability below).
 - **Frame**: u32 body length, u64 FNV-1a-64 over the body, body.
-- **Body**: JSON `{ "meta": OpMeta, "payload": <encode_payload string> }` —
-  the ADR 0009 metadata/payload split with payload bytes taken verbatim
-  from the single serialization choke point (ADR 0017). The at-rest
-  encryption layer later wraps exactly that choke point, so the store body
-  then carries ciphertext with no store change.
+- **Body**: JSON `{ "seq", "meta", "payload" }` — the record's canonical
+  sequence (a repair can leave gaps, so sequences cannot be re-derived
+  from file position), the ADR 0009 server-visible metadata, and the
+  payload verbatim from the single serialization choke point (ADR 0017).
+  The at-rest encryption layer later wraps exactly that choke point, so
+  the store body then carries ciphertext with no store change.
 
 Why not a database: the data model already *is* an append-only op log
 (ADR 0007) — file order is canonical order, the `op_id` dedupe index is
@@ -54,66 +57,103 @@ invites drift, derived state cannot. Boot-from-store == replay holds by
 construction; the tests pin it. Snapshots and compaction, when they come,
 are a boot-time cache over the same log and stay replay-verifiable.
 
+### The store is content-blind, like the log
+
+The store validates structure only: framing, checksums, ids, HLC bounds.
+The payload stays choke-point bytes the store never interprets — under
+at-rest E2EE it is ciphertext, so any payload-level validation here would
+be undone by that slice. An op the engine cannot apply (a field that does
+not fit the entity kind, say) therefore stores fine and wedges replay
+loudly and deterministically at its sequence — exactly the engine's
+designed behavior for a bad op inside any delta (ADR 0017: the first
+failing op aborts the delta, the cursor stops, retrying reproduces the
+error). Capture mints ops through `BudgetState::apply` and cannot mint
+them; a hostile member feeding them is the transport/auth slice's
+problem — the same posture as ADR 0017's HLC poisoning.
+
 ### Durability, atomicity, recovery
 
-- The commit point of an append is `write_all(frame)` + `sync_data`
-  returning. Nothing before it is promised; everything after it is
-  durable.
-- Crash windows reduce to one case: the final frame may be absent, whole,
-  or torn. Boot scans frames sequentially; the first frame that is short,
-  overruns the file, or checksums bad **at the physical tail** was never
-  committed — the log is truncated to the last good frame and that repair
-  is synced. A frame that checksums bad **with valid frames after it**
-  cannot result from the write protocol (single writer, sequential
-  appends) — it is corruption and fails loudly
-  (`StoreError::Corrupt`).
+- **Commit:** an append writes its frame at the log's end, writes the
+  commit marker (the sequence being assigned) into the header, and issues
+  ONE `sync_data`. Frame and marker land or neither does. The marker's
+  `[seq][!seq]` shape makes a torn marker write detectable — and safely
+  ignorable, because a torn marker means its commit never acked.
+- **Torn tail vs corruption, by resync:** the first frame that is short,
+  overruns the file, or checksums bad is classified by scanning for a
+  checksum-valid frame chain that starts anywhere after it and runs
+  exactly to EOF. Such a chain proves the writer produced frames beyond
+  the damage — **mid-file corruption, loud** (`StoreError::Corrupt`, file
+  untouched). No chain after it is the crash window's uncommitted tail:
+  **truncate to the last good frame, sync, continue.** A damaged length
+  field therefore can never silently destroy the committed frames after
+  it.
 - A full frame whose checksum passes but whose body does not decode is
-  corruption — the writer never frames such bytes — loud failure.
-- A foreign file (magic mismatch) is refused loudly, never clobbered
-  (`StoreError::Foreign`); a future format version likewise
-  (`StoreError::UnsupportedVersion`). A file that is a strict prefix of
-  the magic is a torn create (no committed data can predate the header
-  fsync) and is recreated.
-- A write/sync error mid-append rolls the file back to the last durable
-  frame boundary (truncate + sync); if even that fails the store is
-  poisoned and refuses further appends until reopened. The in-memory log
-  never gains an op the disk refused.
-- Honest residual: a torn *final* write whose damaged length field happens
-  to decode small can masquerade as mid-log corruption. It is bounded —
-  one uncommitted op, still held by the rendezvous and every peer — and
-  the remedy is the future rebuild-from-rendezvous path, not silent
-  truncation of a longer tail.
+  loud corruption — the writer never frames such bytes.
+- **Sequences are never reused.** Boot resumes the sequence space at
+  `max(loaded tip, commit marker) + 1`. A crash-torn uncommitted tail
+  leaves the marker equal to the tip — re-sequencing stays dense. Damage
+  to *committed* frames (bit rot — outside the crash model, but detected
+  by the checksums) leaves the marker above the tip: the store resumes
+  above the marker, leaving a gap at the lost sequences. A caught-up
+  client still receives everything appended after; a client behind stalls
+  visibly at the gap — ADR 0017's designed stall, whose sanctioned repair
+  is the compaction slice's bootstrap, never silent reuse.
+- **Header rules:** a strict magic prefix, a short file, or version 0
+  with no marker is a torn create — recreated, since no committed data
+  can predate the header fsync. A magic mismatch is foreign, refused,
+  never clobbered (`StoreError::Foreign`). Any other version or a set
+  reserved word is unsupported, refused loudly
+  (`StoreError::UnsupportedVersion`).
+- **Rollback:** a failed durable append restores the previous marker,
+  truncates to the committed boundary, and syncs; if even that fails the
+  store is poisoned and refuses appends until reopened. The in-memory log
+  never gains an op the disk refused. A file that no longer ends at the
+  committed boundary (the single-writer contract broken) is refused
+  loudly at append rather than written into.
+- **Honest residual:** a torn final write whose damaged length or marker
+  bytes happen to decode misleadingly (bounded, and requiring byte
+  patterns at the u32 extremes) can present as corruption or a phantom
+  gap — both visible failures, never silent truncation or reuse.
 
 Single writer per path is the caller's contract this slice (the app shell
 owns process singleness); locking is deferred with the browser/transport
-work.
+work. The directory-entry fsync after create is best effort (POSIX;
+other platforms rely on the create-fsync alone).
 
 ### Integration
 
 `LocalStore` wraps the 0017 `OpLog` and mirrors its surface — `append`
-(budget scoping + `op_id` dedupe + durable frame), `delta_since`, `tip`,
+(budget scoping + `op_id` dedupe + durable commit), `delta_since`, `tip`,
 `budget_id` — so the engine's convergence proofs run against the backed
 engine, not a parallel toy: the rendezvous loop is re-run with a
 store-backed log, mid-run restarts (drop and reopen from disk) included,
 and every device state is asserted equal to a fresh session booted from
-the store. This slice persists the canonical (rendezvous-side) log:
-per-device mirrors and cursor persistence are the transport slice's
-concern — a client mirror receives reordered ops and maps its cursor to
-the server's sequences, which is delivery, not storage.
+the store. The `OpLog` itself gains the storage hooks ADR 0017 deferred
+when it called sequences "dense `Vec` indexes ... naive about storage
+until that slice": a resumable next-sequence (`resuming_at`), an
+explicit-sequence boot append (`append_sequenced`, crate-private), and
+`tip` as the last op's sequence rather than its count. A fresh log is
+unchanged: dense, 1-based, append order canonical. This slice persists
+the canonical (rendezvous-side) log; per-device mirrors and cursor
+persistence are the transport slice's concern — a client mirror receives
+reordered ops and maps its cursor to the server's sequences, which is
+delivery, not storage.
 
 ### Migration story (stub)
 
 The header carries the format version; every future change bumps it and
 ships a read-old/write-new migration as one atomic replace (temp file +
 rename). Version 1 is the first format, so there is nothing to migrate
-yet; the reserved word keeps room for a snapshot extension.
+yet; the reserved word and the commit marker keep room for a snapshot
+extension.
 
 ## Deferred (deliberately out of this slice)
 
-Snapshots and compaction (ADR 0007) — the frame format and reserved header
-word do not preclude them; the browser storage adapter (IndexedDB over the
-same framed bytes); at-rest E2EE (it wraps the existing choke point);
-batched multi-op commits; concurrent-writer locking; server/API storage.
+Snapshots and compaction (ADR 0007) — the frame format, reserved header
+word, and explicit record sequences do not preclude them; the browser
+storage adapter (IndexedDB over the same framed bytes); at-rest E2EE (it
+wraps the existing choke point); batched multi-op commits;
+concurrent-writer locking; server/API storage.
 
 ## Alternatives considered
 
@@ -131,6 +171,10 @@ batched multi-op commits; concurrent-writer locking; server/API storage.
 - **Persisting materialized state alongside ops** — drift risk (ADR 0016's
   reasoning), doubles the schema, and buys boot speed that snapshots will
   buy honestly later.
+- **Validating payload coherence at append** — rejected: the store is
+  content-blind by E2EE discipline (ADRs 0009, 0017); the check would be
+  undone by at-rest encryption, and the engine already fails loudly at
+  apply time.
 
 ## Consequences
 
@@ -139,9 +183,17 @@ batched multi-op commits; concurrent-writer locking; server/API storage.
   matters (ADR 0007).
 - The framing/checksum codec is the format: any target that can persist
   bytes can hold a store.
-- `op_id` dedupe on boot silently collapses a duplicated record (safe
-  retries, ADR 0007); `op_id` reuse with different content stays loud at
-  apply time, exactly as in memory (ADR 0017).
+- `op_id` dedupe on boot collapses a duplicated record to the first — the
+  E2EE-safe rule (a re-encrypted retry carries different payload bytes
+  and must dedupe). The loud same-id-different-content check lives at
+  apply time, where plaintext always exists, and fires on replicas that
+  *receive* both variants; one log's dedupe never shows both to its own
+  state. Duplicated records cannot be written through the API — only
+  tampering produces them.
+- Records are bounded by the u32 frame length (and the commit marker by
+  u32 sequences); a 32-bit target, which reads the whole file at boot,
+  cannot open stores approaching 4 GiB. Both limits are far beyond one
+  budget's lifetime; snapshots answer scale.
 - The io-error rollback/poison path is designed but not fault-injected in
   tests (unit tests cannot cheaply fail an fsync); the torn-tail suite
   covers the file states that path leaves behind.
