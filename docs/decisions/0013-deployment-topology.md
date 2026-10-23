@@ -5,7 +5,7 @@
 
 ## Context
 
-Pursecraft ships as open source (self-hostable) with an optional hosted cloud
+Pursecraft ships as source-available (self-hostable) with an optional hosted cloud
 tier. The hosted product needs a marketing surface, an app surface, and an API
 surface, without compromising the privacy posture of the app itself.
 
