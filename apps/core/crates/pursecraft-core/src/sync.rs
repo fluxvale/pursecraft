@@ -401,8 +401,8 @@ mod tests {
         ));
         assert_eq!(log.tip(), 1);
         // Scoping is checked before dedupe: even an op REUSING a seen
-        // op_id is rejected while mis-scoped — budget_id is metadata, the
-        // one thing a real server always sees (ADR 0008).
+        // op_id is rejected when scoped to the wrong budget — budget_id
+        // is metadata, the one thing a real server always sees (ADR 0008).
         foreign.op_id = first.op_id;
         assert!(matches!(
             log.append(foreign),

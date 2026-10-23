@@ -1,2 +1,8 @@
 [tools]
 rust = "1.99.1"
+# Supply-chain check tools (issue #12): mise.toml stays the single source of
+# truth — CI parses these versions instead of installing its own.
+"ubi:EmbarkStudios/cargo-deny" = "0.20.2"
+"ubi:bnjbvr/cargo-machete" = "0.9.2"
+# Local parity with the pinned crate-ci/typos action (CI job "Typos").
+typos = "1.51.1"

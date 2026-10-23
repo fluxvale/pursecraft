@@ -1,0 +1,30 @@
+# cargo-deny config for scripts/ci/deny.sh and the CI "cargo-deny" job
+# (issue #12): `cargo-deny check advisories licenses` runs against the whole
+# workspace tree. Anything not deviated from below stays at cargo-deny's
+# deny-by-default.
+
+[advisories]
+# RustSec advisory DB with stock severity handling: vulnerabilities and yanked
+# versions fail the check. Every ignore needs a reason — and a removal plan.
+ignore = [
+    #"RUSTSEC-0000-0000" = { reason = "..." },
+]
+
+[licenses]
+# Allow-list of the licenses actually present in Cargo.lock. Adding a crate
+# with a license not listed here fails the check — extend the list only as a
+# deliberate decision, not to make a red build green.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # unicode-ident: "(MIT OR Apache-2.0) AND Unicode-3.0"
+    "Unicode-3.0",
+    # memchr is "Unlicense OR MIT" — satisfied by MIT above; Unlicense is
+    # deliberately NOT allowed.
+]
+
+# Workspace crates are the app itself (FSL-1.1-ALv2, LICENSE.md) — the
+# allow-list above polices the dependency tree, not our own code. Members
+# carry publish = false so cargo-deny can tell they are never published.
+[licenses.private]
+ignore = true

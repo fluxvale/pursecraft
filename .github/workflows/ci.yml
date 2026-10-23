@@ -26,6 +26,9 @@ jobs:
       core: ${{ steps.filter.outputs.core }}
       api: ${{ steps.filter.outputs.api }}
       cli: ${{ steps.filter.outputs.cli }}
+      deny: ${{ steps.filter.outputs.deny }}
+      machete: ${{ steps.filter.outputs.machete }}
+      typos: ${{ steps.filter.outputs.typos }}
     steps:
       # persist-credentials: false — later steps run no git-authenticated ops
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -67,6 +70,26 @@ jobs:
               - "Cargo.lock"
               - "mise.toml"
               - ".github/workflows/ci.yml"
+            deny:
+              - "apps/**" # the resolved tree is what the checks see
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "deny.toml"
+              - "scripts/ci/deny.sh"
+              - "mise.toml" # cargo-deny version
+              - ".github/workflows/ci.yml"
+            machete:
+              # source edits can orphan a dep without touching Cargo.lock,
+              # so this gates on sources, not just manifests
+              - "apps/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "scripts/ci/machete.sh"
+              - "mise.toml" # cargo-machete version
+              - ".github/workflows/ci.yml"
+            typos:
+              # any file can hold a typo — docs, ADRs, configs included
+              - "**"
 
   core:
     name: Core CI
@@ -194,14 +217,92 @@ jobs:
 
       - run: scripts/ci/cli.sh
 
-  # Adding an app takes FOUR edits here, and skipping any one of them removes
-  # the app from the required check silently (its job never runs, or runs
-  # ungated): (a) add it to the changes filters above, repeating the shared
-  # paths the existing core-consuming filters carry; (b) export that filter in
-  # check-changes.outputs above, or its job gate reads an empty string; (c) add
-  # the per-app job; (d) add that job to wait-for-ci.needs below. New top-level
-  # files (a future Dockerfile, compose.yaml) match no filter today — add them
-  # to every relevant filter when they land, or their changes run nothing.
+  deny:
+    name: cargo-deny
+    needs: check-changes
+    if: needs.check-changes.outputs.deny == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # mise.toml is the single source of truth for tool versions; parse
+      # (not install) so CI and local dev can't drift (ADR 0014).
+      - name: Read tool versions from mise.toml
+        id: versions
+        run: |
+          deny="$(sed -n 's|^"ubi:EmbarkStudios/cargo-deny" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
+          rust="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
+          echo "deny=$deny rust=$rust"
+          test -n "$deny" && test -n "$rust"
+          echo "deny=$deny" >>"$GITHUB_OUTPUT"
+          echo "rust=$rust" >>"$GITHUB_OUTPUT"
+
+      # cargo-deny shells out to `cargo metadata`, so a toolchain is needed
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.versions.outputs.rust }}
+
+      # pinned to commit — mutable tags execute unreviewed code
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-deny@${{ steps.versions.outputs.deny }}
+
+      - run: scripts/ci/deny.sh
+
+  machete:
+    name: cargo-machete
+    needs: check-changes
+    if: needs.check-changes.outputs.machete == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # mise.toml is the single source of truth for tool versions; parse
+      # (not install) so CI and local dev can't drift (ADR 0014).
+      - name: Read cargo-machete version from mise.toml
+        id: versions
+        run: |
+          machete="$(sed -n 's|^"ubi:bnjbvr/cargo-machete" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
+          echo "machete=$machete"
+          test -n "$machete"
+          echo "machete=$machete" >>"$GITHUB_OUTPUT"
+
+      # standalone binary: parses Cargo.tomls and sources, no toolchain needed.
+      # Pinned to commit — mutable tags execute unreviewed code.
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-machete@${{ steps.versions.outputs.machete }}
+
+      - run: scripts/ci/machete.sh
+
+  typos:
+    name: Typos
+    needs: check-changes
+    if: needs.check-changes.outputs.typos == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # pinned to commit — mutable tags execute unreviewed code
+      - uses: crate-ci/typos@9023c1f779400877cafdd98052113fc777e2cfdc # v1.51.1
+
+  # Adding a job (app or check) takes FOUR edits here, and skipping any one
+  # of them removes the job from the required check silently (its job never
+  # runs, or runs ungated): (a) add it to the changes filters above,
+  # repeating the shared paths the existing filters carry; (b) export that
+  # filter in check-changes.outputs above, or its job gate reads an empty
+  # string; (c) add the job; (d) add that job to wait-for-ci.needs below.
+  # New top-level files (a future Dockerfile, compose.yaml) match no cargo
+  # filter today — add them to every relevant filter when they land, or their
+  # changes run nothing; the typos job filters on "**" precisely so no file
+  # class escapes every check.
   #
   # The umbrella: branch protection requires THIS check. Runs regardless of
   # path gating; passes when every gated job succeeded or was skipped.
@@ -209,7 +310,7 @@ jobs:
   # read "skipped" and the all() below would pass on zero checks run.
   wait-for-ci:
     name: Wait for CI
-    needs: [check-changes, core, api, cli]
+    needs: [check-changes, core, api, cli, deny, machete, typos]
     if: always()
     runs-on: ubuntu-latest
     steps:

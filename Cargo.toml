@@ -6,6 +6,9 @@ members = ["apps/core/crates/*", "apps/api", "apps/cli"]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.99"
+# The app ships as releases, never as crates.io packages; cargo-deny's license
+# check also relies on this (deny.toml: [licenses.private]).
+publish = false
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
