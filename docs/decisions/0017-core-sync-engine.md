@@ -102,12 +102,14 @@ Encoding rules, all round-trip exact:
   millisecond instead of producing the reserved value, so no op —
   delivered any number of times — can panic a session or make it mint
   stamps another device's decoder rejects. One caveat is documented
-  honestly: a forged stamp at the exact dual boundary
-  (`i64::MAX`/`u32::MAX-1`) pushes the receiving clock one millisecond
-  past the wire bound; its stamps are then rejected loudly by every
-  peer. Poisoning is contained, visible, and requires a key-holding
-  member — full protection against misbehaving members is the
-  transport/auth slice's domain;
+  honestly: forged stamps at the top physical bound ratchet — one
+  borrowed millisecond per re-delivery, quickly when the logical counter
+  is high (a `physical_ms = i64::MAX` stamp escapes within a few
+  deliveries once `logical` reaches `u32::MAX - 3`; lower counters need
+  proportionally more) — until the victim's minted stamps are rejected
+  loudly by every peer. Poisoning is contained, visible, and requires a
+  key-holding member — full protection against misbehaving members is
+  the transport/auth slice's domain;
 - enums: serde's default external tagging; `Hlc` as
   `{ "physical_ms", "logical" }`.
 

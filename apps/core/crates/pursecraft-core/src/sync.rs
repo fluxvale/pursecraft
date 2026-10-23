@@ -210,6 +210,15 @@ impl SyncSession {
     pub fn last_seen(&self) -> u64 {
         self.last_seen
     }
+
+    /// How many sequences are processed but stranded behind a gap: 0 means
+    /// the watermark is fully caught up; a value that persists while
+    /// `last_seen` stalls says a sequence below the pending window never
+    /// arrived — the designed stall the compaction slice's snapshot
+    /// bootstrap answers (ADR 0007, ADR 0017).
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 impl Default for SyncSession {
@@ -339,6 +348,7 @@ mod tests {
         let first = session.apply_delta([&newest]).unwrap();
         assert_eq!(first.applied, 1);
         assert_eq!(session.last_seen(), 0, "a gap pins the watermark");
+        assert_eq!(session.pending_len(), 1, "the stranded op is visible");
 
         // Catching up from the cursor re-serves everything: 3 is a
         // duplicate; 1 and 2 are stale — their stamps lost to the newer
@@ -350,6 +360,7 @@ mod tests {
         assert_eq!(summary.stale, 2, "the older memos lose the field");
         assert_eq!(summary.duplicates, 1);
         assert_eq!(session.last_seen(), 3);
+        assert_eq!(session.pending_len(), 0, "the gap filled");
         let txn = match session
             .state()
             .entity(&EntityId::new(v7(ID_MS, 50)).unwrap())

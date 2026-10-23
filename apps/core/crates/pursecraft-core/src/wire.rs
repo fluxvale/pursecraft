@@ -422,12 +422,12 @@ mod tests {
             "a sane-extreme receive must mint decodable stamps"
         );
 
-        // A dual-extreme forged stamp ({physical_ms = i64::MAX, logical =
-        // u32::MAX - 1}) also cannot panic — but its single-millisecond
-        // borrow leaves the victim past the wire bound, so its minted
-        // stamps are rejected LOUDLY by every peer's decoder. Poison is
-        // contained and visible; forging it requires a key-holding
-        // member hitting the exact dual boundary (ADR 0017 posture).
+        // A forged stamp at the top physical bound cannot panic — but its
+        // single-millisecond borrow leaves the victim past the wire
+        // bound, so its minted stamps are rejected LOUDLY by every
+        // peer's decoder. Poison is contained and visible; forging it
+        // requires a key-holding member (ADR 0017 posture — see the ADR
+        // for the full ratchet reachability).
         let mut forged = serde_json::to_value(&meta).unwrap();
         forged["hlc"] =
             serde_json::from_str(r#"{"physical_ms":9223372036854775807,"logical":4294967294}"#)
