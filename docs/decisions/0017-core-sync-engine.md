@@ -25,10 +25,10 @@ server:
 - `append(op) -> seq`: sequences are dense, 1-based, and append order is the
   canonical order per budget (ADR 0007). The first append fixes the budget;
   foreign-budget appends are rejected, mirroring `BudgetState`.
-- The log inspects **only server-visible metadata** (`op_id`, `budget_id`) —
-  ADR 0009's discipline expressed in the API: payloads are data the log
-  stores but never interprets.
-- `op_id` is 1:1 with op content: re-appending an identical op returns its
+- The log never interprets payload content: apart from storage, the only
+  place it touches an op beyond metadata is the duplicate/conflict test,
+  which compares whole ops for equality — exactly as a server compares
+  stored ciphertext bytes. Re-appending an identical op returns its
   original sequence (safe retries on flaky links); re-appending the same
   `op_id` with different content is a loud `OpIdConflict` error —
   convergence depends on `op_id` uniquely identifying an op, so a collision

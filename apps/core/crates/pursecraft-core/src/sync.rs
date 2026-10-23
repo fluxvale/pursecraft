@@ -57,9 +57,10 @@ impl std::error::Error for LogError {}
 
 /// The append-only, per-budget canonical op log — the rendezvous model of
 /// [ADR 0007] as an in-memory type the future server drives. Sequences are
-/// dense and 1-based; append order is the canonical order. Only
-/// server-visible metadata (`op_id`, `budget_id`) is ever inspected
-/// ([ADR 0009]).
+/// dense and 1-based; append order is the canonical order. The log never
+/// interprets payload content: beyond storage, the only non-metadata touch
+/// is the duplicate/conflict equality test — the stand-in for a server
+/// comparing stored ciphertext bytes ([ADRs 0009, 0017]).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct OpLog {
     budget_id: Option<BudgetId>,
@@ -629,6 +630,21 @@ mod tests {
                 });
             }
         }
+        // Force one cross-device equal-HLC tie per seed: device 1 mirrors
+        // device 0's first target (same entity and field, identical stamp —
+        // their SKEW rows match by construction), so the op_id tie-break is
+        // exercised in every seed, not just where the shuffle happens to
+        // collide.
+        let (kind, entity_id, field, hlc) = {
+            let first = &ops[0];
+            (first.entity_kind, first.entity_id, first.field, first.hlc)
+        };
+        let tie = &mut ops[OPS_PER_DEVICE];
+        tie.entity_kind = kind;
+        tie.entity_id = entity_id;
+        tie.field = field;
+        tie.value = random_value(&mut rng, field);
+        tie.hlc = hlc;
         ops
     }
 
