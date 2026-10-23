@@ -121,9 +121,10 @@ finds the first failing op, and its sequence comes from the delta.
   claims commits — is damage or foreign: refused, never recreated over,
   or one flipped bit would silently wipe every committed op. A magic
   mismatch is foreign, refused, never clobbered (`StoreError::Foreign`).
-  Any other version, or a set reserved word, is unsupported — refused
-  loudly at any file length, checked the moment the bytes are readable
-  and before any recreate decision (`StoreError::UnsupportedVersion`).
+  Any other version is unsupported — refused loudly at any file length,
+  the moment its bytes are readable and before any recreate decision —
+  and a set reserved word alongside this core's version is refused the
+  same way (`StoreError::UnsupportedVersion`).
 - **Rollback:** a phase-one failure restores the previous marker,
   truncates to the committed boundary, and syncs; if even that fails the
   store is poisoned and refuses appends until reopened. A phase-two

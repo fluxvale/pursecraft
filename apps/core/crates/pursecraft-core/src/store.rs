@@ -358,15 +358,17 @@ impl LocalStore {
                 supported: FORMAT_VERSION,
             });
         }
-        if bytes.len() >= 12 {
-            let reserved = u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field"));
-            if version == Some(FORMAT_VERSION) && reserved != 0 {
-                return Err(StoreError::UnsupportedVersion {
-                    path: path.to_owned(),
-                    found: reserved,
-                    supported: FORMAT_VERSION,
-                });
-            }
+        let reserved = (bytes.len() >= 12)
+            .then(|| u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field")));
+        if let Some(reserved) = reserved
+            && version == Some(FORMAT_VERSION)
+            && reserved != 0
+        {
+            return Err(StoreError::UnsupportedVersion {
+                path: path.to_owned(),
+                found: reserved,
+                supported: FORMAT_VERSION,
+            });
         }
         // A torn create is a file that cannot hold committed data — the
         // header write is one prefix, and frames only ever follow its
@@ -379,11 +381,12 @@ impl LocalStore {
             Self::recreate(&mut file)?;
             return Ok(Self::empty(path, file));
         }
-        let reserved = u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field"));
+        // `bytes.len() >= HEADER_LEN` holds here, so the reserved word
+        // was readable above.
         let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
         if version == Some(0) {
             if bytes.len() == HEADER_LEN
-                && reserved == 0
+                && reserved == Some(0)
                 && !matches!(marker, Marker::Committed(1..))
             {
                 Self::recreate(&mut file)?;
