@@ -40,3 +40,4 @@ their replacement.
 | [0015](0015-product-positioning.md) | Product positioning: local-first and E2EE | Accepted |
 | [0016](0016-core-domain-model.md) | Core domain model: entities, fields, and op mapping | Accepted |
 | [0017](0017-core-sync-engine.md) | Core sync engine: canonical log, sync sessions, and the op wire format | Accepted |
+| [0018](0018-local-oplog-store.md) | Durable local oplog store | Accepted |
