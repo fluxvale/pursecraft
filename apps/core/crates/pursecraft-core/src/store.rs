@@ -368,27 +368,37 @@ impl LocalStore {
                 });
             }
         }
-        // A torn create is a file with nothing after the header — the
+        // A torn create is a file that cannot hold committed data — the
         // header write is one prefix, and frames only ever follow its
-        // fsync — so a short file can hold no committed data and is
-        // recreated (ADR 0018).
+        // fsync: a file too short to hold the header, or a full-length
+        // header that carries nothing (zero version, zero reserved, a
+        // marker claiming no commits — the crash-inside-create state,
+        // where the size is durable but the page is not), is recreated
+        // (ADR 0018).
         if bytes.len() < HEADER_LEN {
             Self::recreate(&mut file)?;
             return Ok(Self::empty(path, file));
         }
-        // A zero version in a full-length header is NOT a torn create: a
-        // prefix write that reaches past the header wrote the version
-        // too. It is damage or foreign — refused, never recreated over,
-        // or one flipped bit would silently wipe every committed op
-        // (ADR 0018).
+        let reserved = u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field"));
+        let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
         if version == Some(0) {
+            if bytes.len() == HEADER_LEN
+                && reserved == 0
+                && !matches!(marker, Marker::Committed(1..))
+            {
+                Self::recreate(&mut file)?;
+                return Ok(Self::empty(path, file));
+            }
+            // A zero version beside frames — or beside a marker that
+            // claims commits — is damage or foreign: refused, never
+            // recreated over, or one flipped bit would silently wipe
+            // every committed op (ADR 0018).
             return Err(StoreError::UnsupportedVersion {
                 path: path.to_owned(),
                 found: 0,
                 supported: FORMAT_VERSION,
             });
         }
-        let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
 
         let mut records = Vec::new();
         let mut offset = HEADER_LEN;
@@ -1471,14 +1481,37 @@ mod tests {
             let (field, value) = conv::amount(1);
             assert_eq!(store.append(conv::op(1, 10, 0, field, value)).unwrap(), 1);
         }
-        // A zero version in a FULL-length header is not a torn create —
-        // a prefix write that reaches past the header wrote the version
-        // too — so it is refused, never recreated over (ADR 0018).
-        let mut not_torn = MAGIC.to_vec();
-        not_torn.extend_from_slice(&[0, 0, 0, 0]);
-        not_torn.extend_from_slice(&marker_bytes(Marker::Committed(0)).unwrap());
-        let path = tmp.path().join("full-zero-version.ops");
-        std::fs::write(&path, &not_torn).unwrap();
+        // A crash inside create() itself: the file's size is durable but
+        // its page is not — exactly HEADER_LEN bytes, zero-filled after
+        // the magic. A torn create by the ADR's own definition (nothing
+        // is committed), so it is recreated, not bricked.
+        let mut crashed_create = MAGIC.to_vec();
+        crashed_create.extend(std::iter::repeat_n(0u8, 12));
+        let path = tmp.path().join("crashed-create.ops");
+        std::fs::write(&path, &crashed_create).unwrap();
+        let mut store = LocalStore::open(&path).unwrap();
+        assert_eq!(store.tip(), 0);
+        let (field, value) = conv::amount(1);
+        assert_eq!(store.append(conv::op(1, 10, 0, field, value)).unwrap(), 1);
+        drop(store);
+
+        // The same shape with the fresh marker intact (a version-byte rot
+        // on an empty store): still nothing to lose — recreated.
+        let mut empty_rot = MAGIC.to_vec();
+        empty_rot.extend_from_slice(&[0, 0, 0, 0]);
+        empty_rot.extend_from_slice(&marker_bytes(Marker::Committed(0)).unwrap());
+        let path = tmp.path().join("empty-rot.ops");
+        std::fs::write(&path, &empty_rot).unwrap();
+        assert_eq!(LocalStore::open(&path).unwrap().tip(), 0);
+
+        // But a full-length header that CLAIMS commits is refused — the
+        // claimed sequences were observable, and recreating would discard
+        // that knowledge (ADR 0018).
+        let mut claims = MAGIC.to_vec();
+        claims.extend_from_slice(&[0, 0, 0, 0]);
+        claims.extend_from_slice(&marker_bytes(Marker::Committed(5)).unwrap());
+        let path = tmp.path().join("claims.ops");
+        std::fs::write(&path, &claims).unwrap();
         assert!(matches!(
             LocalStore::open(&path),
             Err(StoreError::UnsupportedVersion { .. })
