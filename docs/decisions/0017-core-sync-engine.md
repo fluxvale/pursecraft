@@ -97,10 +97,17 @@ Encoding rules, all round-trip exact:
   constructor domain narrowed to the 0000–9999 years the fixed width can
   round-trip;
 - HLC stamps: validated on deserialize — `physical_ms` beyond `i64::MAX`
-  is not a wall clock, and `logical == u32::MAX` is reserved so `merge`
-  can always bump and `tick` can always borrow the next millisecond; a
-  wire value can never exhaust a session's clock (loud error, never a
-  panic, ADR 0016);
+  is not a wall clock, and the top logical counter value is reserved.
+  Receive is a saturation-safe path: `merge` and `tick` borrow the next
+  millisecond instead of producing the reserved value, so no op —
+  delivered any number of times — can panic a session or make it mint
+  stamps another device's decoder rejects. One caveat is documented
+  honestly: a forged stamp at the exact dual boundary
+  (`i64::MAX`/`u32::MAX-1`) pushes the receiving clock one millisecond
+  past the wire bound; its stamps are then rejected loudly by every
+  peer. Poisoning is contained, visible, and requires a key-holding
+  member — full protection against misbehaving members is the
+  transport/auth slice's domain;
 - enums: serde's default external tagging; `Hlc` as
   `{ "physical_ms", "logical" }`.
 
@@ -162,7 +169,15 @@ paging, auth and membership.
 ## Consequences
 
 - Deltas walk the log from the client's cursor; sequences are dense `Vec`
-  indexes — the in-memory model stays naive about storage until that slice.
+  indexes — the in-memory model stays naive about storage until that
+  slice.
+- Sequences are advisory cursors, never identity: two ops sharing a
+  sequence both apply (state is keyed by `op_id`), and the pending set is
+  bounded in practice by a well-formed delta's reordering window. A
+  permanently missing sequence stalls the watermark by design — the
+  compaction slice's bootstrap protocol (ADR 0007: snapshot at sequence
+  N, cursor starting at N) is the sanctioned answer, not silent cursor
+  advancement.
 - Devices converge exactly when delivery is complete and ops are
   well-formed; violations of either surface as errors, never as divergence.
 - The wire format is now load-bearing: it must be versioned and frozen

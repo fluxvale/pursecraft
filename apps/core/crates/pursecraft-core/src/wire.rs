@@ -389,28 +389,72 @@ mod tests {
                 "accepted hostile hlc {bad}"
             );
         }
-        // The boundary values just inside the rule are fine — and applying
-        // such an op then ticking the session clock cannot panic.
+        // The boundary values just inside the rule are fine — and
+        // delivering such an op TWICE (at-least-once, the reviewer's
+        // repro for receive-path exhaustion) plus ticks cannot panic and
+        // never mints an undecodable stamp.
         let mut extreme = serde_json::to_value(&meta).unwrap();
         extreme["hlc"] =
-            serde_json::from_str(r#"{"physical_ms":9223372036854775807,"logical":4294967294}"#)
+            serde_json::from_str(r#"{"physical_ms":4611686018427387904,"logical":4294967294}"#)
                 .unwrap();
         let meta: OpMeta = serde_json::from_value(extreme).unwrap();
-        let mut session = crate::sync::SyncSession::new();
         let payload = OpPayload {
             entity_kind: EntityKind::Transaction,
             entity_id: EntityId::new(v7(MS, 6)).unwrap(),
             field: Field::Deleted,
             value: Value::Bool(true),
         };
-        session
-            .apply_delta(&[crate::sync::SequencedOp {
-                seq: 1,
-                op: Op::from_parts(meta, payload),
-            }])
-            .unwrap();
+        let echo = crate::sync::SequencedOp {
+            seq: 1,
+            op: Op::from_parts(meta.clone(), payload),
+        };
+        let mut session = crate::sync::SyncSession::new();
+        for _ in 0..2 {
+            session.apply_delta([&echo]).unwrap();
+        }
         let mut clock = session.clock();
         clock.tick();
+        clock.tick();
+        assert_ne!(clock.logical, u32::MAX);
+        let wire_clock = serde_json::to_string(&clock).unwrap();
+        assert!(
+            serde_json::from_str::<crate::hlc::Hlc>(&wire_clock).is_ok(),
+            "a sane-extreme receive must mint decodable stamps"
+        );
+
+        // A dual-extreme forged stamp ({physical_ms = i64::MAX, logical =
+        // u32::MAX - 1}) also cannot panic — but its single-millisecond
+        // borrow leaves the victim past the wire bound, so its minted
+        // stamps are rejected LOUDLY by every peer's decoder. Poison is
+        // contained and visible; forging it requires a key-holding
+        // member hitting the exact dual boundary (ADR 0017 posture).
+        let mut forged = serde_json::to_value(&meta).unwrap();
+        forged["hlc"] =
+            serde_json::from_str(r#"{"physical_ms":9223372036854775807,"logical":4294967294}"#)
+                .unwrap();
+        let forged: OpMeta = serde_json::from_value(forged).unwrap();
+        let mut poisoned = crate::sync::SyncSession::new();
+        poisoned
+            .apply_delta(&[crate::sync::SequencedOp {
+                seq: 1,
+                op: Op::from_parts(
+                    forged,
+                    OpPayload {
+                        entity_kind: EntityKind::Transaction,
+                        entity_id: EntityId::new(v7(MS, 6)).unwrap(),
+                        field: Field::Deleted,
+                        value: Value::Bool(true),
+                    },
+                ),
+            }])
+            .unwrap();
+        let mut clock = poisoned.clock();
+        clock.tick();
+        let wire_clock = serde_json::to_string(&clock).unwrap();
+        assert!(
+            serde_json::from_str::<crate::hlc::Hlc>(&wire_clock).is_err(),
+            "a poisoned clock's stamps are rejected loudly, never silently accepted"
+        );
     }
 
     #[test]

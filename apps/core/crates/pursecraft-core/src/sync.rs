@@ -67,14 +67,12 @@ impl OpLog {
         Self::default()
     }
 
-    /// Append an op; returns its canonical sequence. Re-appending an op
-    /// whose `op_id` is already stored returns the original sequence —
-    /// safe retries ([ADR 0007]) regardless of payload bytes. Errors leave
-    /// the log untouched.
+    /// Append an op; returns its canonical sequence. Budget scoping is
+    /// checked first (it is metadata — exactly what a real server sees),
+    /// then dedupe by `op_id`: re-appending an op whose id is already
+    /// stored returns the original sequence — safe retries ([ADR 0007]) —
+    /// regardless of payload bytes. Errors leave the log untouched.
     pub fn append(&mut self, op: Op) -> Result<u64, LogError> {
-        if let Some(&seq) = self.seen.get(&op.op_id) {
-            return Ok(seq);
-        }
         if let Some(log_budget) = self.budget_id
             && log_budget != op.budget_id
         {
@@ -82,6 +80,9 @@ impl OpLog {
                 op_budget: op.budget_id,
                 log_budget,
             });
+        }
+        if let Some(&seq) = self.seen.get(&op.op_id) {
+            return Ok(seq);
         }
         if self.budget_id.is_none() {
             self.budget_id = Some(op.budget_id);
@@ -166,7 +167,12 @@ impl SyncSession {
     where
         I: IntoIterator<Item = &'a SequencedOp>,
     {
-        let mut summary = DeltaSummary::default();
+        // Seed the cursor from the session so an empty delta reports the
+        // current watermark, not zero.
+        let mut summary = DeltaSummary {
+            last_seen: self.last_seen,
+            ..DeltaSummary::default()
+        };
         for sequenced in delta {
             match self.state.apply(sequenced.op.clone())? {
                 Applied::Applied => summary.applied += 1,
@@ -358,14 +364,37 @@ mod tests {
     fn foreign_budget_append_is_rejected() {
         let mut log = OpLog::new();
         let (field, value) = amount(1);
-        assert!(log.append(op(1, 10, 0, field, value)).is_ok());
+        let first = op(1, 10, 0, field, value);
+        assert_eq!(log.append(first.clone()), Ok(1));
         let mut foreign = op(2, 20, 0, amount(0).0, amount(2).1);
         foreign.budget_id = crate::ids::BudgetId::new(v7(9, 9)).unwrap();
+        assert!(matches!(
+            log.append(foreign.clone()),
+            Err(LogError::BudgetMismatch { .. })
+        ));
+        assert_eq!(log.tip(), 1);
+        // Scoping is checked before dedupe: even an op REUSING a seen
+        // op_id is rejected while mis-scoped — budget_id is metadata, the
+        // one thing a real server always sees (ADR 0008).
+        foreign.op_id = first.op_id;
         assert!(matches!(
             log.append(foreign),
             Err(LogError::BudgetMismatch { .. })
         ));
-        assert_eq!(log.tip(), 1);
+    }
+
+    #[test]
+    fn an_empty_delta_reports_the_current_cursor() {
+        let mut session = SyncSession::new();
+        let (field, value) = amount(1);
+        let delivered = sequenced(1, op(1, 10, 0, field, value));
+        session.apply_delta([&delivered]).unwrap();
+        let summary = session.apply_delta(Vec::<&SequencedOp>::new()).unwrap();
+        assert_eq!(
+            summary.last_seen, 1,
+            "an idle poll must not reset the cursor"
+        );
+        assert_eq!(summary.applied + summary.duplicates + summary.stale, 0);
     }
 
     #[test]
