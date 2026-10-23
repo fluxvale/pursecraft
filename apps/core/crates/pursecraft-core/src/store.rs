@@ -339,7 +339,8 @@ impl LocalStore {
         }
         // Version and reserved are checked the moment they are readable —
         // before any recreate decision — so a truncated file from a future
-        // format is refused, never rewritten over (ADR 0018).
+        // format is refused, never rewritten over. Version 0 is judged
+        // after the torn-create length check below (ADR 0018).
         let version = if bytes.len() >= 10 {
             Some(u16::from_le_bytes(
                 bytes[8..10].try_into().expect("version field"),
@@ -367,13 +368,25 @@ impl LocalStore {
                 });
             }
         }
-        // A short file or a zero version is a torn create (numbering
-        // starts at 1; a fresh file's unwritten bytes are zero): no
-        // committed data can predate the header fsync, so recreate
-        // (ADR 0018).
-        if bytes.len() < HEADER_LEN || version == Some(0) {
+        // A torn create is a file with nothing after the header — the
+        // header write is one prefix, and frames only ever follow its
+        // fsync — so a short file can hold no committed data and is
+        // recreated (ADR 0018).
+        if bytes.len() < HEADER_LEN {
             Self::recreate(&mut file)?;
             return Ok(Self::empty(path, file));
+        }
+        // A zero version in a full-length header is NOT a torn create: a
+        // prefix write that reaches past the header wrote the version
+        // too. It is damage or foreign — refused, never recreated over,
+        // or one flipped bit would silently wipe every committed op
+        // (ADR 0018).
+        if version == Some(0) {
+            return Err(StoreError::UnsupportedVersion {
+                path: path.to_owned(),
+                found: 0,
+                supported: FORMAT_VERSION,
+            });
         }
         let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
 
@@ -1440,11 +1453,13 @@ mod tests {
     fn a_torn_create_is_recreated_empty() {
         let tmp = TempDir::new("torn-create");
         let mut partials: Vec<Vec<u8>> = vec![b"".to_vec(), b"PCO".to_vec(), b"PCOPLOG\0".to_vec()];
-        // A power cut inside the header: full magic, zero version, zero
-        // marker (a fresh file's unwritten bytes are zero).
-        let mut torn = MAGIC.to_vec();
-        torn.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        partials.push(torn);
+        // Power cuts inside the 20-byte header: the write is one prefix,
+        // so these carry nothing after the header by construction.
+        for tail in [4usize, 8] {
+            let mut torn = MAGIC.to_vec();
+            torn.extend(std::iter::repeat_n(0u8, tail));
+            partials.push(torn);
+        }
         for (i, partial) in partials.into_iter().enumerate() {
             let path = tmp.path().join(format!("partial-{i}.ops"));
             std::fs::write(&path, partial).unwrap();
@@ -1455,6 +1470,44 @@ mod tests {
             let mut store = LocalStore::open(&path).unwrap();
             let (field, value) = conv::amount(1);
             assert_eq!(store.append(conv::op(1, 10, 0, field, value)).unwrap(), 1);
+        }
+        // A zero version in a FULL-length header is not a torn create —
+        // a prefix write that reaches past the header wrote the version
+        // too — so it is refused, never recreated over (ADR 0018).
+        let mut not_torn = MAGIC.to_vec();
+        not_torn.extend_from_slice(&[0, 0, 0, 0]);
+        not_torn.extend_from_slice(&marker_bytes(Marker::Committed(0)).unwrap());
+        let path = tmp.path().join("full-zero-version.ops");
+        std::fs::write(&path, &not_torn).unwrap();
+        assert!(matches!(
+            LocalStore::open(&path),
+            Err(StoreError::UnsupportedVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn a_rotted_version_byte_is_refused_not_wiped() {
+        // One flipped bit in the version of a populated store must never
+        // recreate it — that would silently discard every committed op.
+        // Only the version's low byte decodes to zero, so only it could
+        // have been the silent wipe; both bytes are refused (ADR 0018).
+        let tmp = TempDir::new("version-rot");
+        let path = store_path(&tmp, "src");
+        let (store, _) = filled_store(&path, 20);
+        drop(store);
+        let good = std::fs::read(&path).unwrap();
+        assert!(good.len() > HEADER_LEN, "the store holds committed ops");
+
+        for (label, byte) in [("low", 8usize), ("high", 9)] {
+            let mut bytes = good.clone();
+            bytes[byte] ^= 0x01;
+            let path = store_path(&tmp, label);
+            std::fs::write(&path, &bytes).unwrap();
+            match LocalStore::open(&path) {
+                Err(StoreError::UnsupportedVersion { .. }) => {}
+                other => panic!("expected a version rejection, got {other:?}"),
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "untouched");
         }
     }
 

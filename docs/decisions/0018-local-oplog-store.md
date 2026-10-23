@@ -105,16 +105,23 @@ finds the first failing op, and its sequence comes from the delta.
   rot — outside the crash model, but detected by the checksums) leaves
   the marker above the surviving records: the store resumes above it,
   leaving a gap at the lost sequences. A caught-up client still receives
-  everything appended after; a client behind stalls visibly at the gap —
-  ADR 0017's designed stall, whose sanctioned repair is the compaction
-  slice's bootstrap, never silent reuse.
-- **Header rules:** a strict magic prefix, a short file, or a zero
-  version is a torn create — recreated, since no committed data can
-  predate the header fsync. A magic mismatch is foreign, refused, never
-  clobbered (`StoreError::Foreign`). Any other version, or a set
-  reserved word, is unsupported — refused loudly at any file length,
-  checked the moment the bytes are readable and before any recreate
-  decision (`StoreError::UnsupportedVersion`).
+  everything appended after; a client that has not crossed the gap —
+  including every device booting fresh from the store — cannot cross it:
+  the watermark stalls there until the compaction slice's bootstrap
+  (ADR 0017's designed stall, its sanctioned repair), and sequences are
+  never silently reused to fake progress. Mid-file damage does not even
+  boot: the corruption rule above refuses it outright.
+- **Header rules:** a strict magic prefix or a file too short to hold
+  the header is a torn create — recreated, since the header write is one
+  prefix and frames only ever follow its fsync: no committed data can
+  exist. A zero version in a *short* file is part of that torn create; a
+  zero version in a full-length header is not (a prefix write that
+  reaches past the header wrote the version too) — it is damage or
+  foreign, refused, never recreated over. A magic mismatch is foreign,
+  refused, never clobbered (`StoreError::Foreign`). Any other version,
+  or a set reserved word, is unsupported — refused loudly at any file
+  length, checked the moment the bytes are readable and before any
+  recreate decision (`StoreError::UnsupportedVersion`).
 - **Rollback:** a phase-one failure restores the previous marker,
   truncates to the committed boundary, and syncs; if even that fails the
   store is poisoned and refuses appends until reopened. A phase-two
