@@ -95,8 +95,11 @@ pub enum ApplyError {
     /// org entities (Organization, Membership, Budget) only in org scope,
     /// budget-content entities only in budget scope.
     ScopeKindMismatch { scope: ScopeId, kind: EntityKind },
-    /// An `Organization` op whose entity id is not its scope's org id —
-    /// one org log holds exactly one organization entity (ADR 0020).
+    /// The organization entity slot is violated (ADR 0020): an
+    /// `Organization` op whose entity id is not its scope's org id, or
+    /// any other entity kind minted onto the scope org's uuid. One org
+    /// log holds exactly one organization entity — its own — and nothing
+    /// else may take that slot.
     OrganizationIdMismatch { entity_id: EntityId, scope: ScopeId },
     /// The `op_id` was already applied with different content — `op_id`
     /// must uniquely identify an op or replicas diverge silently, so the
@@ -186,8 +189,21 @@ impl ScopeState {
                 kind: op.entity_kind,
             });
         }
-        // One org log, one organization entity, its own id (ADR 0020): a
-        // stray org entity cannot masquerade as another personal org.
+        // One org log, one organization entity, its own id (ADR 0020) —
+        // and the org's entity slot is RESERVED: an op touching the scope
+        // org's uuid must be the organization entity itself. Without the
+        // second half, a Membership minted onto the org's uuid wins the
+        // slot and permanently blinds the org (every later organization
+        // op is a kind lie against the squatter).
+        if let ScopeId::Org(org) = op.scope
+            && op.entity_id.as_uuid() == org.as_uuid()
+            && op.entity_kind != EntityKind::Organization
+        {
+            return Err(ApplyError::OrganizationIdMismatch {
+                entity_id: op.entity_id,
+                scope: op.scope,
+            });
+        }
         if op.entity_kind == EntityKind::Organization
             && ScopeId::Org(OrgId::from_raw(op.entity_id.as_uuid())) != op.scope
         {
@@ -1041,6 +1057,34 @@ mod tests {
             Err(ApplyError::OrganizationIdMismatch { .. })
         ));
         assert_eq!(org_state.entities().count(), 0);
+
+        // And the org's entity slot is reserved: a Membership (or Budget)
+        // minted onto the org's own uuid is rejected the same way —
+        // otherwise the squatter blinds the org permanently and every
+        // later organization op wedges as a kind lie against it.
+        let squatter = Op {
+            op_id: OpId::new(v7(35, 6)).unwrap(),
+            scope,
+            device_id: DeviceId::new(Uuid::nil()).unwrap(),
+            user_id: UserId::new(Uuid::nil()).unwrap(),
+            entity_kind: EntityKind::Membership,
+            entity_id: EntityId::from_raw(org.as_uuid()),
+            field: Field::Membership(MembershipField::UserId),
+            value: Value::User(UserId::new(Uuid::nil()).unwrap()),
+            hlc: Hlc {
+                physical_ms: 35,
+                logical: 0,
+            },
+        };
+        assert!(matches!(
+            org_state.apply(squatter),
+            Err(ApplyError::OrganizationIdMismatch { .. })
+        ));
+        assert_eq!(
+            org_state.entities().count(),
+            0,
+            "the squatter must not materialize anything"
+        );
 
         // A second org's op is foreign to this org's state, exactly as a
         // second budget is to a budget state.

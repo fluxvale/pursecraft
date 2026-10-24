@@ -1827,7 +1827,7 @@ mod tests {
             crate::org::membership_role(state, partner),
             Some(crate::domain::MembershipRole::Viewer)
         );
-        assert_eq!(crate::org::visible_budgets(state).count(), 1);
+        assert_eq!(crate::org::visible_budgets(state).len(), 1);
     }
 
     /// Version 1 stores (the pre-scope meta shape) are refused loudly —
