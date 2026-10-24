@@ -40,9 +40,12 @@ repo (upload riding the platform CI job, per-flag statuses, a root
   watchdog is disarmed for them — an external contributor is never blocked
   by an upload they cannot authorize.
 - **Root `codecov.yml`:** one flag per app (`core` today; api/cli get flags
-  when they get code), per-flag project status with a 1% threshold, patch
-  status `target: auto`, and `carryforward: false` so a flag reports only
-  when its path-gated job ran — the same shape as the workflow itself.
+  when they get code), a per-flag project status with a 1% threshold and a
+  per-flag patch status with `target: auto`, and `carryforward: false` so a
+  flag reports only when its path-gated job ran — the same shape as the
+  workflow itself. Reliability hierarchy, deliberate: the patch status is
+  the always-armed gate; the project status is best-effort (it needs
+  base-commit data for the flag — see Consequences).
 
 ## Alternatives considered
 
@@ -71,5 +74,9 @@ repo (upload riding the platform CI job, per-flag statuses, a root
   fluxvale/fluxvale, whose identical shape posts only
   `codecov/patch/<flag>`). The patch status is the always-armed gate — a
   coverage drop reds there.
+- Until base data exists on main (and on any later main stretch that skipped
+  the core job), pure deletions — removing tests or code, adding no new
+  lines — pass the patch gate vacuously and gate nothing; the project
+  status covers exactly those, and only where its base data exists.
 - Doctests are not instrumented (stable-toolchain limitation) — the report
   measures the binaries cargo-llvm-cov runs.

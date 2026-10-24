@@ -45,6 +45,7 @@ jobs:
               - "apps/core/**"
               - "scripts/ci/core.sh"
               - "scripts/ci/rust.sh"
+              - "scripts/ci/mise-version.sh"
               - "clippy.toml" # float guard (ADR 0006) applies to every Rust package
               - "Cargo.toml"
               - "Cargo.lock"
@@ -56,6 +57,7 @@ jobs:
               - "apps/core/**" # core is shared: a core change re-runs every consumer
               - "scripts/ci/api.sh"
               - "scripts/ci/rust.sh"
+              - "scripts/ci/mise-version.sh"
               - "clippy.toml"
               - "Cargo.toml"
               - "Cargo.lock"
@@ -66,6 +68,7 @@ jobs:
               - "apps/core/**" # core is shared: a core change re-runs every consumer
               - "scripts/ci/cli.sh"
               - "scripts/ci/rust.sh"
+              - "scripts/ci/mise-version.sh"
               - "clippy.toml"
               - "Cargo.toml"
               - "Cargo.lock"
@@ -77,6 +80,7 @@ jobs:
               - "Cargo.lock"
               - "deny.toml"
               - "scripts/ci/deny.sh"
+              - "scripts/ci/mise-version.sh"
               - "mise.toml" # cargo-deny version
               - ".github/workflows/ci.yml"
             machete:
@@ -86,6 +90,7 @@ jobs:
               - "Cargo.toml"
               - "Cargo.lock"
               - "scripts/ci/machete.sh"
+              - "scripts/ci/mise-version.sh"
               - "mise.toml" # cargo-machete version
               - ".github/workflows/ci.yml"
             typos:
@@ -158,6 +163,8 @@ jobs:
         with:
           flags: core
           files: target/coverage/core.lcov
+          disable_search: true # files: is additive — without this the CLI
+          # also globs for coverage files and could upload a stray match
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: ${{ !github.event.pull_request.head.repo.fork }}
 
