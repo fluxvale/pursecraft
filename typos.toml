@@ -1,0 +1,15 @@
+# typos config (issue #12): CI runs crate-ci/typos (pinned by action SHA);
+# locally the same tool comes from mise. The action runs `typos .`, which
+# skips hidden paths by default — that would exclude .github/ and dotfiles,
+# so hidden files are included and only .git and the root build dir
+# (/target, anchored — a nested source dir named target stays checked)
+# are excluded.
+[files]
+ignore-hidden = false
+extend-exclude = [".git", "/target"]
+
+# Domain prose hyphenates "mis-scoped" (oplog scoping, ADR 0017); typos splits
+# hyphens and rejects the bare word "mis". Accept it without weakening the
+# rest of the dictionary.
+[default.extend-words]
+mis = "mis"

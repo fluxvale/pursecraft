@@ -1,0 +1,30 @@
+# cargo-deny config for scripts/ci/deny.sh and the CI "cargo-deny" job
+# (issue #12): `cargo-deny --locked check advisories licenses` runs against
+# the whole workspace tree. Vulnerabilities, unmaintained crates, and yanked
+# versions all FAIL by configuration below — cargo-deny's stock defaults are
+# not all deny (yanked defaults to warn), so deviations are spelled out.
+
+[advisories]
+# A yanked release in Cargo.lock is a withdrawn, unsupported release — deny it
+# (stock default is warn; a money app does not ship withdrawn deps).
+yanked = "deny"
+# RustSec advisories with a fix demand an upgrade; an ignore is a documented,
+# temporary exception — every entry needs a reason and a removal plan.
+ignore = [
+    #{ id = "RUSTSEC-0000-0000", reason = "..." },
+]
+
+[licenses]
+# Allow-list of licenses. "MIT", "Apache-2.0" are the Rust ecosystem's two
+# defaults; "Unicode-3.0" rides along with unicode-ident ("(MIT OR Apache-2.0)
+# AND Unicode-3.0"); "FSL-1.1-ALv2" is this workspace's own license
+# (ADR 0019), declared via workspace.package.license so our crates are checked
+# exactly like dependencies. Adding anything else to this list is a deliberate
+# decision (memchr's "Unlicense OR MIT" is satisfied by MIT; Unlicense itself
+# stays un-allowed).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "FSL-1.1-ALv2",
+]

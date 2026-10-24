@@ -480,9 +480,9 @@ impl LocalStore {
     }
 
     /// Append one op durably; returns its canonical sequence. Scoping and
-    /// `op_id` dedupe follow the in-memory log exactly (ADR 0017): a
-    /// mis-scoped op is rejected, a re-append returns the original
-    /// sequence and writes nothing. The commit is two-phase (ADR 0018):
+    /// `op_id` dedupe follow the in-memory log exactly (ADR 0017): an op
+    /// scoped to the wrong budget is rejected, a re-append returns the
+    /// original sequence and writes nothing. The commit is two-phase (ADR 0018):
     /// the frame plus a PENDING marker under one sync, then the COMMITTED
     /// marker under a second — so a durable committed marker always
     /// implies a durable frame. A phase-one failure rolls the file back
