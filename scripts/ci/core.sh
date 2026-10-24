@@ -10,7 +10,7 @@ mapfile -t pkgs < <(cargo metadata --format-version 1 --no-deps \
   | jq -r --arg root "$(pwd -P)/apps/core/crates" \
       '.packages[] | select(.manifest_path | startswith($root + "/")) | .name')
 if [[ ${#pkgs[@]} -eq 0 ]]; then
-  echo "scripts/ci/core.sh: no workspace members matched under apps/core/crates (pwd -P: $(pwd -P))" >&2
+  echo "scripts/ci/core.sh: no workspace members matched under apps/core/crates (is jq installed? pwd -P: $(pwd -P))" >&2
   exit 1
 fi
 exec scripts/ci/rust.sh "${pkgs[@]}"
