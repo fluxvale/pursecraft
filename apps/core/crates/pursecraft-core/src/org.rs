@@ -88,7 +88,7 @@ pub fn budget_access(state: &ScopeState, user: UserId, budget: &Budget) -> Optio
         .flatten()
 }
 
-/// The ids a personal-org provisioning writes (ADR 2020): the org, the
+/// The ids a personal-org provisioning writes (ADR 0020): the org, the
 /// owner-membership entity, and the user the org is personal for. The
 /// caller mints all three (capture is a later slice, ADR 0016).
 #[derive(Clone, Copy, Debug)]
@@ -98,15 +98,45 @@ pub struct PersonalOrgIds {
     pub membership: EntityId,
 }
 
-/// The personal-org provisioning op-set (ADR 2020): the organization —
+/// The creation stamp every provisioning op carries (ADR 0020): the org
+/// id's own UUIDv7 millisecond, logical zero. Anchoring here is the merge
+/// guard — any device that has ever seen this org received a stamp this
+/// dominates (HLC receive, ADR 0007), so every edit such a device later
+/// writes outranks provisioning at merge, whatever the provisioning
+/// device's clock knew. A stale or empty device therefore cannot clobber
+/// a user edit or re-escalate a role, structurally; provisioning can only
+/// land fields no device ever wrote. (A never-synced writer with a clock
+/// behind the org's mint is outside the protocol — the ADR 0017 skew
+/// posture.)
+fn org_creation_stamp(org: OrgId) -> Hlc {
+    // RFC 9562: a UUIDv7's top 48 bits are its unix-milliseconds field —
+    // exactly what the id's minter encoded. (0 only if the bits carry
+    // nothing, which a validated v7 id never does; it is the fail-safe
+    // bottom of the stamp order anyway.)
+    let ms = (org.as_uuid().as_u128() >> 80) as u64;
+    Hlc {
+        physical_ms: ms,
+        logical: 0,
+    }
+}
+
+/// The personal-org provisioning op-set (ADR 0020): the organization —
 /// named, marked personal for `user` — plus the creator's owner
-/// membership. The FluxVale pattern as oplog data, probe-first: an op is
-/// emitted only where `state` does not already hold a value for its
-/// field, so a retry — fresh op ids, fresh stamp, whatever the clocks did
-/// between attempts — rewrites nothing: an intervening user edit
-/// survives, and a role demotion is never re-escalated. A partially
-/// applied first attempt is completed; a satisfied one emits nothing at
-/// all. `mint_op_id` supplies op ids for whatever is missing. `state` is
+/// membership. Two barriers make retrying safe, because the retrying
+/// device may be empty or stale (that is why retries exist):
+///
+/// 1. **Read-then-mint (capture's contract):** the caller probes the
+///    current org-log state — sync first — and this function emits an op
+///    only where that state holds no value for its field, completing a
+///    partially-applied attempt and emitting nothing for a satisfied one.
+/// 2. **Anchored stamps (the core's structural guard):** every emitted op
+///    carries the org id's own mint millisecond (see the private
+///    `org_creation_stamp`) — not the provisioning device's clock, so on
+///    merge these ops lose to every field any legitimate editor ever
+///    wrote. A contract-violating stale retry still cannot revert a
+///    rename or re-escalate a demotion.
+///
+/// `mint_op_id` supplies op ids for whatever is missing. `state` is
 /// probed only when fixed to this org — otherwise every op is emitted,
 /// and a genuinely foreign state rejects them loudly at apply.
 pub fn provision_personal_org(
@@ -114,7 +144,6 @@ pub fn provision_personal_org(
     ids: PersonalOrgIds,
     name: &str,
     device_id: DeviceId,
-    hlc: Hlc,
     mut mint_op_id: impl FnMut() -> OpId,
 ) -> Vec<Op> {
     let PersonalOrgIds {
@@ -124,6 +153,7 @@ pub fn provision_personal_org(
     } = ids;
     let scope = ScopeId::Org(org);
     let org_entity = EntityId::from_raw(org.as_uuid());
+    let hlc = org_creation_stamp(org);
     let probing = state.scope_id() == Some(scope);
     let present = |id: EntityId, field: Field| match (state.entity(&id), field) {
         (Some(Entity::Organization(o)), Field::Organization(OrgField::Name)) => o.name.is_some(),
@@ -204,16 +234,15 @@ where
 }
 
 /// The personal-org invariant's second clause (ADR 0020): the creator's
-/// membership in their own org survives. Removal (a tombstone) strips the
-/// user's role and access to every budget in their own org while the org
-/// stays alive — the checker flags it; the log stays faithful. Role
-/// *changes* are data: ADR 0020's two policy rules cover deletion and
-/// removal only.
+/// OWNER membership survives — their resolved role in their own org is
+/// Owner, exactly what [`membership_role`] (and therefore
+/// [`budget_access`]) resolves, so the checker can never disagree with
+/// access. Removal, a role-less twin, a squatted membership id, or a
+/// demotion — anything that leaves the creator without Owner — is a
+/// visible violation; the log stays faithful. Roles among OTHER members
+/// are data.
 pub fn owner_membership_intact(state: &ScopeState, user: UserId) -> bool {
-    state.entities().any(|entity| match entity {
-        Entity::Membership(membership) => !membership.deleted && membership.user_id == Some(user),
-        _ => false,
-    })
+    membership_role(state, user) == Some(MembershipRole::Owner)
 }
 
 #[cfg(test)]
@@ -395,7 +424,6 @@ mod tests {
             },
             "Terence's org",
             device,
-            hlc_at(MS + 1),
             || {
                 counter += 1;
                 OpId::new(v7(MS + counter, counter)).unwrap()
@@ -454,7 +482,6 @@ mod tests {
             },
             "Terence's org",
             device,
-            hlc_at(MS + 60),
             || {
                 counter2 += 1;
                 OpId::new(v7(MS + counter2, counter2)).unwrap()
@@ -470,7 +497,11 @@ mod tests {
         assert_eq!(organization(&state).unwrap().name.as_deref(), Some("Home"));
         assert_eq!(membership_role(&state, terence), Some(Role::Viewer));
         assert_eq!(live_personal_orgs([&state], terence), vec![org]);
-        assert!(owner_membership_intact(&state, terence));
+        // The self-demotion is itself a flagged state under the owner
+        // clause (the creator lost Owner in their own org) — that is the
+        // checker REPORTING policy, which is exactly what must NOT be
+        // silently "repaired" by a retry.
+        assert!(!owner_membership_intact(&state, terence));
 
         // The same-stamp, same-op-id replay of the ORIGINAL set is still
         // the engine's duplicate no-op (ADR 0007) — the probe and the
@@ -497,7 +528,6 @@ mod tests {
             },
             "Second",
             device,
-            hlc_at(MS + 1),
             || {
                 counter3 += 1;
                 OpId::new(v7(MS + counter3, counter3)).unwrap()
@@ -530,7 +560,6 @@ mod tests {
             },
             "Second",
             device,
-            hlc_at(MS + 60),
             || {
                 counter4 += 1;
                 OpId::new(v7(MS + counter4, counter4)).unwrap()
@@ -605,9 +634,139 @@ mod tests {
         );
     }
 
-    /// The invariant's second clause (ADR 0020): removing the owner
-    /// membership of a live personal org strips the creator's role and
-    /// access to their own budgets — the checker flags it.
+    /// The stale/empty-device path (ADR 0020): a device that never saw
+    /// the org provisions with a fresh clock — read-then-mint cannot help
+    /// it (its state is empty), so the ANCHORED STAMPS must: its ops lose
+    /// on merge to every field the up-to-date world already wrote. The
+    /// repro from review: device A provisions, the user renames and
+    /// self-demotes; device B, empty, re-provisions; merging B into A
+    /// must not revert the rename or re-escalate the role — in either
+    /// merge order.
+    #[test]
+    fn stale_device_provisioning_cannot_clobber_on_merge() {
+        let terence = user(500);
+        let org = OrgId::new(v7(MS, 41)).unwrap();
+        let membership = EntityId::new(v7(MS, 42)).unwrap();
+        let device_a = DeviceId::new(Uuid::nil()).unwrap();
+        let device_b = DeviceId::new(Uuid::max()).unwrap();
+        let scope = ScopeId::Org(org);
+        let org_entity = EntityId::from_raw(org.as_uuid());
+
+        // Device A: virgin provisioning, then the user's own edits at
+        // T+50 (rename + self-demotion).
+        let mut counter = 0u64;
+        let a_ops = provision_personal_org(
+            &ScopeState::new(),
+            PersonalOrgIds {
+                user: terence,
+                org,
+                membership,
+            },
+            "Terence's org",
+            device_a,
+            || {
+                counter += 1;
+                OpId::new(v7(MS + counter, counter)).unwrap()
+            },
+        );
+        // Provisioning ops are stamped at the org's mint time (MS), not
+        // the minter's clock — the anchored-stamp guard itself.
+        assert!(
+            a_ops.iter().all(|op| op.hlc.physical_ms == MS),
+            "provisioning stamps anchor at the org id's UUIDv7 ms"
+        );
+        let mut edits = vec![];
+        for (kind, id, field, value) in [
+            (
+                EntityKind::Organization,
+                org_entity,
+                Field::Organization(OrgField::Name),
+                Value::Text("Home".into()),
+            ),
+            (
+                EntityKind::Membership,
+                membership,
+                Field::Membership(MembershipField::Role),
+                Value::Role(Role::Viewer),
+            ),
+        ] {
+            let n = edits.len() as u64;
+            edits.push(Op {
+                op_id: OpId::new(v7(MS + 50 + n, 50 + n)).unwrap(),
+                scope,
+                device_id: device_a,
+                user_id: terence,
+                entity_kind: kind,
+                entity_id: id,
+                field,
+                value,
+                hlc: hlc_at(MS + 50),
+            });
+        }
+
+        // Device B: NEVER saw any of it — its state is empty, so the
+        // probe passes everything through, and its fresh clock (T+60)
+        // would win a blind LWW race. The anchored stamps must not.
+        let mut counter_b = 100u64;
+        let b_ops = provision_personal_org(
+            &ScopeState::new(),
+            PersonalOrgIds {
+                user: terence,
+                org,
+                membership,
+            },
+            "Terence's org",
+            device_b,
+            || {
+                counter_b += 1;
+                OpId::new(v7(MS + counter_b, counter_b)).unwrap()
+            },
+        );
+        assert_eq!(b_ops.len(), 4, "an empty state provisions in full");
+        assert!(b_ops.iter().all(|op| op.hlc.physical_ms == MS));
+
+        // Merge B into A, and A into B — both orders, same outcome: the
+        // user's edits survive, the demotion is not re-escalated.
+        for order in [
+            (true, "B's stale provisioning applied onto A's state"),
+            (false, "A's ops applied onto B's provisioning-first state"),
+        ] {
+            let (b_onto_a, label) = order;
+            let mut merged = ScopeState::new();
+            let first: Vec<Op> = if b_onto_a {
+                b_ops.clone()
+            } else {
+                a_ops.clone().into_iter().chain(edits.clone()).collect()
+            };
+            let second: Vec<Op> = if b_onto_a {
+                a_ops.clone().into_iter().chain(edits.clone()).collect()
+            } else {
+                b_ops.clone()
+            };
+            for op in first.iter().chain(&second) {
+                merged.apply(op.clone()).expect("well-formed ops");
+            }
+            assert_eq!(
+                organization(&merged).unwrap().name.as_deref(),
+                Some("Home"),
+                "the rename survives the merge ({label})"
+            );
+            assert_eq!(
+                membership_role(&merged, terence),
+                Some(Role::Viewer),
+                "no privilege re-escalation through the merge ({label})"
+            );
+            assert_eq!(live_personal_orgs([&merged], terence), vec![org]);
+        }
+    }
+
+    /// The invariant's second clause (ADR 0020): the checker verifies the
+    /// CREATOR'S OWNER membership — the resolved role, so it can never
+    /// disagree with access. Repro A: removal plus a role-less twin
+    /// naming the creator must flag (the checker must not be satisfied by
+    /// any live membership). Repro B: an attacker squats the membership
+    /// id provisioning will use — the creator ends up role-less while
+    /// the attacker is Owner, and the checker must flag that too.
     #[test]
     fn removed_owner_membership_is_flagged() {
         let terence = user(500);
@@ -624,7 +783,6 @@ mod tests {
             },
             "Home",
             device,
-            hlc_at(MS + 1),
             || {
                 counter += 1;
                 OpId::new(v7(MS + counter, counter)).unwrap()
@@ -638,9 +796,9 @@ mod tests {
         assert!(owner_membership_intact(&state, terence));
         assert_eq!(membership_role(&state, terence), Some(Role::Owner));
 
-        // The removal: tombstone the owner membership in the user's own
-        // org. The org stays alive and personal — the membership clause
-        // alone must break, visibly, while role and access collapse.
+        // Repro A: the owner membership is tombstoned and a role-less
+        // twin naming the creator takes its place — "any live membership"
+        // would be satisfied; the CREATOR'S OWNER membership is not.
         OrgPen {
             state: &mut state,
             scope: ScopeId::Org(org),
@@ -654,15 +812,105 @@ mod tests {
             Field::Deleted,
             Value::Bool(true),
         );
-        assert!(
-            !owner_membership_intact(&state, terence),
-            "the removal is a visible violation"
+        let mut twin = state.clone();
+        OrgPen {
+            state: &mut twin,
+            scope: ScopeId::Org(org),
+            actor: terence,
+            n: 10,
+        }
+        .write(
+            MS + 11,
+            EntityKind::Membership,
+            EntityId::new(v7(MS, 45)).unwrap(), // lower id than `membership`: the earliest survivor if it counted
+            Field::Membership(MembershipField::UserId),
+            Value::User(terence),
         );
-        assert_eq!(membership_role(&state, terence), None);
+        assert!(
+            !owner_membership_intact(&twin, terence),
+            "repro A: the role-less twin must not satisfy the clause"
+        );
+        assert_eq!(membership_role(&twin, terence), None);
         assert_eq!(
-            live_personal_orgs([&state], terence),
+            live_personal_orgs([&twin], terence),
             vec![org],
             "the org clause still holds — the two clauses are independent"
+        );
+
+        // Repro B: an attacker pre-writes the membership id provisioning
+        // will use, naming themselves Owner. The probe skips the occupied
+        // fields, the creator ends up role-less, and the checker flags
+        // the creator's loss (policing the attacker is the auth slice's).
+        let victim_org = OrgId::new(v7(MS, 56)).unwrap();
+        let victim_membership = EntityId::new(v7(MS, 57)).unwrap();
+        let attacker = user(502);
+        let mut squatted = ScopeState::new();
+        {
+            let mut pen = OrgPen {
+                state: &mut squatted,
+                scope: ScopeId::Org(victim_org),
+                actor: attacker,
+                n: 0,
+            };
+            pen.write(
+                MS + 1,
+                EntityKind::Organization,
+                EntityId::from_raw(victim_org.as_uuid()),
+                Field::Organization(OrgField::Name),
+                Value::Text("Stolen".into()),
+            );
+            pen.write(
+                MS + 2,
+                EntityKind::Membership,
+                victim_membership,
+                Field::Membership(MembershipField::UserId),
+                Value::User(attacker),
+            );
+            pen.write(
+                MS + 3,
+                EntityKind::Membership,
+                victim_membership,
+                Field::Membership(MembershipField::Role),
+                Value::Role(Role::Owner),
+            );
+        }
+        let mut counter2 = 200u64;
+        let squatter_ops = provision_personal_org(
+            &squatted,
+            PersonalOrgIds {
+                user: terence,
+                org: victim_org,
+                membership: victim_membership,
+            },
+            "Terence's org",
+            device,
+            || {
+                counter2 += 1;
+                OpId::new(v7(MS + counter2, counter2)).unwrap()
+            },
+        );
+        assert_eq!(
+            squatter_ops.len(),
+            1,
+            "the probe skips the squatted fields: only personal_for is missing"
+        );
+        for op in &squatter_ops {
+            squatted.apply(op.clone()).unwrap();
+        }
+        assert_eq!(
+            membership_role(&squatted, terence),
+            None,
+            "repro B: the creator is role-less in their own org"
+        );
+        assert_eq!(membership_role(&squatted, attacker), Some(Role::Owner));
+        assert!(
+            !owner_membership_intact(&squatted, terence),
+            "repro B: the creator's loss is flagged"
+        );
+        assert_eq!(
+            live_personal_orgs([&squatted], terence),
+            vec![victim_org],
+            "the org clause holds — personal_for is the creator's"
         );
     }
 
@@ -718,7 +966,7 @@ mod tests {
 
     /// The budget list is in stable `BudgetId` order, and a budget whose
     /// stored scope is another org's is never visible or accessible
-    /// through this org's projections (ADR 2020) — cross-org composition
+    /// through this org's projections (ADR 0020) — cross-org composition
     /// cannot smuggle a foreign budget past them.
     #[test]
     fn budget_list_order_is_stable_and_foreign_scope_budgets_resolve_nothing() {
