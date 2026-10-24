@@ -14,6 +14,7 @@ pub mod hlc;
 pub mod ids;
 pub mod money;
 pub mod ops;
+pub mod probe;
 pub mod resolve;
 pub mod store;
 pub mod sync;
