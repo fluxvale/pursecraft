@@ -22,7 +22,8 @@ the sync engine, transport, and storage are later slices.
 
 ### Entity set
 
-Seven entities. Every entity carries the same envelope: a **UUIDv7 id**, the
+Seven entities *(nine since [ADR 0020](0020-organizations-own-budgets.md)
+added `Organization` and `Membership`)*. Every entity carries the same envelope: a **UUIDv7 id**, the
 **`budget_id`** scope ([ADR 0008](0008-multiuser-day-one.md)) — *(amended by
 [ADR 0020](0020-organizations-own-budgets.md): the envelope field is the typed
 `scope` (an org or a budget); the entity set grows `Organization` and

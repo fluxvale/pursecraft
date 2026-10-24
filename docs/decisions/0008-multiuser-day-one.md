@@ -18,8 +18,10 @@ Build multi-user into the foundation:
 
 - `budget_memberships` table (user ↔ budget) with roles: **owner / editor /
   viewer**.
-- Every entity carries `budget_id`; the server enforces scoping on both op
-  ingestion and delta reads.
+- Every entity carries `budget_id` *(amended by
+  [ADR 0020](0020-organizations-own-budgets.md): the envelope field is the
+  typed `scope`, and org logs carry org entities alongside)*; the server
+  enforces scoping on both op ingestion and delta reads.
 - Invite flow: link/email token → membership → device registers → syncs.
 - Every op is tagged with `user_id` and `device_id`, giving attribution/audit
   trails for free ("who changed this").

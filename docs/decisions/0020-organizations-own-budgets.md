@@ -118,15 +118,25 @@ FluxVale pattern — one transaction, idempotent — translates to oplog data:
 
 - **Provisioning op-set** (`provision_personal_org`): the ops that write
   the `Organization` entity (`name`, `personal_for = user`) and the owner
-  `Membership` — **probe-first**: an op is emitted only where the current
-  state holds no value for its field. That is the FluxVale probe
-  transferred to oplog data, and it is what makes retrying safe: a
-  crash-retry mints fresh op ids AND a fresh stamp, and under plain LWW
-  that retry would revert a user's rename or re-escalate a self-demotion —
-  the probe instead emits nothing for fields already written, so user
-  edits survive every retry and a partially-applied first attempt is
-  completed, never redone. The caller owns id minting (ADR 0016 keeps
-  capture deferred).
+  `Membership`. Two barriers make retrying safe, because the retrying
+  device may be EMPTY OR STALE — that is why retries exist:
+  1. **Read-then-mint (capture's contract):** provisioning reads the
+     current org-log state — sync first — before minting; the function
+     emits an op only where that state holds no value for its field, so a
+     caught-up retry emits nothing and a partially-applied first attempt
+     is completed, never redone. Until the capture slice exists, this
+     ADR *is* that contract.
+  2. **Anchored stamps (the core's structural guard):** every
+     provisioning op is stamped at the ORG ID'S OWN mint millisecond —
+     the UUIDv7 field — not the provisioning device's clock. Any device
+     that has ever seen the org holds an HLC dominating that stamp
+     (receive-merge, ADR 0007), so every edit such a device later writes
+     outranks provisioning at merge. A contract-violating stale or empty
+     retry therefore loses every contested field on merge: it can revert
+     no rename and re-escalate no demotion — it can only land fields no
+     device ever wrote. (A never-synced writer with a clock behind the
+     org's mint is outside the protocol — the ADR 0017 skew posture.)
+  The caller owns id minting (ADR 0016 keeps capture deferred).
 - **Invariant as data:** `live_personal_orgs(org_states, user)` returns the
   live orgs claiming `personal_for = user` (deduplicated — repeated input
   states are legal); a user's state satisfies the clause iff exactly one
@@ -134,13 +144,18 @@ FluxVale pattern — one transaction, idempotent — translates to oplog data:
   false when the creator's membership in their own org was removed. The
   checkers are pure and multi-state — a user's orgs live in several org
   logs, which never mix.
-- **Policy:** a personal org is **not deletable**, and its owner membership
-  is **not removable** — a user always has a home. Enforcement lives at
+- **Policy:** a personal org is **not deletable**, and its creator keeps
+  **Owner** — removal *or demotion* of the creator's owner membership is a
+  violation; a user always has a home they control. Enforcement lives at
   capture (the later capture slice refuses to mint such ops) and at the
-  invariant checker (flags violations loudly); the log itself stays
-  faithful — a hostile or buggy tombstone is data the checker reports,
-  never something resolution silently merges away. Personal orgs may hold
-  further members: that is day-one household sharing.
+  invariant checker, whose second clause is the creator's RESOLVED role —
+  `owner_membership_intact` asks what `membership_role` answers, so the
+  checker can never disagree with access (a tombstone behind a role-less
+  twin, or a squatted membership id, is flagged, not waved through).
+  The log itself stays faithful — a hostile or buggy tombstone is data
+  the checker reports, never something resolution silently merges away.
+  Roles among OTHER members are data. Personal orgs may hold further
+  members: that is day-one household sharing.
 
 ### Sync, storage, wire
 
