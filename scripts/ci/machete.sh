@@ -4,4 +4,7 @@
 # plain mode false-greens on those (needs cargo on PATH).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-exec cargo-machete --with-metadata
+cargo-machete --with-metadata
+# deny.sh has --locked; machete has no such flag, and --with-metadata would
+# silently rewrite (and grade) a stale Cargo.lock instead. Fail on rewrite.
+git diff --exit-code -- Cargo.lock

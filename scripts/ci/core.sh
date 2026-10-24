@@ -4,8 +4,13 @@
 # land unchecked (its name is not hardcoded here).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+# pwd -P: cargo metadata reports canonical paths — a symlinked checkout's
+# logical $PWD would match nothing and die below.
 mapfile -t pkgs < <(cargo metadata --format-version 1 --no-deps \
-  | jq -r --arg root "$PWD/apps/core/crates" \
+  | jq -r --arg root "$(pwd -P)/apps/core/crates" \
       '.packages[] | select(.manifest_path | startswith($root + "/")) | .name')
-test "${#pkgs[@]}" -gt 0
+if [[ ${#pkgs[@]} -eq 0 ]]; then
+  echo "scripts/ci/core.sh: no workspace members matched under apps/core/crates (pwd -P: $(pwd -P))" >&2
+  exit 1
+fi
 exec scripts/ci/rust.sh "${pkgs[@]}"

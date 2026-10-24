@@ -4,7 +4,7 @@
 # so hidden files are included and only .git is excluded.
 [files]
 ignore-hidden = false
-extend-exclude = [".git"]
+extend-exclude = [".git", "target"]
 
 # Domain prose hyphenates "mis-scoped" (oplog scoping, ADR 0017); typos splits
 # hyphens and rejects the bare word "mis". Accept it without weakening the
