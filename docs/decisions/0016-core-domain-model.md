@@ -1,6 +1,8 @@
 # 0016 — Core Domain Model: Entities, Fields, and Op Mapping
 
-- **Status:** Accepted
+- **Status:** Accepted — entity set and value vocabulary amended by
+  [ADR 0020](0020-organizations-own-budgets.md) (Budget entity moves to org
+  scope; org entities and the `User`/`Role` values arrive)
 - **Date:** 2026-10-20
 - **Builds on:** [ADR 0006](0006-integer-money.md),
   [ADR 0007](0007-oplog-sync-protocol.md),

@@ -5,8 +5,10 @@
 //! deterministic referential resolution — the sync engine and op wire
 //! format of ADR 0017: the canonical op log, delta-applying sync sessions,
 //! and the metadata/payload split whose single choke point the E2EE layer
-//! will wrap — and the durable local store of ADR 0018: the append-only
-//! framed file a real client boots the engine from.
+//! will wrap — the durable local store of ADR 0018: the append-only
+//! framed file a real client boots the engine from — and the organization
+//! scope of ADR 0020: orgs own budgets, personal-org provisioning, and
+//! org-level roles and resolution.
 
 pub mod date;
 pub mod domain;
@@ -14,6 +16,7 @@ pub mod hlc;
 pub mod ids;
 pub mod money;
 pub mod ops;
+pub mod org;
 pub mod resolve;
 pub mod store;
 pub mod sync;
@@ -92,17 +95,19 @@ pub(crate) mod testkit {
 
     /// The shared convergence-test machinery of ADR 0017 — deterministic op
     /// generators and state assertions — reused by the store suite
-    /// (ADR 0018). All loops are xorshift-deterministic per the ADR 0016
-    /// convention.
+    /// (ADR 0018) and parameterized over the log scope (ADR 0020: the same
+    /// theorem, proved for org logs and budget logs). All loops are
+    /// xorshift-deterministic per the ADR 0016 convention.
     pub(crate) mod conv {
         use crate::domain::{
             AccountField, BudgetField, CategoryField, CategoryGroupField, EntityKind, Field,
-            MonthCategoryField, PayeeField, TransactionField, Value,
+            MembershipField, MembershipRole, MonthCategoryField, OrgField, PayeeField,
+            TransactionField, Value,
         };
         use crate::hlc::Hlc;
-        use crate::ids::{BudgetId, DeviceId, EntityId, OpId, UserId};
+        use crate::ids::{BudgetId, DeviceId, EntityId, OpId, OrgId, ScopeId, UserId};
         use crate::money::Milliunits;
-        use crate::ops::{BudgetState, Op};
+        use crate::ops::{Op, ScopeState};
         use crate::sync::SequencedOp;
         use crate::testkit::{Rng, v7};
         use uuid::Uuid;
@@ -113,9 +118,22 @@ pub(crate) mod testkit {
         /// v7-friendly ms for deterministic ids.
         pub(crate) const ID_MS: u64 = 1 << 40;
         const BUDGET_RAND: u64 = 1;
+        const ORG_RAND: u64 = 2;
 
         pub(crate) fn budget() -> BudgetId {
             BudgetId::new(v7(1, BUDGET_RAND)).unwrap()
+        }
+
+        /// The scope org of org-scope generations, on the same `ID_MS` base
+        /// as pool entity ids — the org entity's id must equal the scope
+        /// org id exactly (ADR 0020).
+        pub(crate) fn org() -> OrgId {
+            OrgId::new(v7(ID_MS, ORG_RAND)).unwrap()
+        }
+
+        /// The two scopes the convergence loops prove (ADR 0020).
+        pub(crate) fn scopes() -> [ScopeId; 2] {
+            [ScopeId::Budget(budget()), ScopeId::Org(org())]
         }
 
         /// One deterministic op. `op_rand` disambiguates the op id; `(ms,
@@ -123,7 +141,7 @@ pub(crate) mod testkit {
         pub(crate) fn op(op_rand: u64, ms: u64, logical: u32, field: Field, value: Value) -> Op {
             Op {
                 op_id: OpId::new(v7(ID_MS, op_rand)).unwrap(),
-                budget_id: budget(),
+                scope: ScopeId::Budget(budget()),
                 device_id: DeviceId::new(Uuid::nil()).unwrap(),
                 user_id: UserId::new(Uuid::nil()).unwrap(),
                 entity_kind: EntityKind::Transaction,
@@ -155,10 +173,11 @@ pub(crate) mod testkit {
         /// behind the base.
         const SKEW: [u64; DEVICES as usize] = [0, 0, 3_600_000, 31_536_000_000, 86_399_999];
 
-        /// Entity pool across every kind: (kind, id rand) — multiple entities
-        /// per kind so ops race across both fields and entities.
-        const POOL: [(EntityKind, u64); 12] = [
-            (EntityKind::Budget, 1),
+        /// Entity pool for budget scope (ADR 0016's content entities; the
+        /// Budget entity itself lives in org scope, ADR 0020): (kind, id
+        /// rand) — multiple entities per kind so ops race across both
+        /// fields and entities.
+        const BUDGET_POOL: [(EntityKind, u64); 10] = [
             (EntityKind::Account, 2),
             (EntityKind::Account, 30),
             (EntityKind::CategoryGroup, 3),
@@ -168,14 +187,55 @@ pub(crate) mod testkit {
             (EntityKind::Payee, 5),
             (EntityKind::Transaction, 6),
             (EntityKind::Transaction, 50),
-            (EntityKind::MonthCategory, 7),
             (EntityKind::MonthCategory, 60),
         ];
 
+        /// Entity pool for org scope (ADR 0020): the organization entry
+        /// uses the scope's own org rand (an org log holds exactly its own
+        /// org entity), plus racing memberships and budgets.
+        const ORG_POOL: [(EntityKind, u64); 7] = [
+            (EntityKind::Organization, ORG_RAND),
+            (EntityKind::Membership, 7),
+            (EntityKind::Membership, 61),
+            (EntityKind::Membership, 62),
+            (EntityKind::Budget, 8),
+            (EntityKind::Budget, 63),
+            (EntityKind::Budget, 64),
+        ];
+
+        /// Users the generator writes into membership/personal-for fields:
+        /// two auth-issued ids plus a dangling third (a user with no
+        /// membership — resolution's missing-reference path).
+        fn users() -> [UserId; 3] {
+            [
+                UserId::new(Uuid::nil()).unwrap(),
+                UserId::new(Uuid::max()).unwrap(),
+                UserId::new(v7(ID_MS, 300)).unwrap(),
+            ]
+        }
+
         const TEXTS: [&str; 5] = ["", "GCash", "groceries ₱", "Meralco", "uña"];
+
+        /// The pool a scope generates from.
+        fn pool_for(scope: ScopeId) -> &'static [(EntityKind, u64)] {
+            match scope {
+                ScopeId::Budget(_) => &BUDGET_POOL,
+                ScopeId::Org(_) => &ORG_POOL,
+            }
+        }
 
         fn fields_for(kind: EntityKind) -> &'static [Field] {
             match kind {
+                EntityKind::Organization => &[
+                    Field::Deleted,
+                    Field::Organization(OrgField::Name),
+                    Field::Organization(OrgField::PersonalFor),
+                ],
+                EntityKind::Membership => &[
+                    Field::Deleted,
+                    Field::Membership(MembershipField::UserId),
+                    Field::Membership(MembershipField::Role),
+                ],
                 EntityKind::Budget => &[Field::Deleted, Field::Budget(BudgetField::Name)],
                 EntityKind::Account => &[
                     Field::Deleted,
@@ -215,7 +275,7 @@ pub(crate) mod testkit {
         /// An id value: a pool entity of the referenced kind, or a dangling id
         /// (resolution's missing-reference path, ADR 0016).
         fn reference_value(rng: &mut Rng, kind: EntityKind) -> Value {
-            let candidates: Vec<u64> = POOL
+            let candidates: Vec<u64> = BUDGET_POOL
                 .iter()
                 .filter(|(k, _)| *k == kind)
                 .map(|(_, r)| *r)
@@ -230,11 +290,23 @@ pub(crate) mod testkit {
             )
         }
 
+        /// A user value: one of the fixed users, or a dangling id (ADR 0020).
+        fn user_value(rng: &mut Rng) -> Value {
+            let users = users();
+            let i = rng.below(users.len() as u64 + 1) as usize;
+            if i == users.len() {
+                Value::User(UserId::new(v7(ID_MS, 8888)).unwrap())
+            } else {
+                Value::User(users[i])
+            }
+        }
+
         fn random_value(rng: &mut Rng, field: Field) -> Value {
             use crate::date::{Date, Month};
             match field {
                 Field::Deleted => Value::Bool(rng.below(2) == 0),
-                Field::Budget(BudgetField::Name)
+                Field::Organization(OrgField::Name)
+                | Field::Budget(BudgetField::Name)
                 | Field::Account(AccountField::Name)
                 | Field::CategoryGroup(CategoryGroupField::Name)
                 | Field::Category(CategoryField::Name)
@@ -243,6 +315,13 @@ pub(crate) mod testkit {
                 | Field::Transaction(TransactionField::Memo) => {
                     Value::Text(TEXTS[rng.below(TEXTS.len() as u64) as usize].into())
                 }
+                Field::Organization(OrgField::PersonalFor)
+                | Field::Membership(MembershipField::UserId) => user_value(rng),
+                Field::Membership(MembershipField::Role) => Value::Role(match rng.below(3) {
+                    0 => MembershipRole::Owner,
+                    1 => MembershipRole::Editor,
+                    _ => MembershipRole::Viewer,
+                }),
                 Field::Account(AccountField::Kind) => Value::AccountKind(match rng.below(11) {
                     0 => crate::domain::AccountKind::Checking,
                     1 => crate::domain::AccountKind::Savings,
@@ -296,16 +375,19 @@ pub(crate) mod testkit {
             }
         }
 
-        /// Deterministic op stream: `DEVICES × OPS_PER_DEVICE` ops, per-device
-        /// clock offsets, occasional same-ms logical bumps.
-        pub(crate) fn generate_ops(seed: u64) -> Vec<Op> {
+        /// Deterministic op stream for one scope: `DEVICES × OPS_PER_DEVICE`
+        /// ops, per-device clock offsets, occasional same-ms logical bumps.
+        /// Org-scope streams draw from the org pool — the organization
+        /// entity pinned to the scope's own org id (ADR 0020).
+        pub(crate) fn generate_ops(seed: u64, scope: ScopeId) -> Vec<Op> {
             let mut rng = Rng::new(seed | 1);
+            let pool = pool_for(scope);
             let mut ops = Vec::new();
             let mut global: u64 = 0;
             for device in 0..DEVICES {
                 for event in 0..OPS_PER_DEVICE as u64 {
                     global += 1;
-                    let (kind, entity_rand) = POOL[rng.below(POOL.len() as u64) as usize];
+                    let (kind, entity_rand) = pool[rng.below(pool.len() as u64) as usize];
                     let fields = fields_for(kind);
                     let field = fields[rng.below(fields.len() as u64) as usize];
                     let value = random_value(&mut rng, field);
@@ -317,7 +399,7 @@ pub(crate) mod testkit {
                     };
                     ops.push(Op {
                         op_id: OpId::new(v7(ID_MS, global)).unwrap(),
-                        budget_id: budget(),
+                        scope,
                         device_id: DeviceId::new(v7(ID_MS + device, 100 + device)).unwrap(),
                         user_id: UserId::new(v7(ID_MS + device % 2, 200 + device % 2)).unwrap(),
                         entity_kind: kind,
@@ -363,12 +445,26 @@ pub(crate) mod testkit {
         /// The materialized value of one field — the test-side inverse of
         /// `set_field`, so convergence assertions can read state back.
         pub(crate) fn materialized(
-            state: &BudgetState,
+            state: &ScopeState,
             id: EntityId,
             field: Field,
         ) -> Option<Value> {
             use crate::domain::Entity;
             match (state.entity(&id)?, field) {
+                (Entity::Organization(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+                (Entity::Organization(e), Field::Organization(OrgField::Name)) => {
+                    e.name.clone().map(Value::Text)
+                }
+                (Entity::Organization(e), Field::Organization(OrgField::PersonalFor)) => {
+                    e.personal_for.map(Value::User)
+                }
+                (Entity::Membership(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
+                (Entity::Membership(e), Field::Membership(MembershipField::UserId)) => {
+                    e.user_id.map(Value::User)
+                }
+                (Entity::Membership(e), Field::Membership(MembershipField::Role)) => {
+                    e.role.map(Value::Role)
+                }
                 (Entity::Budget(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
                 (Entity::Budget(e), Field::Budget(BudgetField::Name)) => {
                     e.name.clone().map(Value::Text)

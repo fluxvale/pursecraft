@@ -1,6 +1,8 @@
 # 0008 — Multi-User Budgets from Day One
 
-- **Status:** Accepted
+- **Status:** Accepted — membership shape (user ↔ budget roles) superseded
+  by [ADR 0020](0020-organizations-own-budgets.md); multi-user day one,
+  entity scoping, and op attribution stand
 - **Date:** 2026-10-15
 
 ## Context

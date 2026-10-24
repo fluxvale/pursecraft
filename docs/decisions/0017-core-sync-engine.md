@@ -1,6 +1,9 @@
 # 0017 — Core Sync Engine: Canonical Log, Sync Sessions, and the Op Wire Format
 
-- **Status:** Accepted
+- **Status:** Accepted — scope model generalized by
+  [ADR 0020](0020-organizations-own-budgets.md) (logs scope to orgs or
+  budgets; `BudgetState` renamed `ScopeState`; the theorem extends by case
+  analysis on scope)
 - **Date:** 2026-10-23
 - **Builds on:** [ADR 0007](0007-oplog-sync-protocol.md),
   [ADR 0009](0009-e2ee-opaque-payloads.md),

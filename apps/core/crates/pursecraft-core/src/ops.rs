@@ -1,9 +1,10 @@
-//! The op record and its application semantics (ADRs 0007, 0008, 0016).
+//! The op record and its application semantics (ADRs 0007, 0016, 0020).
 //!
 //! Core-side ops are typed; the wire form is opaque (ADR 0009) —
 //! `entity_kind`/`entity_id`/`field`/`value` live inside the encrypted
-//! payload, and only `op_id`, `budget_id`, `device_id`, `user_id`, and the
-//! HLC timestamp are server-visible metadata.
+//! payload, and only `op_id`, the `scope` (an org or a budget, ADR 0020),
+//! `device_id`, `user_id`, and the HLC timestamp are server-visible
+//! metadata.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -11,18 +12,19 @@ use std::hash::{Hash, Hasher};
 
 use crate::domain::{
     AccountField, BudgetField, CategoryField, CategoryGroupField, Entity, EntityKind, Field,
-    MonthCategoryField, PayeeField, TransactionField, Value,
+    MembershipField, MonthCategoryField, OrgField, PayeeField, TransactionField, Value,
 };
 use crate::hlc::Hlc;
 use crate::ids::{
-    AccountId, BudgetId, CategoryGroupId, CategoryId, DeviceId, EntityId, OpId, PayeeId, UserId,
+    AccountId, CategoryGroupId, CategoryId, DeviceId, EntityId, OpId, OrgId, PayeeId, ScopeId,
+    UserId,
 };
 
 /// One client write (ADR 0007).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Op {
     pub op_id: OpId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub device_id: DeviceId,
     pub user_id: UserId,
     pub entity_kind: EntityKind,
@@ -48,13 +50,14 @@ pub struct EntityRecord {
     pub stamps: BTreeMap<Field, WriteStamp>,
 }
 
-/// Budget state materialized from applied ops. A state is single-budget
-/// ([ADR 0008]): the first applied op fixes its budget, and ops scoped to
-/// any other budget are rejected — cross-budget resolution is structurally
-/// impossible (ADR 0016).
+/// State materialized from applied ops, scoped to exactly one log — an
+/// organization's or a budget's (ADR 0020): the first applied op fixes the
+/// scope, and ops of any other scope are rejected — cross-scope resolution
+/// is structurally impossible, for orgs exactly as for budgets before them
+/// (ADR 0016).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct BudgetState {
-    budget: Option<BudgetId>,
+pub struct ScopeState {
+    scope: Option<ScopeId>,
     entities: HashMap<EntityId, EntityRecord>,
     /// Every applied op's id with a content fingerprint: `op_id` must be
     /// 1:1 with op content (ADR 0017) — an id reused for different
@@ -63,7 +66,7 @@ pub struct BudgetState {
     seen_ops: HashMap<OpId, u64>,
 }
 
-/// How [`BudgetState::apply`] disposed of an op.
+/// How [`ScopeState::apply`] disposed of an op.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Applied {
     /// Written (or the entity's field set for the first time).
@@ -82,11 +85,19 @@ pub enum ApplyError {
     KindMismatch { kind: EntityKind, field: Field },
     /// The value type does not match the field.
     ValueMismatch { field: Field, value: Value },
-    /// Budget mismatch against this state's single budget ([ADR 0008]).
-    BudgetMismatch {
-        op_budget: BudgetId,
-        state_budget: BudgetId,
+    /// Scope mismatch against this state's single fixed scope (ADRs 0008,
+    /// 0020).
+    ScopeMismatch {
+        op_scope: ScopeId,
+        state_scope: ScopeId,
     },
+    /// The entity kind cannot exist in the op's scope kind (ADR 0020):
+    /// org entities (Organization, Membership, Budget) only in org scope,
+    /// budget-content entities only in budget scope.
+    ScopeKindMismatch { scope: ScopeId, kind: EntityKind },
+    /// An `Organization` op whose entity id is not its scope's org id —
+    /// one org log holds exactly one organization entity (ADR 0020).
+    OrganizationIdMismatch { entity_id: EntityId, scope: ScopeId },
     /// The `op_id` was already applied with different content — `op_id`
     /// must uniquely identify an op or replicas diverge silently, so the
     /// collision is loud (ADR 0017).
@@ -102,13 +113,20 @@ impl fmt::Display for ApplyError {
             Self::ValueMismatch { field, value } => {
                 write!(f, "value {value:?} does not fit field {field:?}")
             }
-            Self::BudgetMismatch {
-                op_budget,
-                state_budget,
-            } => {
+            Self::ScopeMismatch {
+                op_scope,
+                state_scope,
+            } => write!(
+                f,
+                "op scope {op_scope:?} does not belong to state scoped to {state_scope:?}"
+            ),
+            Self::ScopeKindMismatch { scope, kind } => {
+                write!(f, "{kind:?} entities cannot exist in scope {scope:?}")
+            }
+            Self::OrganizationIdMismatch { entity_id, scope } => {
                 write!(
                     f,
-                    "op budget {op_budget} does not belong to budget state {state_budget}"
+                    "organization entity {entity_id} does not match its scope {scope:?}"
                 )
             }
             Self::OpIdConflict { op_id } => {
@@ -120,7 +138,7 @@ impl fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
-impl BudgetState {
+impl ScopeState {
     pub fn new() -> Self {
         Self::default()
     }
@@ -149,13 +167,33 @@ impl BudgetState {
                 value: op.value,
             });
         }
-        // Single-budget state (ADR 0008): the first applied op fixes it.
-        if let Some(state_budget) = self.budget
-            && state_budget != op.budget_id
+        // Single-scope state (ADRs 0008, 0020): the first applied op fixes
+        // it.
+        if let Some(state_scope) = self.scope
+            && state_scope != op.scope
         {
-            return Err(ApplyError::BudgetMismatch {
-                op_budget: op.budget_id,
-                state_budget,
+            return Err(ApplyError::ScopeMismatch {
+                op_scope: op.scope,
+                state_scope,
+            });
+        }
+        // Kind-vs-scope validity (ADR 0020): an org entity in a budget log,
+        // or budget content in an org log, is loud corruption — never
+        // merged, never silently materialized.
+        if !kind_valid_in_scope(op.entity_kind, op.scope) {
+            return Err(ApplyError::ScopeKindMismatch {
+                scope: op.scope,
+                kind: op.entity_kind,
+            });
+        }
+        // One org log, one organization entity, its own id (ADR 0020): a
+        // stray org entity cannot masquerade as another personal org.
+        if op.entity_kind == EntityKind::Organization
+            && ScopeId::Org(OrgId::from_raw(op.entity_id.as_uuid())) != op.scope
+        {
+            return Err(ApplyError::OrganizationIdMismatch {
+                entity_id: op.entity_id,
+                scope: op.scope,
             });
         }
 
@@ -163,7 +201,7 @@ impl BudgetState {
             .entities
             .entry(op.entity_id)
             .or_insert_with(|| EntityRecord {
-                entity: Entity::shell(op.entity_kind, op.entity_id, op.budget_id),
+                entity: Entity::shell(op.entity_kind, op.entity_id, op.scope),
                 stamps: BTreeMap::new(),
             });
         if record.entity.kind() != op.entity_kind {
@@ -187,8 +225,8 @@ impl BudgetState {
             record.stamps.insert(op.field, incoming);
             Applied::Applied
         };
-        if self.budget.is_none() {
-            self.budget = Some(op.budget_id);
+        if self.scope.is_none() {
+            self.scope = Some(op.scope);
         }
         self.seen_ops.insert(op.op_id, fingerprint);
         Ok(outcome)
@@ -201,6 +239,12 @@ impl BudgetState {
     pub fn entities(&self) -> impl Iterator<Item = &Entity> {
         self.entities.values().map(|r| &r.entity)
     }
+
+    /// The scope this state is fixed to, once the first applied op fixes
+    /// it (ADR 0020).
+    pub fn scope_id(&self) -> Option<ScopeId> {
+        self.scope
+    }
 }
 
 /// A content fingerprint for one op (everything but the `op_id`, which is
@@ -210,7 +254,7 @@ impl BudgetState {
 fn op_fingerprint(op: &Op) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     let mut hasher = DefaultHasher::new();
-    op.budget_id.hash(&mut hasher);
+    op.scope.hash(&mut hasher);
     op.device_id.hash(&mut hasher);
     op.user_id.hash(&mut hasher);
     op.entity_kind.hash(&mut hasher);
@@ -225,6 +269,8 @@ fn op_fingerprint(op: &Op) -> u64 {
 fn field_valid_for(kind: EntityKind, field: Field) -> bool {
     match field {
         Field::Deleted => true,
+        Field::Organization(_) => kind == EntityKind::Organization,
+        Field::Membership(_) => kind == EntityKind::Membership,
         Field::Budget(_) => kind == EntityKind::Budget,
         Field::Account(_) => kind == EntityKind::Account,
         Field::CategoryGroup(_) => kind == EntityKind::CategoryGroup,
@@ -235,11 +281,35 @@ fn field_valid_for(kind: EntityKind, field: Field) -> bool {
     }
 }
 
+/// Whether `kind` exists in the scope kind (ADR 0020): org entities in
+/// org scope, budget-content entities in budget scope.
+pub(crate) fn kind_valid_in_scope(kind: EntityKind, scope: ScopeId) -> bool {
+    matches!(
+        (kind, scope),
+        (
+            EntityKind::Organization | EntityKind::Membership | EntityKind::Budget,
+            ScopeId::Org(_),
+        ) | (
+            EntityKind::Account
+                | EntityKind::CategoryGroup
+                | EntityKind::Category
+                | EntityKind::Payee
+                | EntityKind::Transaction
+                | EntityKind::MonthCategory,
+            ScopeId::Budget(_),
+        )
+    )
+}
+
 /// Whether `value`'s type fits `field` — checked before any mutation.
 fn value_matches_field(field: &Field, value: &Value) -> bool {
     matches!(
         (field, value),
         (Field::Deleted, Value::Bool(_))
+            | (Field::Organization(OrgField::Name), Value::Text(_))
+            | (Field::Organization(OrgField::PersonalFor), Value::User(_))
+            | (Field::Membership(MembershipField::UserId), Value::User(_))
+            | (Field::Membership(MembershipField::Role), Value::Role(_))
             | (Field::Budget(BudgetField::Name), Value::Text(_))
             | (Field::Account(AccountField::Name), Value::Text(_))
             | (Field::Account(AccountField::Kind), Value::AccountKind(_))
@@ -286,10 +356,24 @@ fn value_matches_field(field: &Field, value: &Value) -> bool {
 }
 
 /// Write `value` into `field`. Kind and value type are pre-validated by
-/// [`BudgetState::apply`]; the `expect`s below cannot fire through it.
+/// [`ScopeState::apply`]; the `expect`s below cannot fire through it.
 fn set_field(entity: &mut Entity, field: Field, value: Value) {
     let ok = "field/value agreement pre-validated in apply";
     match (entity, field) {
+        (Entity::Organization(e), Field::Deleted) => e.deleted = value.into_bool().expect(ok),
+        (Entity::Organization(e), Field::Organization(OrgField::Name)) => {
+            e.name = Some(value.into_text().expect(ok));
+        }
+        (Entity::Organization(e), Field::Organization(OrgField::PersonalFor)) => {
+            e.personal_for = Some(value.into_user().expect(ok));
+        }
+        (Entity::Membership(e), Field::Deleted) => e.deleted = value.into_bool().expect(ok),
+        (Entity::Membership(e), Field::Membership(MembershipField::UserId)) => {
+            e.user_id = Some(value.into_user().expect(ok));
+        }
+        (Entity::Membership(e), Field::Membership(MembershipField::Role)) => {
+            e.role = Some(value.into_role().expect(ok));
+        }
         (Entity::Budget(e), Field::Deleted) => e.deleted = value.into_bool().expect(ok),
         (Entity::Budget(e), Field::Budget(BudgetField::Name)) => {
             e.name = Some(value.into_text().expect(ok));
@@ -361,10 +445,15 @@ fn set_field(entity: &mut Entity, field: Field, value: Value) {
 mod tests {
     use super::*;
     use crate::date::{Date, Month};
-    use crate::domain::{AccountKind, Budget, CategoryGroup, Cleared, Payee, Transaction};
+    use crate::domain::{
+        AccountKind, Budget, CategoryGroup, Cleared, Membership, MembershipField,
+        MembershipRole as Role, OrgField, Organization, Payee, Transaction,
+    };
     use crate::money::Milliunits;
     use crate::testkit::v7;
     use uuid::Uuid;
+
+    use crate::ids::BudgetId;
 
     const TXN_RAND: u64 = 77;
     const MS_BASE: u64 = 1 << 40;
@@ -374,7 +463,7 @@ mod tests {
     fn txn_op(rand: u64, ms: u64, logical: u32, field: Field, value: Value) -> Op {
         Op {
             op_id: OpId::new(v7(ms, rand)).unwrap(),
-            budget_id: BudgetId::new(v7(1, 1)).unwrap(),
+            scope: ScopeId::Budget(BudgetId::new(v7(1, 1)).unwrap()),
             device_id: DeviceId::new(Uuid::nil()).unwrap(),
             user_id: UserId::new(Uuid::nil()).unwrap(),
             entity_kind: EntityKind::Transaction,
@@ -395,7 +484,7 @@ mod tests {
         )
     }
 
-    fn txn_entity(state: &BudgetState) -> Transaction {
+    fn txn_entity(state: &ScopeState) -> Transaction {
         match state.entity(&EntityId::new(v7(MS_BASE, TXN_RAND)).unwrap()) {
             Some(Entity::Transaction(t)) => t.clone(),
             other => panic!("expected transaction, got {other:?}"),
@@ -404,7 +493,7 @@ mod tests {
 
     #[test]
     fn first_op_materializes_a_shell_entity() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let (field, value) = amount_field(-4_500);
         assert_eq!(
             state.apply(txn_op(1, 10, 0, field, value)),
@@ -418,7 +507,7 @@ mod tests {
 
     #[test]
     fn replayed_op_id_is_a_duplicate_no_op() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let (field, value) = amount_field(1_000);
         let first = txn_op(5, 10, 0, field, value);
         state.apply(first.clone()).unwrap();
@@ -429,7 +518,7 @@ mod tests {
 
     #[test]
     fn reused_op_id_with_different_content_is_loud() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let (field, _) = amount_field(1_000);
         let first = txn_op(5, 10, 0, field, amount_field(1_000).1);
         state.apply(first.clone()).unwrap();
@@ -472,7 +561,7 @@ mod tests {
             vec![older.clone(), newer.clone()],
             vec![newer.clone(), older.clone()],
         ] {
-            let mut state = BudgetState::new();
+            let mut state = ScopeState::new();
             for op in order {
                 state.apply(op).unwrap();
             }
@@ -507,7 +596,7 @@ mod tests {
             vec![small.clone(), big.clone()],
             vec![big.clone(), small.clone()],
         ] {
-            let mut state = BudgetState::new();
+            let mut state = ScopeState::new();
             for op in order {
                 state.apply(op).unwrap();
             }
@@ -521,7 +610,7 @@ mod tests {
 
     #[test]
     fn older_stamp_after_newer_is_stale() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let (field, _) = amount_field(0);
         let newer = txn_op(
             2,
@@ -557,7 +646,7 @@ mod tests {
 
     #[test]
     fn fields_are_independent_lww_registers() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let (field, value) = amount_field(5_000);
         state.apply(txn_op(1, 50, 0, field, value)).unwrap();
         // A lower-stamped write to a *different* field still applies...
@@ -586,7 +675,7 @@ mod tests {
 
     #[test]
     fn tombstone_is_just_a_field() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let (field, value) = amount_field(1);
         state.apply(txn_op(1, 10, 0, field, value)).unwrap();
         state
@@ -602,8 +691,7 @@ mod tests {
 
     #[test]
     fn every_entity_kind_round_trips_field_writes() {
-        let mut state = BudgetState::new();
-        let budget = EntityId::new(v7(MS_BASE, 11)).unwrap();
+        let mut state = ScopeState::new();
         let account = EntityId::new(v7(MS_BASE, 12)).unwrap();
         let group = EntityId::new(v7(MS_BASE, 13)).unwrap();
         let category = EntityId::new(v7(MS_BASE, 14)).unwrap();
@@ -611,13 +699,9 @@ mod tests {
         let txn = EntityId::new(v7(MS_BASE, 16)).unwrap();
         let cell = EntityId::new(v7(MS_BASE, 17)).unwrap();
 
+        // Budget scope holds the six content entities; the Budget entity
+        // itself lives in org scope (ADR 0020).
         let cases: Vec<(EntityKind, EntityId, Field, Value)> = vec![
-            (
-                EntityKind::Budget,
-                budget,
-                Field::Budget(BudgetField::Name),
-                Value::Text("Home".into()),
-            ),
             (
                 EntityKind::Account,
                 account,
@@ -664,7 +748,7 @@ mod tests {
         for (i, (kind, entity_id, field, value)) in cases.into_iter().enumerate() {
             let op = Op {
                 op_id: OpId::new(v7(10 + i as u64, 30 + i as u64)).unwrap(),
-                budget_id: BudgetId::new(v7(1, 1)).unwrap(),
+                scope: ScopeId::Budget(BudgetId::new(v7(1, 1)).unwrap()),
                 device_id: DeviceId::new(Uuid::nil()).unwrap(),
                 user_id: UserId::new(Uuid::nil()).unwrap(),
                 entity_kind: kind,
@@ -681,7 +765,7 @@ mod tests {
 
         assert_eq!(
             state.entities().count(),
-            7,
+            6,
             "account writes share one entity"
         );
         match state.entity(&account) {
@@ -690,10 +774,6 @@ mod tests {
                 assert_eq!(a.kind, Some(AccountKind::Cash));
             }
             other => panic!("expected account, got {other:?}"),
-        }
-        match state.entity(&budget) {
-            Some(Entity::Budget(Budget { name, .. })) => assert_eq!(name.as_deref(), Some("Home")),
-            other => panic!("expected budget, got {other:?}"),
         }
         match state.entity(&group) {
             Some(Entity::CategoryGroup(CategoryGroup { name, .. })) => {
@@ -707,9 +787,91 @@ mod tests {
         }
     }
 
+    /// One op per org-scope entity field (ADR 0020), into one org log.
+    #[test]
+    fn org_scope_entities_round_trip_field_writes() {
+        let org = OrgId::new(v7(MS_BASE, 1)).unwrap();
+        let scope = ScopeId::Org(org);
+        let membership = EntityId::new(v7(MS_BASE, 2)).unwrap();
+        let budget = EntityId::new(v7(MS_BASE, 3)).unwrap();
+        let terence = UserId::new(Uuid::nil()).unwrap();
+        let cases: Vec<(EntityKind, EntityId, Field, Value)> = vec![
+            (
+                EntityKind::Organization,
+                EntityId::from_raw(org.as_uuid()),
+                Field::Organization(OrgField::Name),
+                Value::Text("Terence's org".into()),
+            ),
+            (
+                EntityKind::Organization,
+                EntityId::from_raw(org.as_uuid()),
+                Field::Organization(OrgField::PersonalFor),
+                Value::User(terence),
+            ),
+            (
+                EntityKind::Membership,
+                membership,
+                Field::Membership(MembershipField::UserId),
+                Value::User(terence),
+            ),
+            (
+                EntityKind::Membership,
+                membership,
+                Field::Membership(MembershipField::Role),
+                Value::Role(Role::Owner),
+            ),
+            (
+                EntityKind::Budget,
+                budget,
+                Field::Budget(BudgetField::Name),
+                Value::Text("Home".into()),
+            ),
+        ];
+        let mut state = ScopeState::new();
+        for (i, (kind, entity_id, field, value)) in cases.into_iter().enumerate() {
+            let op = Op {
+                op_id: OpId::new(v7(20 + i as u64, 40 + i as u64)).unwrap(),
+                scope,
+                device_id: DeviceId::new(Uuid::nil()).unwrap(),
+                user_id: terence,
+                entity_kind: kind,
+                entity_id,
+                field,
+                value,
+                hlc: Hlc {
+                    physical_ms: 20 + i as u64,
+                    logical: 0,
+                },
+            };
+            assert_eq!(state.apply(op), Ok(Applied::Applied));
+        }
+        assert_eq!(state.entities().count(), 3, "org + membership + budget");
+        assert_eq!(state.scope_id(), Some(scope));
+        match state.entity(&EntityId::from_raw(org.as_uuid())) {
+            Some(Entity::Organization(Organization {
+                name, personal_for, ..
+            })) => {
+                assert_eq!(name.as_deref(), Some("Terence's org"));
+                assert_eq!(*personal_for, Some(terence));
+            }
+            other => panic!("expected organization, got {other:?}"),
+        }
+        match state.entity(&membership) {
+            Some(Entity::Membership(Membership { user_id, role, .. })) => {
+                assert_eq!(*user_id, Some(terence));
+                assert_eq!(*role, Some(Role::Owner));
+            }
+            other => panic!("expected membership, got {other:?}"),
+        }
+        match state.entity(&budget) {
+            Some(Entity::Budget(Budget { name, .. })) => assert_eq!(name.as_deref(), Some("Home")),
+            other => panic!("expected budget, got {other:?}"),
+        }
+    }
+
     #[test]
     fn field_for_wrong_kind_is_rejected_without_materializing() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let bad = txn_op(
             1,
             10,
@@ -733,12 +895,12 @@ mod tests {
 
     #[test]
     fn kind_lie_against_existing_entity_is_rejected() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let (field, value) = amount_field(1);
         state.apply(txn_op(1, 10, 0, field, value)).unwrap();
         let lie = Op {
             op_id: OpId::new(v7(20, 2)).unwrap(),
-            budget_id: BudgetId::new(v7(1, 1)).unwrap(),
+            scope: ScopeId::Budget(BudgetId::new(v7(1, 1)).unwrap()),
             device_id: DeviceId::new(Uuid::nil()).unwrap(),
             user_id: UserId::new(Uuid::nil()).unwrap(),
             entity_kind: EntityKind::Payee,
@@ -758,7 +920,7 @@ mod tests {
 
     #[test]
     fn value_type_mismatch_is_rejected_without_state_change() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let (field, value) = amount_field(7);
         state.apply(txn_op(1, 10, 0, field, value)).unwrap();
         let before = state.clone();
@@ -772,29 +934,37 @@ mod tests {
     }
 
     #[test]
-    fn foreign_budget_is_rejected() {
-        let mut state = BudgetState::new();
+    fn foreign_scope_is_rejected() {
+        let mut state = ScopeState::new();
         let (field, value) = amount_field(1);
         state.apply(txn_op(1, 10, 0, field, value.clone())).unwrap();
         let mut foreign = txn_op(2, 20, 0, field, value);
-        foreign.budget_id = BudgetId::new(v7(9, 9)).unwrap();
+        foreign.scope = ScopeId::Budget(BudgetId::new(v7(9, 9)).unwrap());
         assert!(matches!(
             state.apply(foreign),
-            Err(ApplyError::BudgetMismatch { .. })
+            Err(ApplyError::ScopeMismatch { .. })
+        ));
+        // An org-scoped op is equally foreign to a budget-scoped state —
+        // orgs cannot leak into budget logs (ADR 0020).
+        let mut org_op = txn_op(3, 30, 0, amount_field(0).0, amount_field(0).1);
+        org_op.scope = ScopeId::Org(OrgId::new(v7(9, 9)).unwrap());
+        assert!(matches!(
+            state.apply(org_op),
+            Err(ApplyError::ScopeMismatch { .. })
         ));
     }
 
     #[test]
-    fn state_is_single_budget() {
-        let mut state = BudgetState::new();
+    fn state_is_single_scope() {
+        let mut state = ScopeState::new();
         let (field, value) = amount_field(1);
         assert_eq!(
             state.apply(txn_op(1, 10, 0, field, value)),
             Ok(Applied::Applied)
         );
-        // A fresh-id op for another budget is rejected too — a BudgetState
-        // is one budget (ADR 0008), so resolution can never leak across
-        // budgets via fallback categories or accounts.
+        // A fresh-id op for another budget is rejected too — a ScopeState
+        // is one scope (ADRs 0008, 0020), so resolution can never leak
+        // across scopes via fallback categories or accounts.
         let mut foreign = txn_op(
             2,
             20,
@@ -803,16 +973,104 @@ mod tests {
             Value::Text("x".into()),
         );
         foreign.entity_id = EntityId::new(v7(MS_BASE, 999)).unwrap();
-        foreign.budget_id = BudgetId::new(v7(9, 9)).unwrap();
+        foreign.scope = ScopeId::Budget(BudgetId::new(v7(9, 9)).unwrap());
         assert!(matches!(
             state.apply(foreign),
-            Err(ApplyError::BudgetMismatch { .. })
+            Err(ApplyError::ScopeMismatch { .. })
         ));
         assert_eq!(
             state.entities().count(),
             1,
-            "a foreign-budget op must not materialize anything"
+            "a foreign-scope op must not materialize anything"
         );
+    }
+
+    /// Kind-vs-scope validity (ADR 0020): org entities cannot be written
+    /// into a budget log, budget-content entities cannot be written into
+    /// an org log, and an org log holds exactly one organization entity —
+    /// its own.
+    #[test]
+    fn entity_kinds_outside_their_scope_are_rejected_loudly() {
+        let mut budget_state = ScopeState::new();
+        let (field, value) = amount_field(1);
+        budget_state.apply(txn_op(1, 10, 0, field, value)).unwrap();
+        let mut org_entity = txn_op(2, 20, 0, Field::Deleted, Value::Bool(true));
+        org_entity.entity_kind = EntityKind::Membership;
+        org_entity.entity_id = EntityId::new(v7(MS_BASE, 88)).unwrap();
+        org_entity.field = Field::Membership(MembershipField::Role);
+        org_entity.value = Value::Role(Role::Viewer);
+        assert!(matches!(
+            budget_state.apply(org_entity),
+            Err(ApplyError::ScopeKindMismatch { .. })
+        ));
+
+        let org = OrgId::new(v7(MS_BASE, 5)).unwrap();
+        let scope = ScopeId::Org(org);
+        let mut org_state = ScopeState::new();
+        let mut content = Op {
+            op_id: OpId::new(v7(30, 3)).unwrap(),
+            scope,
+            device_id: DeviceId::new(Uuid::nil()).unwrap(),
+            user_id: UserId::new(Uuid::nil()).unwrap(),
+            entity_kind: EntityKind::Transaction,
+            entity_id: EntityId::new(v7(MS_BASE, 99)).unwrap(),
+            field: Field::Transaction(TransactionField::Memo),
+            value: Value::Text("x".into()),
+            hlc: Hlc {
+                physical_ms: 30,
+                logical: 0,
+            },
+        };
+        assert!(matches!(
+            org_state.apply(content.clone()),
+            Err(ApplyError::ScopeKindMismatch { .. })
+        ));
+        assert_eq!(
+            org_state.entities().count(),
+            0,
+            "a rejected op must not materialize anything"
+        );
+
+        // The organization entity's id must equal the scope's org id.
+        content.entity_kind = EntityKind::Organization;
+        content.entity_id = EntityId::new(v7(MS_BASE, 77)).unwrap(); // not the org id
+        content.field = Field::Organization(OrgField::Name);
+        content.value = Value::Text("imposter".into());
+        assert!(matches!(
+            org_state.apply(content),
+            Err(ApplyError::OrganizationIdMismatch { .. })
+        ));
+        assert_eq!(org_state.entities().count(), 0);
+
+        // A second org's op is foreign to this org's state, exactly as a
+        // second budget is to a budget state.
+        let foreign_org = Op {
+            op_id: OpId::new(v7(40, 4)).unwrap(),
+            scope: ScopeId::Org(OrgId::new(v7(MS_BASE, 6)).unwrap()),
+            device_id: DeviceId::new(Uuid::nil()).unwrap(),
+            user_id: UserId::new(Uuid::nil()).unwrap(),
+            entity_kind: EntityKind::Organization,
+            entity_id: EntityId::from_raw(OrgId::new(v7(MS_BASE, 6)).unwrap().as_uuid()),
+            field: Field::Organization(OrgField::Name),
+            value: Value::Text("other".into()),
+            hlc: Hlc {
+                physical_ms: 40,
+                logical: 0,
+            },
+        };
+        let mut own_org = foreign_org.clone();
+        own_org.scope = scope;
+        own_org.entity_id = EntityId::from_raw(org.as_uuid());
+        own_org.op_id = OpId::new(v7(41, 5)).unwrap();
+        assert_eq!(
+            org_state.apply(own_org),
+            Ok(Applied::Applied),
+            "the org's own entity applies"
+        );
+        assert!(matches!(
+            org_state.apply(foreign_org),
+            Err(ApplyError::ScopeMismatch { .. })
+        ));
     }
 
     #[test]
@@ -843,7 +1101,7 @@ mod tests {
             vec![old_hlc_big_id.clone(), new_hlc_small_id.clone()],
             vec![new_hlc_small_id.clone(), old_hlc_big_id.clone()],
         ] {
-            let mut state = BudgetState::new();
+            let mut state = ScopeState::new();
             for op in order {
                 state.apply(op).unwrap();
             }
@@ -857,7 +1115,7 @@ mod tests {
 
     #[test]
     fn full_transaction_and_month_cell_lifecycle() {
-        let mut state = BudgetState::new();
+        let mut state = ScopeState::new();
         let account_id = AccountId::new(v7(MS_BASE, 51)).unwrap();
         let category_id = CategoryId::new(v7(MS_BASE, 52)).unwrap();
         let fields = [

@@ -1,4 +1,4 @@
-//! UUID id newtypes (ADRs 0007, 0008).
+//! UUID id newtypes (ADRs 0007, 0008, 0020) and the typed log scope.
 //!
 //! Entity and op ids are UUIDv7: time-ordered, so lexicographic order is
 //! creation order within clock skew (relied on by referential resolution,
@@ -98,6 +98,7 @@ macro_rules! id_newtype {
 id_newtype!(EntityId, v7);
 id_newtype!(OpId, v7);
 id_newtype!(BudgetId, v7);
+id_newtype!(OrgId, v7);
 id_newtype!(AccountId, v7);
 id_newtype!(CategoryGroupId, v7);
 id_newtype!(CategoryId, v7);
@@ -106,6 +107,27 @@ id_newtype!(TransactionId, v7);
 id_newtype!(MonthCategoryId, v7);
 id_newtype!(DeviceId, any_version);
 id_newtype!(UserId, any_version);
+
+/// Which log an op belongs to (ADR 0020): an organization's or a budget's.
+/// Wire form is externally tagged (`{"Org": "…"} / {"Budget": "…"}`) — the
+/// scope is metadata the server routes on, so its kind must be legible
+/// without touching the encrypted payload.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum ScopeId {
+    Org(OrgId),
+    Budget(BudgetId),
+}
+
+impl ScopeId {
+    /// The org this scope belongs to: the org itself for org scope, `None`
+    /// for budget scope (a budget log does not name its org — ADR 0020).
+    pub fn org(self) -> Option<OrgId> {
+        match self {
+            Self::Org(org) => Some(org),
+            Self::Budget(_) => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -133,6 +155,31 @@ mod tests {
         assert!(DeviceId::new(Uuid::nil()).is_ok());
         assert!(UserId::new(Uuid::max()).is_ok());
         assert!(DeviceId::new(v7(5, 5)).is_ok());
+    }
+
+    #[test]
+    fn org_ids_are_v7_and_the_scope_wire_form_is_tagged() {
+        assert!(OrgId::new(v7(3, 4)).is_ok());
+        assert_eq!(OrgId::new(Uuid::nil()), Err(IdVersionError));
+        let org = ScopeId::Org(OrgId::new(v7(3, 4)).unwrap());
+        let budget = ScopeId::Budget(BudgetId::new(v7(5, 6)).unwrap());
+        for (scope, wire) in [(org, r#"{"Org":"0…"}"#), (budget, r#"{"Budget":"0…"}"#)] {
+            let encoded = serde_json::to_string(&scope).unwrap();
+            let decoded: ScopeId = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, scope, "round trip for {wire:?}");
+        }
+        assert!(
+            serde_json::to_string(&org)
+                .unwrap()
+                .starts_with(r#"{"Org":"#)
+        );
+        assert!(
+            serde_json::to_string(&budget)
+                .unwrap()
+                .starts_with(r#"{"Budget":"#)
+        );
+        assert_eq!(org.org(), Some(OrgId::new(v7(3, 4)).unwrap()));
+        assert_eq!(budget.org(), None);
     }
 
     #[test]
