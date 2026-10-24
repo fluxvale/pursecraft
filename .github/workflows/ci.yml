@@ -88,7 +88,8 @@ jobs:
               - "mise.toml" # cargo-machete version
               - ".github/workflows/ci.yml"
             typos:
-              # any file can hold a typo — docs, ADRs, configs included
+              # any file can hold a typo — typos.toml makes the action walk
+              # hidden paths (.github/, dotfiles) too, so "**" is literal
               - "**"
 
   core:
@@ -235,7 +236,9 @@ jobs:
           deny="$(sed -n 's|^"ubi:EmbarkStudios/cargo-deny" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
           rust="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
           echo "deny=$deny rust=$rust"
-          test -n "$deny" && test -n "$rust"
+          # separate tests: `a && b` does not fail the step when a is empty
+          test -n "$deny"
+          test -n "$rust"
           echo "deny=$deny" >>"$GITHUB_OUTPUT"
           echo "rust=$rust" >>"$GITHUB_OUTPUT"
 
@@ -264,16 +267,26 @@ jobs:
 
       # mise.toml is the single source of truth for tool versions; parse
       # (not install) so CI and local dev can't drift (ADR 0014).
-      - name: Read cargo-machete version from mise.toml
+      - name: Read tool versions from mise.toml
         id: versions
         run: |
           machete="$(sed -n 's|^"ubi:bnjbvr/cargo-machete" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
-          echo "machete=$machete"
+          rust="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
+          echo "machete=$machete rust=$rust"
+          # separate tests: `a && b` does not fail the step when a is empty
           test -n "$machete"
+          test -n "$rust"
           echo "machete=$machete" >>"$GITHUB_OUTPUT"
+          echo "rust=$rust" >>"$GITHUB_OUTPUT"
 
-      # standalone binary: parses Cargo.tomls and sources, no toolchain needed.
-      # Pinned to commit — mutable tags execute unreviewed code.
+      # cargo-machete --with-metadata resolves target/build deps, which needs
+      # cargo — a missing toolchain would degrade the check to silent green.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.versions.outputs.rust }}
+
+      # install-action pinned to commit — mutable tags execute unreviewed code
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-machete@${{ steps.versions.outputs.machete }}
@@ -301,8 +314,8 @@ jobs:
   # string; (c) add the job; (d) add that job to wait-for-ci.needs below.
   # New top-level files (a future Dockerfile, compose.yaml) match no cargo
   # filter today — add them to every relevant filter when they land, or their
-  # changes run nothing; the typos job filters on "**" precisely so no file
-  # class escapes every check.
+  # changes run nothing; the typos job filters on "**" (and walks hidden
+  # paths via typos.toml) precisely so no file class escapes every check.
   #
   # The umbrella: branch protection requires THIS check. Runs regardless of
   # path gating; passes when every gated job succeeded or was skipped.

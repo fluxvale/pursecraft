@@ -4,5 +4,6 @@ rust = "1.99.1"
 # truth — CI parses these versions instead of installing its own.
 "ubi:EmbarkStudios/cargo-deny" = "0.20.2"
 "ubi:bnjbvr/cargo-machete" = "0.9.2"
-# Local parity with the pinned crate-ci/typos action (CI job "Typos").
+# Local runner for the same checks the CI "Typos" job enforces; the CI pin is
+# the crate-ci/typos action SHA (both read typos.toml).
 typos = "1.51.1"
