@@ -19,7 +19,9 @@ Two parts:
 
 1. **Day-one discipline:** the sync protocol treats all op payloads and
    snapshots as opaque. The server only ever sees metadata: `op_id`, `device_id`,
-   `user_id`, `budget_id`, HLC timestamp, sequence numbers. All serialization
+   `user_id`, `budget_id` *(amended by [ADR 0020](0020-organizations-own-budgets.md):
+   the metadata field is now the typed `scope` — an org or a budget — replacing
+   `budget_id`)*, HLC timestamp, sequence numbers. All serialization
    routes through a single point in the core so encryption is a layer, not a
    rewrite. Conflict resolution already lives in the client core, so the server
    never needs plaintext.

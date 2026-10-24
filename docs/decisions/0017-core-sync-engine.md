@@ -27,14 +27,17 @@ server:
 
 - `append(op) -> seq`: sequences are dense, 1-based, and append order is the
   canonical order per budget (ADR 0007). The first append fixes the budget;
-  foreign-budget appends are rejected, mirroring `BudgetState`.
+  foreign-budget appends are rejected, mirroring `BudgetState` *(amended by
+  [ADR 0020](0020-organizations-own-budgets.md): a log fixes a typed
+  `ScopeId` — an org or a budget — and `BudgetState` is now `ScopeState`).*
 - The log touches only server-visible metadata. Dedupe is by `op_id`
   alone: re-appending an op whose id is already stored returns the
   original sequence — safe retries ([ADR 0007]) — and this must hold
   under [ADR 0009] encryption, where a re-encrypted retry carries
   different payload bytes. The log therefore never compares content.
 - `op_id` is 1:1 with op content, and the loud check for a violation
-  lives in [`BudgetState::apply`] — where plaintext always exists, on
+  lives in [`BudgetState::apply`] — *(renamed `ScopeState::apply`, ADR
+  0020)* — where plaintext always exists, on
   every replica. The state fingerprints every applied op by `op_id`;
   replaying identical content is a no-op, while reusing an id for
   different content is an `OpIdConflict` error, because replicas fed the
@@ -45,7 +48,8 @@ server:
 
 ### Client model: `SyncSession`
 
-A session is one device's `BudgetState` plus its `Hlc` clock plus a
+A session is one device's `BudgetState` *(renamed `ScopeState`, ADR
+  [0020](0020-organizations-own-budgets.md))* plus its `Hlc` clock plus a
 `last_seen` cursor (0 = nothing seen). `apply_delta(ops)` processes ops in
 any order:
 
@@ -68,7 +72,8 @@ any order:
   the engine never advances past an op it could not apply.
 
 Local capture — minting ops and applying them immediately — is not part of
-the session; the capture slice composes `BudgetState::apply` with this
+the session; the capture slice composes `BudgetState::apply` *(renamed
+  `ScopeState::apply`, ADR 0020)* with this
 clock. Nothing here pre-empts that.
 
 ### Wire format
@@ -76,7 +81,9 @@ clock. Nothing here pre-empts that.
 The op record serializes as two parts, matching what the server may ever
 see (ADR 0009):
 
-- `OpMeta { op_id, budget_id, device_id, user_id, hlc }` — server-visible;
+- `OpMeta { op_id, budget_id, device_id, user_id, hlc }` — server-visible
+  *(amended by [ADR 0020](0020-organizations-own-budgets.md):
+  `budget_id` → `scope: ScopeId`)*;
 - `OpPayload { entity_kind, entity_id, field, value }` — opaque to the
   server, encrypted in a later slice.
 
@@ -123,7 +130,9 @@ the versioned protocol freeze the transport slice brings (ADR 0012).
 
 ### Convergence: statement and proof method
 
-**Statement:** after a set of ops S has been applied, `BudgetState` is a
+**Statement:** after a set of ops S has been applied, `BudgetState`
+  *(renamed `ScopeState`, ADR [0020](0020-organizations-own-budgets.md);
+  the theorem extends to org logs by case analysis on scope)* is a
 function of S alone. Dedupe collapses duplicates; per-field LWW by the total
 order `(hlc, op_id)` picks the maximum stamp per field independent of
 arrival order; equal-HLC ties break by `op_id`, identically on every replica

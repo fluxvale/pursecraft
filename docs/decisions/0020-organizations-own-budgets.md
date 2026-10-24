@@ -51,9 +51,11 @@ The core enforces two structural rules at apply time, both loud:
 - **Kind-vs-scope validity**: `Organization`, `Membership`, and `Budget`
   entities exist only in org scope; the six budget-content entities only in
   budget scope. A mismatch is loud corruption, never merged. Additionally,
-  an `Organization` op's entity id must equal its scope's org id — there is
-  exactly one organization entity per org log, so a stray org entity cannot
-  masquerade (e.g. as a second personal org).
+  the org's entity slot is reserved: an op touching the scope org's uuid
+  must be the `Organization` entity, and an `Organization` op's entity id
+  must be that org id — exactly one organization entity per org log, and
+  nothing else can squat its slot (a squatter would blind the org
+  permanently).
 
 ### Entity set (org scope)
 
@@ -87,15 +89,18 @@ entities — it no longer self-describes. Consequences, all deliberate:
 
 ### Membership and role resolution (pure projections)
 
-- `membership_role(org_state, user)`: the **earliest-created surviving**
-  membership naming the user — minimum UUIDv7, ADR 0016's fallback-category
-  convention. A user appears at most once per org in well-formed data
-  (capture reuses the existing membership entity); a racing twin resolves
-  deterministically everywhere. Tombstoned memberships confer nothing.
+- `membership_role(org_state, user)`: the **earliest-created surviving
+  role-bearing** membership naming the user — minimum UUIDv7, ADR 0016's
+  fallback-category convention; a torn, role-less write shadows nothing. A
+  user appears at most once per org in well-formed data (capture reuses the
+  existing membership entity); a racing twin resolves deterministically
+  everywhere. Tombstoned memberships confer nothing.
 - `budget_access(org_state, user, budget)`: the user's role iff the budget
-  is visible (entity alive, org alive) and a surviving membership exists.
-  Roles are **data** this slice — enforcing them (who may append what) is
-  the auth slice's job, server- and capture-side.
+  is visible (entity alive, org alive, and the budget's stored scope IS
+  this org — cross-org composition cannot smuggle a foreign org's budget
+  past the projection) and a surviving membership exists. Roles are
+  **data** this slice — enforcing them (who may append what) is the auth
+  slice's job, server- and capture-side.
 - **Per-budget role overrides are rejected.** The requirement is different
   roles across budgets of *different orgs*, which different memberships
   already deliver; overrides would recreate the superseded ADR 0008 shape
@@ -113,14 +118,22 @@ FluxVale pattern — one transaction, idempotent — translates to oplog data:
 
 - **Provisioning op-set** (`provision_personal_org`): the ops that write
   the `Organization` entity (`name`, `personal_for = user`) and the owner
-  `Membership`. Idempotent by construction: a retried op-set dedupes on
-  `op_id` (ADR 0007), and a re-provisioned one reusing the entity ids
-  rewrites identical values under LWW. The caller owns id minting
-  (ADR 0016 keeps capture deferred).
+  `Membership` — **probe-first**: an op is emitted only where the current
+  state holds no value for its field. That is the FluxVale probe
+  transferred to oplog data, and it is what makes retrying safe: a
+  crash-retry mints fresh op ids AND a fresh stamp, and under plain LWW
+  that retry would revert a user's rename or re-escalate a self-demotion —
+  the probe instead emits nothing for fields already written, so user
+  edits survive every retry and a partially-applied first attempt is
+  completed, never redone. The caller owns id minting (ADR 0016 keeps
+  capture deferred).
 - **Invariant as data:** `live_personal_orgs(org_states, user)` returns the
-  live orgs claiming `personal_for = user`; a user's state satisfies the
-  invariant iff exactly one exists. The checker is pure and multi-state —
-  a user's orgs live in several org logs, which never mix.
+  live orgs claiming `personal_for = user` (deduplicated — repeated input
+  states are legal); a user's state satisfies the clause iff exactly one
+  exists. The second clause is `owner_membership_intact(org_state, user)`,
+  false when the creator's membership in their own org was removed. The
+  checkers are pure and multi-state — a user's orgs live in several org
+  logs, which never mix.
 - **Policy:** a personal org is **not deletable**, and its owner membership
   is **not removable** — a user always has a home. Enforcement lives at
   capture (the later capture slice refuses to mint such ops) and at the

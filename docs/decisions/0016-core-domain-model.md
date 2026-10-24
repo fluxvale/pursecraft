@@ -23,7 +23,10 @@ the sync engine, transport, and storage are later slices.
 ### Entity set
 
 Seven entities. Every entity carries the same envelope: a **UUIDv7 id**, the
-**`budget_id`** scope ([ADR 0008](0008-multiuser-day-one.md)), and a
+**`budget_id`** scope ([ADR 0008](0008-multiuser-day-one.md)) — *(amended by
+[ADR 0020](0020-organizations-own-budgets.md): the envelope field is the typed
+`scope` (an org or a budget); the entity set grows `Organization` and
+`Membership`, and `Budget` moves to org scope)* — and a
 **`deleted` tombstone flag** — modeled as an ordinary bool *field*, so deletes
 ride the same per-field LWW path as any other write.
 
@@ -61,19 +64,25 @@ Op { op_id, budget_id, device_id, user_id,
      entity_kind, entity_id, field, value, hlc }
 ```
 
+*(Amended by [ADR 0020](0020-organizations-own-budgets.md): the field is
+`scope: ScopeId` — `Org(OrgId)` or `Budget(BudgetId)`.)*
+
 `field` is a nested enum — `Field::Deleted` shared by every entity, plus one
 variant per entity wrapping that entity's field enum — so `match` is
 exhaustive and adding a field is compiler-guided. `value` is a closed
 `Value` enum (bool, text, milliunits, id, date, month, account-kind,
 cleared). The server-visible form is metadata only (`op_id`, `device_id`,
-`user_id`, `budget_id`, HLC, sequence): `entity_kind`/`entity_id`/`field`/
+`user_id`, `budget_id` *(→ `scope`, ADR 0020)*, HLC, sequence):
+`entity_kind`/`entity_id`/`field`/
 `value` live inside the encrypted payload. Serialization itself is deferred;
 `Value` is the single choke point it will route through.
 
 ### Application semantics
 
 - **Idempotence:** ops are deduplicated by `op_id`; a replayed op is a no-op.
-- **Single-budget state:** a `BudgetState` is scoped to one budget — the
+- **Single-budget state:** a `BudgetState` *(renamed `ScopeState` by
+  [ADR 0020](0020-organizations-own-budgets.md), which generalizes the
+  fixed scope to an org or a budget)* is scoped to one budget — the
   first applied op fixes it, and ops for any other budget are rejected
   loudly (the core-side mirror of [ADR 0008]'s server scoping, making
   cross-budget resolution leaks structurally impossible).
