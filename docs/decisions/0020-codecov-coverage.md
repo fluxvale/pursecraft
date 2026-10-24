@@ -43,9 +43,11 @@ repo (upload riding the platform CI job, per-flag statuses, a root
   when they get code), a per-flag project status with a 1% threshold and a
   per-flag patch status with `target: auto`, and `carryforward: false` so a
   flag reports only when its path-gated job ran — the same shape as the
-  workflow itself. Reliability hierarchy, deliberate: the patch status is
-  the always-armed gate; the project status is best-effort (it needs
-  base-commit data for the flag — see Consequences).
+  workflow itself. Reliability hierarchy, deliberate: neither status can
+  red until the merge-base carries a report — the gate arms when the
+  push-to-main run uploads (first landing with this change's merge). From
+  then on the patch status is the primary gate, and the project status is
+  best-effort — it needs the flag's base-commit data (see Consequences).
 
 ## Alternatives considered
 
@@ -72,11 +74,18 @@ repo (upload riding the platform CI job, per-flag statuses, a root
   with `carryforward: false` and path-gated uploads, a base commit that
   skipped the job leaves nothing to compare against (observed on
   fluxvale/fluxvale, whose identical shape posts only
-  `codecov/patch/<flag>`). The patch status is the always-armed gate — a
-  coverage drop reds there.
-- Until base data exists on main (and on any later main stretch that skipped
-  the core job), pure deletions — removing tests or code, adding no new
-  lines — pass the patch gate vacuously and gate nothing; the project
-  status covers exactly those, and only where its base data exists.
+  `codecov/patch/<flag>`).
+- Neither status can red before main carries a report: a pre-merge PR sits
+  on a merge-base with no upload, so codecov posts the patch status as
+  passing with "No report found to compare against" and does not post the
+  project status at all (both observed on this change's own mutation
+  proof). The gate arms when the push-to-main run uploads — from the
+  first merge on, a coverage drop reds the patch status, and the project
+  status wherever the flag's base data exists.
+- With `carryforward: false` and path-gated uploads, any later main
+  stretch that skipped the core job re-creates the unarmed window: there
+  the project status cannot post, and pure deletions — removing tests or
+  code, adding no new lines — pass the patch gate vacuously and gate
+  nothing.
 - Doctests are not instrumented (stable-toolchain limitation) — the report
   measures the binaries cargo-llvm-cov runs.
