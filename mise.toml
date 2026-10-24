@@ -1,5 +1,10 @@
 [tools]
-rust = "1.99.1"
+# Table form (not plain "1.99.1") so mise installs the llvm-tools-preview
+# component cargo-llvm-cov needs; CI installs it via the toolchain action's
+# components input (ADR 0014: one version source, two installers).
+rust = { version = "1.99.1", components = ["llvm-tools-preview"] }
+# lcov generation for the Codecov upload (ADR 0020); core.sh runs it.
+"ubi:taiki-e/cargo-llvm-cov" = "0.9.1"
 # Supply-chain check tools (issue #12): mise.toml stays the single source of
 # truth — CI parses these versions instead of installing its own.
 "ubi:EmbarkStudios/cargo-deny" = "0.20.2"
