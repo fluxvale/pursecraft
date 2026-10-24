@@ -25,17 +25,20 @@ repo (upload riding the platform CI job, per-flag statuses, a root
   unchanged checks: the suite runs a second time under instrumentation to
   produce `target/coverage/core.lcov`. The check itself stays literally
   `cargo test` — coverage is reporting, not a check, and stays strictly
-  additive: an llvm-cov defect must red the coverage step, never blur into
-  the test result.
+  additive: an llvm-cov defect fails its own command after the checks have
+  run, never the test result itself.
 - **The upload rides the existing Core CI job** (FluxVale's shape) as a
-  SHA-pinned `codecov/codecov-action` step with `flags: core` and
-  `token: CODECOV_TOKEN`. A separate Coverage job would need the four-edit
-  checklist from the workflow's extension comment plus its own toolchain
-  setup and instrumented build, for the same report.
-- **`fail_ci_if_error: true`** — the silent-upload watchdog. Without it a
-  swallowed upload failure looks like passing CI with fresh coverage; with
-  it, a codecov.io outage reds the step. Same deliberate tradeoff as
-  FluxVale's upload step.
+  SHA-pinned `codecov/codecov-action` step with `flags: core` and the
+  `CODECOV_TOKEN` secret (referenced, never stored in-repo). A separate
+  Coverage job would need the four-edit checklist from the workflow's
+  extension comment plus its own toolchain setup and instrumented build,
+  for the same report.
+- **`fail_ci_if_error` is the silent-upload watchdog**, armed wherever the
+  token is (same-repo PRs and main pushes): a swallowed upload failure must
+  not look like passing CI with fresh coverage, and a codecov.io outage
+  reds the step. Fork PRs get no secret access and upload tokenless, so the
+  watchdog is disarmed for them — an external contributor is never blocked
+  by an upload they cannot authorize.
 - **Root `codecov.yml`:** one flag per app (`core` today; api/cli get flags
   when they get code), per-flag project status with a 1% threshold, patch
   status `target: auto`, and `carryforward: false` so a flag reports only
@@ -56,10 +59,17 @@ repo (upload riding the platform CI job, per-flag statuses, a root
 
 - Core CI (and a local `scripts/ci/core.sh`) runs the suite twice: plain,
   then instrumented. `mise install` must have fetched the tool and the
-  component before the script works (ADR 0014 parity).
+  component before the script works (ADR 0014 parity; the component list is
+  mirrored in the workflow's toolchain step — keep the two in sync).
 - Codecov statuses post as check runs but are not required checks — branch
   protection still requires only "Wait for CI". A red coverage status
   signals; it does not block. Tightening that is a repo-settings change,
   not a code change.
+- A per-flag project status only posts when the flag has base-commit data:
+  with `carryforward: false` and path-gated uploads, a base commit that
+  skipped the job leaves nothing to compare against (observed on
+  fluxvale/fluxvale, whose identical shape posts only
+  `codecov/patch/<flag>`). The patch status is the always-armed gate — a
+  coverage drop reds there.
 - Doctests are not instrumented (stable-toolchain limitation) — the report
   measures the binaries cargo-llvm-cov runs.

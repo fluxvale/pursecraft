@@ -104,14 +104,13 @@ jobs:
           persist-credentials: false
 
       # mise.toml is the single source of truth for tool versions; parse
-      # (not install) so CI and local dev can't drift (ADR 0014). The rust
-      # regex accepts both mise forms — plain ("x") and table with
-      # components (see mise.toml).
+      # (not install) so CI and local dev can't drift (ADR 0014) — through
+      # the one shared parser in scripts/ci/mise-version.sh.
       - name: Read tool versions from mise.toml
         id: versions
         run: |
-          rust="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
-          llvm_cov="$(sed -n 's|^"ubi:taiki-e/cargo-llvm-cov" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
+          rust="$(scripts/ci/mise-version.sh rust)"
+          llvm_cov="$(scripts/ci/mise-version.sh 'ubi:taiki-e/cargo-llvm-cov')"
           echo "rust=$rust llvm-cov=$llvm_cov"
           # separate tests: `a && b` does not fail the step when a is empty
           test -n "$rust"
@@ -123,7 +122,8 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.versions.outputs.rust }}
-          # llvm-tools-preview: cargo-llvm-cov needs llvm-profdata (ADR 0020)
+          # llvm-tools-preview: cargo-llvm-cov needs llvm-profdata (ADR 0020);
+          # keep in sync with the components list in mise.toml
           components: rustfmt, clippy, llvm-tools-preview
 
       # Self-keyed cargo cache (parsed rust version + Cargo.lock). Never
@@ -150,16 +150,16 @@ jobs:
 
       # v7.1.1 — pinned to commit: mutable tags execute unreviewed code.
       # fail_ci_if_error is the silent-upload watchdog: a swallowed failure
-      # must not look like passing CI with fresh coverage. A codecov.io
-      # outage will red this step; revert to false if that bites (the same
-      # deliberate tradeoff as fluxvale/fluxvale's upload step).
+      # must not look like passing CI with fresh coverage. Fork PRs have no
+      # secret access (tokenless upload) — the watchdog stays armed wherever
+      # the token is; a codecov.io outage reds this step on same-repo runs.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
         with:
           flags: core
           files: target/coverage/core.lcov
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+          fail_ci_if_error: ${{ !github.event.pull_request.head.repo.fork }}
 
   api:
     name: API CI
@@ -176,8 +176,7 @@ jobs:
       - name: Read Rust version from mise.toml
         id: rust
         run: |
-          # both mise forms — plain ("x") and table with components
-          version="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
+          version="$(scripts/ci/mise-version.sh rust)"
           echo "rust=$version"
           test -n "$version"
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -219,8 +218,7 @@ jobs:
       - name: Read Rust version from mise.toml
         id: rust
         run: |
-          # both mise forms — plain ("x") and table with components
-          version="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
+          version="$(scripts/ci/mise-version.sh rust)"
           echo "rust=$version"
           test -n "$version"
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -262,9 +260,8 @@ jobs:
       - name: Read tool versions from mise.toml
         id: versions
         run: |
-          deny="$(sed -n 's|^"ubi:EmbarkStudios/cargo-deny" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
-          # both mise forms — plain ("x") and table with components
-          rust="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
+          deny="$(scripts/ci/mise-version.sh 'ubi:EmbarkStudios/cargo-deny')"
+          rust="$(scripts/ci/mise-version.sh rust)"
           echo "deny=$deny rust=$rust"
           # separate tests: `a && b` does not fail the step when a is empty
           test -n "$deny"
@@ -300,9 +297,8 @@ jobs:
       - name: Read tool versions from mise.toml
         id: versions
         run: |
-          machete="$(sed -n 's|^"ubi:bnjbvr/cargo-machete" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
-          # both mise forms — plain ("x") and table with components
-          rust="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
+          machete="$(scripts/ci/mise-version.sh 'ubi:bnjbvr/cargo-machete')"
+          rust="$(scripts/ci/mise-version.sh rust)"
           echo "machete=$machete rust=$rust"
           # separate tests: `a && b` does not fail the step when a is empty
           test -n "$machete"
