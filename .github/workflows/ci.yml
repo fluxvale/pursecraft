@@ -49,6 +49,7 @@ jobs:
               - "Cargo.toml"
               - "Cargo.lock"
               - "mise.toml"
+              - "codecov.yml" # core flag's statuses — an edit must reach the upload that applies it
               - ".github/workflows/ci.yml"
             api:
               - "apps/api/**"
@@ -103,20 +104,27 @@ jobs:
           persist-credentials: false
 
       # mise.toml is the single source of truth for tool versions; parse
-      # (not install) so CI and local dev can't drift (ADR 0014).
-      - name: Read Rust version from mise.toml
-        id: rust
+      # (not install) so CI and local dev can't drift (ADR 0014). The rust
+      # regex accepts both mise forms — plain ("x") and table with
+      # components (see mise.toml).
+      - name: Read tool versions from mise.toml
+        id: versions
         run: |
-          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
-          echo "rust=$version"
-          test -n "$version"
-          echo "version=$version" >>"$GITHUB_OUTPUT"
+          rust="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
+          llvm_cov="$(sed -n 's|^"ubi:taiki-e/cargo-llvm-cov" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
+          echo "rust=$rust llvm-cov=$llvm_cov"
+          # separate tests: `a && b` does not fail the step when a is empty
+          test -n "$rust"
+          test -n "$llvm_cov"
+          echo "rust=$rust" >>"$GITHUB_OUTPUT"
+          echo "llvm_cov=$llvm_cov" >>"$GITHUB_OUTPUT"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: ${{ steps.rust.outputs.version }}
-          components: rustfmt, clippy
+          toolchain: ${{ steps.versions.outputs.rust }}
+          # llvm-tools-preview: cargo-llvm-cov needs llvm-profdata (ADR 0020)
+          components: rustfmt, clippy, llvm-tools-preview
 
       # Self-keyed cargo cache (parsed rust version + Cargo.lock). Never
       # cache ~/.rustup: a restored install marker without the toolchain
@@ -128,11 +136,30 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ steps.versions.outputs.rust }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-
+            ${{ runner.os }}-cargo-${{ steps.versions.outputs.rust }}-
+
+      # install-action pinned to commit — mutable tags execute unreviewed
+      # code. Version parsed from mise.toml above (ADR 0014).
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: cargo-llvm-cov@${{ steps.versions.outputs.llvm_cov }}
 
       - run: scripts/ci/core.sh
+
+      # v7.1.1 — pinned to commit: mutable tags execute unreviewed code.
+      # fail_ci_if_error is the silent-upload watchdog: a swallowed failure
+      # must not look like passing CI with fresh coverage. A codecov.io
+      # outage will red this step; revert to false if that bites (the same
+      # deliberate tradeoff as fluxvale/fluxvale's upload step).
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
+        with:
+          flags: core
+          files: target/coverage/core.lcov
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
 
   api:
     name: API CI
@@ -149,7 +176,8 @@ jobs:
       - name: Read Rust version from mise.toml
         id: rust
         run: |
-          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
+          # both mise forms — plain ("x") and table with components
+          version="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
           echo "rust=$version"
           test -n "$version"
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -191,7 +219,8 @@ jobs:
       - name: Read Rust version from mise.toml
         id: rust
         run: |
-          version="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
+          # both mise forms — plain ("x") and table with components
+          version="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
           echo "rust=$version"
           test -n "$version"
           echo "version=$version" >>"$GITHUB_OUTPUT"
@@ -234,7 +263,8 @@ jobs:
         id: versions
         run: |
           deny="$(sed -n 's|^"ubi:EmbarkStudios/cargo-deny" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
-          rust="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
+          # both mise forms — plain ("x") and table with components
+          rust="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
           echo "deny=$deny rust=$rust"
           # separate tests: `a && b` does not fail the step when a is empty
           test -n "$deny"
@@ -271,7 +301,8 @@ jobs:
         id: versions
         run: |
           machete="$(sed -n 's|^"ubi:bnjbvr/cargo-machete" *= *"\([^"]*\)".*|\1|p' mise.toml | head -n1)"
-          rust="$(sed -n 's/^rust *= *"\([^"]*\)".*/\1/p' mise.toml | head -n1)"
+          # both mise forms — plain ("x") and table with components
+          rust="$(sed -n 's/^rust *= *\(.*version *= *\)\?"\([^"]*\)".*/\2/p' mise.toml | head -n1)"
           echo "machete=$machete rust=$rust"
           # separate tests: `a && b` does not fail the step when a is empty
           test -n "$machete"
