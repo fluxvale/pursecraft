@@ -7,7 +7,7 @@
 //! and the metadata/payload split whose single choke point the E2EE layer
 //! will wrap — the durable local store of ADR 0018: the append-only
 //! framed file a real client boots the engine from — and the organization
-//! scope of ADR 0020: orgs own budgets, personal-org provisioning, and
+//! scope of ADR 0021: orgs own budgets, personal-org provisioning, and
 //! org-level roles and resolution.
 
 pub mod date;
@@ -95,7 +95,7 @@ pub(crate) mod testkit {
 
     /// The shared convergence-test machinery of ADR 0017 — deterministic op
     /// generators and state assertions — reused by the store suite
-    /// (ADR 0018) and parameterized over the log scope (ADR 0020: the same
+    /// (ADR 0018) and parameterized over the log scope (ADR 0021: the same
     /// theorem, proved for org logs and budget logs). All loops are
     /// xorshift-deterministic per the ADR 0016 convention.
     pub(crate) mod conv {
@@ -126,12 +126,12 @@ pub(crate) mod testkit {
 
         /// The scope org of org-scope generations, on the same `ID_MS` base
         /// as pool entity ids — the org entity's id must equal the scope
-        /// org id exactly (ADR 0020).
+        /// org id exactly (ADR 0021).
         pub(crate) fn org() -> OrgId {
             OrgId::new(v7(ID_MS, ORG_RAND)).unwrap()
         }
 
-        /// The two scopes the convergence loops prove (ADR 0020).
+        /// The two scopes the convergence loops prove (ADR 0021).
         pub(crate) fn scopes() -> [ScopeId; 2] {
             [ScopeId::Budget(budget()), ScopeId::Org(org())]
         }
@@ -174,7 +174,7 @@ pub(crate) mod testkit {
         const SKEW: [u64; DEVICES as usize] = [0, 0, 3_600_000, 31_536_000_000, 86_399_999];
 
         /// Entity pool for budget scope (ADR 0016's content entities; the
-        /// Budget entity itself lives in org scope, ADR 0020): (kind, id
+        /// Budget entity itself lives in org scope, ADR 0021): (kind, id
         /// rand) — multiple entities per kind so ops race across both
         /// fields and entities.
         const BUDGET_POOL: [(EntityKind, u64); 10] = [
@@ -190,7 +190,7 @@ pub(crate) mod testkit {
             (EntityKind::MonthCategory, 60),
         ];
 
-        /// Entity pool for org scope (ADR 0020): the organization entry
+        /// Entity pool for org scope (ADR 0021): the organization entry
         /// uses the scope's own org rand (an org log holds exactly its own
         /// org entity), plus racing memberships and budgets.
         const ORG_POOL: [(EntityKind, u64); 7] = [
@@ -290,7 +290,7 @@ pub(crate) mod testkit {
             )
         }
 
-        /// A user value: one of the fixed users, or a dangling id (ADR 0020).
+        /// A user value: one of the fixed users, or a dangling id (ADR 0021).
         fn user_value(rng: &mut Rng) -> Value {
             let users = users();
             let i = rng.below(users.len() as u64 + 1) as usize;
@@ -378,7 +378,7 @@ pub(crate) mod testkit {
         /// Deterministic op stream for one scope: `DEVICES × OPS_PER_DEVICE`
         /// ops, per-device clock offsets, occasional same-ms logical bumps.
         /// Org-scope streams draw from the org pool — the organization
-        /// entity pinned to the scope's own org id (ADR 0020).
+        /// entity pinned to the scope's own org id (ADR 0021).
         pub(crate) fn generate_ops(seed: u64, scope: ScopeId) -> Vec<Op> {
             let mut rng = Rng::new(seed | 1);
             let pool = pool_for(scope);

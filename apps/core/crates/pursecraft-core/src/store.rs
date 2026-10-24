@@ -23,7 +23,7 @@ use crate::wire::{self, OpMeta};
 
 /// File magic; a strict prefix of it is a torn create (ADR 0018).
 const MAGIC: [u8; 8] = *b"PCOPLOG\0";
-/// Version 2: `OpMeta.scope` replaced `OpMeta.budget_id` (ADR 0020). No
+/// Version 2: `OpMeta.scope` replaced `OpMeta.budget_id` (ADR 0021). No
 /// read-old migration ships — version 1 was never released and exists in
 /// no store outside test fixtures; a v1 file is refused loudly per ADR
 /// 0018's contract, never misread.
@@ -564,7 +564,7 @@ impl LocalStore {
     }
 
     /// The scope this store is scoped to — an org or a budget — once the
-    /// first op fixes it (ADR 0020).
+    /// first op fixes it (ADR 0021).
     pub fn scope_id(&self) -> Option<ScopeId> {
         self.log.scope_id()
     }
@@ -1565,7 +1565,7 @@ mod tests {
 
     const STORE_SEEDS: u64 = 10;
 
-    /// Both scopes (ADR 0020): the budget log's proof, re-run as an org
+    /// Both scopes (ADR 0021): the budget log's proof, re-run as an org
     /// log's — same engine, same store, org-entity pools.
     #[test]
     fn n_devices_converge_through_the_store_backed_rendezvous_loop() {
@@ -1669,7 +1669,7 @@ mod tests {
         }
     }
 
-    /// Both scopes (ADR 0020): shuffled delivery against the store boot
+    /// Both scopes (ADR 0021): shuffled delivery against the store boot
     /// state.
     #[test]
     fn shuffled_delivery_converges_to_the_store_boot_state() {
@@ -1730,7 +1730,7 @@ mod tests {
         }
     }
 
-    /// Boot-from-store for an org log specifically (ADR 0020): org ops
+    /// Boot-from-store for an org log specifically (ADR 0021): org ops
     /// persist, boot, and resolve exactly as budget ops do — here
     /// asserted on the org projections, not just state equality.
     #[test]

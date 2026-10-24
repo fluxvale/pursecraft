@@ -1,4 +1,4 @@
-//! Organization-level semantics (ADR 0020): projections within one org
+//! Organization-level semantics (ADR 0021): projections within one org
 //! state, the personal-org provisioning op-set, and the cross-state
 //! personal-org invariant.
 //!
@@ -16,7 +16,7 @@ use crate::ids::{DeviceId, EntityId, OpId, OrgId, ScopeId, UserId};
 use crate::ops::{Op, ScopeState};
 
 /// The organization entity of `state`'s own org. An org log holds exactly
-/// one organization entity — its own, enforced at apply time (ADR 0020) —
+/// one organization entity — its own, enforced at apply time (ADR 0021) —
 /// so this lookup cannot find a stranger's.
 pub fn organization(state: &ScopeState) -> Option<&Organization> {
     let org = state.scope_id()?.org()?;
@@ -27,7 +27,7 @@ pub fn organization(state: &ScopeState) -> Option<&Organization> {
 }
 
 /// Whether the org of `state` survives: org deletion hides everything it
-/// owns, data stays (ADR 0020's cascade-hide).
+/// owns, data stays (ADR 0021's cascade-hide).
 pub fn org_alive(state: &ScopeState) -> bool {
     organization(state).is_some_and(|organization| !organization.deleted)
 }
@@ -36,13 +36,13 @@ pub fn org_alive(state: &ScopeState) -> bool {
 /// entity's stored scope is checked against the state's — a caller
 /// composing budgets across orgs cannot smuggle a foreign org's budget
 /// past this projection), the budget survives, and the org survives
-/// (ADR 0020). An org's budget list is the visible ones — offline, from
+/// (ADR 0021). An org's budget list is the visible ones — offline, from
 /// the org log alone.
 pub fn budget_visible(state: &ScopeState, budget: &Budget) -> bool {
     state.scope_id() == Some(budget.scope) && !budget.deleted && org_alive(state)
 }
 
-/// The org's visible budgets (ADR 0020), in stable `BudgetId` order —
+/// The org's visible budgets (ADR 0021), in stable `BudgetId` order —
 /// entity iteration order is a HashMap's and must never leak into
 /// anything a caller can observe.
 pub fn visible_budgets(state: &ScopeState) -> Vec<&Budget> {
@@ -62,7 +62,7 @@ pub fn visible_budgets(state: &ScopeState) -> Vec<&Budget> {
 /// role-bearing memberships compete: a torn, role-less write shadows
 /// nothing (it contributes no role until one lands on it). A user appears
 /// at most once per org in well-formed data; racing twins resolve
-/// deterministically on every device (ADR 0020).
+/// deterministically on every device (ADR 0021).
 pub fn membership_role(state: &ScopeState, user: UserId) -> Option<MembershipRole> {
     state
         .entities()
@@ -79,7 +79,7 @@ pub fn membership_role(state: &ScopeState, user: UserId) -> Option<MembershipRol
 }
 
 /// A user's access to one budget of this org: their membership role, iff
-/// the budget belongs to this org and both survive (ADR 0020). Different
+/// the budget belongs to this org and both survive (ADR 0021). Different
 /// orgs give different roles through different memberships; roles are
 /// data, and enforcing them is the auth slice's job.
 pub fn budget_access(state: &ScopeState, user: UserId, budget: &Budget) -> Option<MembershipRole> {
@@ -88,7 +88,7 @@ pub fn budget_access(state: &ScopeState, user: UserId, budget: &Budget) -> Optio
         .flatten()
 }
 
-/// The ids a personal-org provisioning writes (ADR 0020): the org, the
+/// The ids a personal-org provisioning writes (ADR 0021): the org, the
 /// owner-membership entity, and the user the org is personal for. The
 /// caller mints all three (capture is a later slice, ADR 0016).
 #[derive(Clone, Copy, Debug)]
@@ -98,7 +98,7 @@ pub struct PersonalOrgIds {
     pub membership: EntityId,
 }
 
-/// The creation stamp every provisioning op carries (ADR 0020): the org
+/// The creation stamp every provisioning op carries (ADR 0021): the org
 /// id's own UUIDv7 millisecond, logical zero. Anchoring here is the merge
 /// guard — any device that has ever seen this org received a stamp this
 /// dominates (HLC receive, ADR 0007), so every edit such a device later
@@ -120,7 +120,7 @@ fn org_creation_stamp(org: OrgId) -> Hlc {
     }
 }
 
-/// The personal-org provisioning op-set (ADR 0020): the organization —
+/// The personal-org provisioning op-set (ADR 0021): the organization —
 /// named, marked personal for `user` — plus the creator's owner
 /// membership. Two barriers make retrying safe, because the retrying
 /// device may be empty or stale (that is why retries exist):
@@ -210,7 +210,7 @@ pub fn provision_personal_org(
 }
 
 /// The live orgs claiming to be `user`'s personal org, across every org
-/// state the caller holds (ADR 0020) — deduplicated, because passing the
+/// state the caller holds (ADR 0021) — deduplicated, because passing the
 /// same state twice is a legal call, not a violation. The provisioning
 /// invariant holds iff the result has exactly one element: a user's state
 /// always includes a personal org, and provisioning never duplicates one.
@@ -233,7 +233,7 @@ where
     orgs
 }
 
-/// The personal-org invariant's second clause (ADR 0020): the creator's
+/// The personal-org invariant's second clause (ADR 0021): the creator's
 /// OWNER membership survives — their resolved role in their own org is
 /// Owner, exactly what [`membership_role`] (and therefore
 /// [`budget_access`]) resolves, so the checker can never disagree with
@@ -397,7 +397,7 @@ mod tests {
         }
     }
 
-    /// Provisioning invariant (ADR 0020): provisioning yields exactly one
+    /// Provisioning invariant (ADR 0021): provisioning yields exactly one
     /// live personal org with the creator as owner — and NEVER clobbers
     /// user edits, whatever stamps a retry carries. The hostile case: the
     /// user renames their org and demotes themselves, then a crash-retry
@@ -599,7 +599,7 @@ mod tests {
 
         // A deleted personal org is equally visible: the invariant demands
         // exactly one LIVE org, so a hostile or buggy tombstone leaves the
-        // user org-less and the checker says so (ADR 0020 — the log stays
+        // user org-less and the checker says so (ADR 0021 — the log stays
         // faithful; the policy is enforced at capture).
         let mut deleted = imposter;
         deleted.write(
@@ -634,7 +634,7 @@ mod tests {
         );
     }
 
-    /// The stale/empty-device path (ADR 0020): a device that never saw
+    /// The stale/empty-device path (ADR 0021): a device that never saw
     /// the org provisions with a fresh clock — read-then-mint cannot help
     /// it (its state is empty), so the ANCHORED STAMPS must: its ops lose
     /// on merge to every field the up-to-date world already wrote. The
@@ -760,7 +760,7 @@ mod tests {
         }
     }
 
-    /// The invariant's second clause (ADR 0020): the checker verifies the
+    /// The invariant's second clause (ADR 0021): the checker verifies the
     /// CREATOR'S OWNER membership — the resolved role, so it can never
     /// disagree with access. Repro A: removal plus a role-less twin
     /// naming the creator must flag (the checker must not be satisfied by
@@ -914,7 +914,7 @@ mod tests {
         );
     }
 
-    /// Role semantics as data (ADR 0020): one user, two orgs, different
+    /// Role semantics as data (ADR 0021): one user, two orgs, different
     /// roles — the requirement, resolved from memberships alone.
     #[test]
     fn roles_differ_across_orgs() {
@@ -939,7 +939,7 @@ mod tests {
 
         // A torn, role-less membership with a LOWER id than the complete
         // one shadows nothing: only role-bearing memberships compete, so
-        // the earliest complete one wins (ADR 0020).
+        // the earliest complete one wins (ADR 0021).
         household.write(
             EntityKind::Membership,
             51, // lower id than 52 — a racing twin that never got its role
@@ -966,7 +966,7 @@ mod tests {
 
     /// The budget list is in stable `BudgetId` order, and a budget whose
     /// stored scope is another org's is never visible or accessible
-    /// through this org's projections (ADR 0020) — cross-org composition
+    /// through this org's projections (ADR 0021) — cross-org composition
     /// cannot smuggle a foreign budget past them.
     #[test]
     fn budget_list_order_is_stable_and_foreign_scope_budgets_resolve_nothing() {
@@ -1009,7 +1009,7 @@ mod tests {
         );
     }
 
-    /// Cross-org isolation (ADR 0020, the P1 class): an op or entity from
+    /// Cross-org isolation (ADR 0021, the P1 class): an op or entity from
     /// one org never influences another's resolution.
     #[test]
     fn cross_org_ops_never_influence_another_orgs_resolution() {
@@ -1066,7 +1066,7 @@ mod tests {
         );
     }
 
-    /// Referential behavior (ADR 0020): org deletion hides its budgets
+    /// Referential behavior (ADR 0021): org deletion hides its budgets
     /// (cascade-hide, data stays), budget deletion hides one budget,
     /// membership removal drops that user's access only.
     #[test]
@@ -1122,7 +1122,7 @@ mod tests {
         );
     }
 
-    /// Determinism (ADR 0020): concurrent membership and org edits resolve
+    /// Determinism (ADR 0021): concurrent membership and org edits resolve
     /// identically under every delivery order — the same theorem the
     /// convergence loops prove, asserted on the org projections.
     #[test]

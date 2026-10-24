@@ -1,6 +1,6 @@
 //! Deterministic referential resolution at projection time (ADRs 0007, 0016)
 //! — budget-content projections; org-level resolution lives in
-//! [`crate::org`] (ADR 0020).
+//! [`crate::org`] (ADR 0021).
 //!
 //! Resolution is a pure projection over [`ScopeState`] — it never mutates
 //! stored state, so the op log stays faithful and the rules can change

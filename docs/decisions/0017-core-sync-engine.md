@@ -1,7 +1,7 @@
 # 0017 — Core Sync Engine: Canonical Log, Sync Sessions, and the Op Wire Format
 
 - **Status:** Accepted — scope model generalized by
-  [ADR 0020](0020-organizations-own-budgets.md) (logs scope to orgs or
+  [ADR 0021](0021-organizations-own-budgets.md) (logs scope to orgs or
   budgets; `BudgetState` renamed `ScopeState`; the theorem extends by case
   analysis on scope)
 - **Date:** 2026-10-23
@@ -28,7 +28,7 @@ server:
 - `append(op) -> seq`: sequences are dense, 1-based, and append order is the
   canonical order per budget (ADR 0007). The first append fixes the budget;
   foreign-budget appends are rejected, mirroring `BudgetState` *(amended by
-  [ADR 0020](0020-organizations-own-budgets.md): a log fixes a typed
+  [ADR 0021](0021-organizations-own-budgets.md): a log fixes a typed
   `ScopeId` — an org or a budget — and `BudgetState` is now `ScopeState`).*
 - The log touches only server-visible metadata. Dedupe is by `op_id`
   alone: re-appending an op whose id is already stored returns the
@@ -49,7 +49,7 @@ server:
 ### Client model: `SyncSession`
 
 A session is one device's `BudgetState` *(renamed `ScopeState`, ADR
-  [0020](0020-organizations-own-budgets.md))* plus its `Hlc` clock plus a
+  [0020](0021-organizations-own-budgets.md))* plus its `Hlc` clock plus a
 `last_seen` cursor (0 = nothing seen). `apply_delta(ops)` processes ops in
 any order:
 
@@ -73,7 +73,7 @@ any order:
 
 Local capture — minting ops and applying them immediately — is not part of
 the session; the capture slice composes `BudgetState::apply` *(renamed
-  `ScopeState::apply`, ADR 0020)* with this
+  `ScopeState::apply`, ADR 0021)* with this
 clock. Nothing here pre-empts that.
 
 ### Wire format
@@ -82,7 +82,7 @@ The op record serializes as two parts, matching what the server may ever
 see (ADR 0009):
 
 - `OpMeta { op_id, budget_id, device_id, user_id, hlc }` — server-visible
-  *(amended by [ADR 0020](0020-organizations-own-budgets.md):
+  *(amended by [ADR 0021](0021-organizations-own-budgets.md):
   `budget_id` → `scope: ScopeId`)*;
 - `OpPayload { entity_kind, entity_id, field, value }` — opaque to the
   server, encrypted in a later slice.
@@ -131,7 +131,7 @@ the versioned protocol freeze the transport slice brings (ADR 0012).
 ### Convergence: statement and proof method
 
 **Statement:** after a set of ops S has been applied, `BudgetState`
-  *(renamed `ScopeState`, ADR [0020](0020-organizations-own-budgets.md);
+  *(renamed `ScopeState`, ADR [0020](0021-organizations-own-budgets.md);
   the theorem extends to org logs by case analysis on scope)* is a
 function of S alone. Dedupe collapses duplicates; per-field LWW by the total
 order `(hlc, op_id)` picks the maximum stamp per field independent of

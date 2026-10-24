@@ -108,7 +108,7 @@ id_newtype!(MonthCategoryId, v7);
 id_newtype!(DeviceId, any_version);
 id_newtype!(UserId, any_version);
 
-/// Which log an op belongs to (ADR 0020): an organization's or a budget's.
+/// Which log an op belongs to (ADR 0021): an organization's or a budget's.
 /// Wire form is externally tagged (`{"Org": "…"} / {"Budget": "…"}`) — the
 /// scope is metadata the server routes on, so its kind must be legible
 /// without touching the encrypted payload.
@@ -120,7 +120,7 @@ pub enum ScopeId {
 
 impl ScopeId {
     /// The org this scope belongs to: the org itself for org scope, `None`
-    /// for budget scope (a budget log does not name its org — ADR 0020).
+    /// for budget scope (a budget log does not name its org — ADR 0021).
     pub fn org(self) -> Option<OrgId> {
         match self {
             Self::Org(org) => Some(org),

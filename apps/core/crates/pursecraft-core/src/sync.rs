@@ -26,7 +26,7 @@ pub struct SequencedOp {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LogError {
     /// The op is scoped to a log other than this one's ([ADR 0008],
-    /// [ADR 0020]).
+    /// [ADR 0021]).
     ScopeMismatch {
         op_scope: ScopeId,
         log_scope: ScopeId,
@@ -51,7 +51,7 @@ impl std::error::Error for LogError {}
 
 /// The append-only, per-scope canonical op log — the rendezvous model of
 /// [ADR 0007] as an in-memory type the future server drives; a log is
-/// scoped to one org or one budget (ADR 0020). Sequences are 1-based and
+/// scoped to one org or one budget (ADR 0021). Sequences are 1-based and
 /// append order is the canonical order in a fresh log. The log touches
 /// only server-visible metadata: dedupe is by `op_id` alone (content is
 /// opaque under [ADR 0009] — an encrypted retry must dedupe like an
@@ -152,7 +152,7 @@ impl OpLog {
     }
 
     /// The scope this log is fixed to, once the first op fixes it
-    /// (ADR 0020).
+    /// (ADR 0021).
     pub fn scope_id(&self) -> Option<ScopeId> {
         self.scope
     }
@@ -185,7 +185,7 @@ pub struct DeltaSummary {
 
 /// One device's client side: materialized state, the device's HLC, and the
 /// `last_seen` cursor (ADR 0017). The transport-free "sync session" the
-/// future transport drives — one per log scope (ADR 0020).
+/// future transport drives — one per log scope (ADR 0021).
 #[derive(Clone, Debug)]
 pub struct SyncSession {
     state: ScopeState,
@@ -254,7 +254,7 @@ impl SyncSession {
     }
 
     /// The materialized state — converges across devices by ADR 0017's
-    /// theorem, per scope (ADR 0020).
+    /// theorem, per scope (ADR 0021).
     pub fn state(&self) -> &ScopeState {
         &self.state
     }
@@ -566,7 +566,7 @@ mod tests {
     // tombstone races, dangling references — all xorshift-deterministic
     // per the ADR 0016 convention. The op stream generator and assertions
     // live in `testkit::conv`, shared with the store suite (ADR 0018), and
-    // run over both log scopes (ADR 0020): the same theorem for org logs
+    // run over both log scopes (ADR 0021): the same theorem for org logs
     // and budget logs.
     // ------------------------------------------------------------------
 
@@ -575,7 +575,7 @@ mod tests {
     /// Scenario (a): the rendezvous loop — devices push their ops to the
     /// log in a shuffled interleave and pull random-sized deltas, sometimes
     /// re-pulling overlaps (at-least-once delivery), until everyone has
-    /// everything. Both scopes (ADR 0020).
+    /// everything. Both scopes (ADR 0021).
     #[test]
     fn n_devices_converge_through_the_rendezvous_loop() {
         for scope in scopes() {
@@ -675,7 +675,7 @@ mod tests {
     /// Scenario (b): no log at all — each device receives the full op set
     /// as an independent shuffle with injected duplicates, in random batch
     /// sizes; all must equal the generation-order reference. Both scopes
-    /// (ADR 0020).
+    /// (ADR 0021).
     #[test]
     fn n_devices_converge_from_shuffled_duplicated_delivery() {
         for scope in scopes() {

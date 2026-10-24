@@ -1,7 +1,7 @@
 # 0008 — Multi-User Budgets from Day One
 
 - **Status:** Accepted — membership shape (user ↔ budget roles) superseded
-  by [ADR 0020](0020-organizations-own-budgets.md); multi-user day one,
+  by [ADR 0021](0021-organizations-own-budgets.md); multi-user day one,
   entity scoping, and op attribution stand
 - **Date:** 2026-10-15
 
@@ -19,7 +19,7 @@ Build multi-user into the foundation:
 - `budget_memberships` table (user ↔ budget) with roles: **owner / editor /
   viewer**.
 - Every entity carries `budget_id` *(amended by
-  [ADR 0020](0020-organizations-own-budgets.md): the envelope field is the
+  [ADR 0021](0021-organizations-own-budgets.md): the envelope field is the
   typed `scope`, and org logs carry org entities alongside)*; the server
   enforces scoping on both op ingestion and delta reads.
 - Invite flow: link/email token → membership → device registers → syncs.

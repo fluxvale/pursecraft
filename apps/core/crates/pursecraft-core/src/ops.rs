@@ -2,7 +2,7 @@
 //!
 //! Core-side ops are typed; the wire form is opaque (ADR 0009) —
 //! `entity_kind`/`entity_id`/`field`/`value` live inside the encrypted
-//! payload, and only `op_id`, the `scope` (an org or a budget, ADR 0020),
+//! payload, and only `op_id`, the `scope` (an org or a budget, ADR 0021),
 //! `device_id`, `user_id`, and the HLC timestamp are server-visible
 //! metadata.
 
@@ -51,7 +51,7 @@ pub struct EntityRecord {
 }
 
 /// State materialized from applied ops, scoped to exactly one log — an
-/// organization's or a budget's (ADR 0020): the first applied op fixes the
+/// organization's or a budget's (ADR 0021): the first applied op fixes the
 /// scope, and ops of any other scope are rejected — cross-scope resolution
 /// is structurally impossible, for orgs exactly as for budgets before them
 /// (ADR 0016).
@@ -91,11 +91,11 @@ pub enum ApplyError {
         op_scope: ScopeId,
         state_scope: ScopeId,
     },
-    /// The entity kind cannot exist in the op's scope kind (ADR 0020):
+    /// The entity kind cannot exist in the op's scope kind (ADR 0021):
     /// org entities (Organization, Membership, Budget) only in org scope,
     /// budget-content entities only in budget scope.
     ScopeKindMismatch { scope: ScopeId, kind: EntityKind },
-    /// The organization entity slot is violated (ADR 0020): an
+    /// The organization entity slot is violated (ADR 0021): an
     /// `Organization` op whose entity id is not its scope's org id, or
     /// any other entity kind minted onto the scope org's uuid. One org
     /// log holds exactly one organization entity — its own — and nothing
@@ -180,7 +180,7 @@ impl ScopeState {
                 state_scope,
             });
         }
-        // Kind-vs-scope validity (ADR 0020): an org entity in a budget log,
+        // Kind-vs-scope validity (ADR 0021): an org entity in a budget log,
         // or budget content in an org log, is loud corruption — never
         // merged, never silently materialized.
         if !kind_valid_in_scope(op.entity_kind, op.scope) {
@@ -189,7 +189,7 @@ impl ScopeState {
                 kind: op.entity_kind,
             });
         }
-        // One org log, one organization entity, its own id (ADR 0020) —
+        // One org log, one organization entity, its own id (ADR 0021) —
         // and the org's entity slot is RESERVED: an op touching the scope
         // org's uuid must be the organization entity itself. Without the
         // second half, a Membership minted onto the org's uuid wins the
@@ -257,7 +257,7 @@ impl ScopeState {
     }
 
     /// The scope this state is fixed to, once the first applied op fixes
-    /// it (ADR 0020).
+    /// it (ADR 0021).
     pub fn scope_id(&self) -> Option<ScopeId> {
         self.scope
     }
@@ -297,7 +297,7 @@ fn field_valid_for(kind: EntityKind, field: Field) -> bool {
     }
 }
 
-/// Whether `kind` exists in the scope kind (ADR 0020): org entities in
+/// Whether `kind` exists in the scope kind (ADR 0021): org entities in
 /// org scope, budget-content entities in budget scope.
 pub(crate) fn kind_valid_in_scope(kind: EntityKind, scope: ScopeId) -> bool {
     matches!(
@@ -716,7 +716,7 @@ mod tests {
         let cell = EntityId::new(v7(MS_BASE, 17)).unwrap();
 
         // Budget scope holds the six content entities; the Budget entity
-        // itself lives in org scope (ADR 0020).
+        // itself lives in org scope (ADR 0021).
         let cases: Vec<(EntityKind, EntityId, Field, Value)> = vec![
             (
                 EntityKind::Account,
@@ -803,7 +803,7 @@ mod tests {
         }
     }
 
-    /// One op per org-scope entity field (ADR 0020), into one org log.
+    /// One op per org-scope entity field (ADR 0021), into one org log.
     #[test]
     fn org_scope_entities_round_trip_field_writes() {
         let org = OrgId::new(v7(MS_BASE, 1)).unwrap();
@@ -961,7 +961,7 @@ mod tests {
             Err(ApplyError::ScopeMismatch { .. })
         ));
         // An org-scoped op is equally foreign to a budget-scoped state —
-        // orgs cannot leak into budget logs (ADR 0020).
+        // orgs cannot leak into budget logs (ADR 0021).
         let mut org_op = txn_op(3, 30, 0, amount_field(0).0, amount_field(0).1);
         org_op.scope = ScopeId::Org(OrgId::new(v7(9, 9)).unwrap());
         assert!(matches!(
@@ -1001,7 +1001,7 @@ mod tests {
         );
     }
 
-    /// Kind-vs-scope validity (ADR 0020): org entities cannot be written
+    /// Kind-vs-scope validity (ADR 0021): org entities cannot be written
     /// into a budget log, budget-content entities cannot be written into
     /// an org log, and an org log holds exactly one organization entity —
     /// its own.

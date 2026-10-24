@@ -15,7 +15,7 @@ use crate::ops::Op;
 
 /// Server-visible op metadata (ADR 0009): everything the rendezvous may
 /// read — including the typed log scope the future server routes
-/// authorization on (ADR 0020).
+/// authorization on (ADR 0021).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct OpMeta {
     pub op_id: OpId,
@@ -178,7 +178,7 @@ mod tests {
 
     /// One op per (entity kind × field), covering every `Value` variant —
     /// including calendar edges, empty and non-ASCII text, and extreme
-    /// milliunits. Org-scope entities (ADR 0020) ride org ops.
+    /// milliunits. Org-scope entities (ADR 0021) ride org ops.
     fn every_variant() -> Vec<Op> {
         vec![
             org_op(

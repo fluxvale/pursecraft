@@ -2,7 +2,7 @@
 //! (ADRs 0007, 0016, 0020).
 //!
 //! Every entity carries the same envelope: a UUIDv7 id, the `scope` of its
-//! log (an org or a budget, ADR 0020), and a `deleted` tombstone flag
+//! log (an org or a budget, ADR 0021), and a `deleted` tombstone flag
 //! modeled as an ordinary field so deletes ride the same per-field LWW path
 //! as any other write. Entity fields are `Option` until an op sets them —
 //! money must never default silently to zero (ADR 0016).
@@ -39,7 +39,7 @@ pub enum Cleared {
     Reconciled,
 }
 
-/// A user's role in an organization (ADR 0020): ADR 0008's owner/editor/
+/// A user's role in an organization (ADR 0021): ADR 0008's owner/editor/
 /// viewer set, transferred to the org level. Roles are data — enforcing
 /// them is the auth slice's job.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ pub enum MembershipRole {
     Viewer,
 }
 
-/// An organization — the ownership scope for budgets (ADR 0020). Exactly
+/// An organization — the ownership scope for budgets (ADR 0021). Exactly
 /// one per org log, its id equal to the log's scope; `personal_for` marks
 /// the default org every user is provisioned with.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -61,9 +61,9 @@ pub struct Organization {
     pub personal_for: Option<UserId>,
 }
 
-/// A user's membership in an organization, with a role (ADR 0020). Lives
+/// A user's membership in an organization, with a role (ADR 0021). Lives
 /// in the org's log; well-formed data has one per (org, user), and racing
-/// twins resolve deterministically to the earliest-created (ADR 0020).
+/// twins resolve deterministically to the earliest-created (ADR 0021).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Membership {
     pub id: EntityId,
@@ -74,7 +74,7 @@ pub struct Membership {
 }
 
 /// A budget, owned by the organization whose log this entity lives in —
-/// the scope is the tie (ADR 0020). Budget *content* entities live in the
+/// the scope is the tie (ADR 0021). Budget *content* entities live in the
 /// budget's own log; this entity is the org-visible registry entry.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Budget {
@@ -338,7 +338,7 @@ pub enum MonthCategoryField {
 }
 
 /// A field value — the closed vocabulary the op log writes, and the future
-/// single serialization choke point (ADR 0009, ADR 0016, ADR 0020).
+/// single serialization choke point (ADR 0009, ADR 0016, ADR 0021).
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Value {
     Bool(bool),
