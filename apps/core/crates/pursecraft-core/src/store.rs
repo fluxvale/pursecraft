@@ -8,7 +8,15 @@
 //! `sync_data`. Applied state is never persisted: boot is replay through
 //! the ordinary [`crate::sync::SyncSession`] path, so boot-from-store
 //! equals in-memory replay by construction (ADR 0018).
+//!
+//! [`OpaqueStore`] is the same file format string-native (ADR 0024): rows
+//! keep the payload as the exact string the transport carried — never
+//! decoded, never validated — which is what the rendezvous relay requires
+//! (payload opacity holds for bytes that are not choke-point output, the
+//! ciphertext E2EE will produce) and what ADR 0018's "the string changes,
+//! the shape does not" evolution anticipated.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -16,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::ScopeId;
+use crate::ids::{OpId, ScopeId};
 use crate::ops::Op;
 use crate::sync::{LogError, OpLog, SequencedOp};
 use crate::wire::{self, OpMeta};
@@ -103,7 +111,7 @@ fn parse_marker(bytes: &[u8]) -> Marker {
 /// metadata verbatim, and the payload as the choke-point string (ADRs
 /// 0009, 0018) — the future at-rest encryption layer changes what that
 /// string holds, not this shape.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct StoredOp {
     seq: u64,
     meta: OpMeta,
@@ -113,10 +121,17 @@ struct StoredOp {
 /// Serialize one op into its frame under `seq` (ADR 0018).
 fn encode_frame(op: &Op, seq: u64) -> Result<Vec<u8>, StoreError> {
     let (meta, payload) = op.clone().into_parts();
+    encode_frame_parts(seq, &meta, &wire::encode_payload(&payload)?)
+}
+
+/// Frame a stored record from its wire parts (ADR 0024): the shared body
+/// of both stores' commits — the payload stays the caller's string
+/// verbatim, whatever it holds.
+fn encode_frame_parts(seq: u64, meta: &OpMeta, payload: &str) -> Result<Vec<u8>, StoreError> {
     let body = serde_json::to_vec(&StoredOp {
         seq,
-        meta,
-        payload: wire::encode_payload(&payload)?,
+        meta: meta.clone(),
+        payload: payload.to_owned(),
     })?;
     let len = u32::try_from(body.len()).map_err(|_| {
         io::Error::new(
@@ -144,15 +159,48 @@ enum Scan {
     Corrupt(&'static str),
 }
 
-/// Validate and decode the frame at `offset` (ADR 0018's framing rules).
+/// Validate and decode the frame at `offset` (ADR 0018's framing rules),
+/// payload-decoding like the client store's boot requires.
 fn scan_frame(bytes: &[u8], offset: usize) -> Scan {
+    match scan_frame_parts(bytes, offset) {
+        ScanParts::Op(stored, end) => match wire::decode_payload(&stored.payload) {
+            Ok(payload) => Scan::Op(
+                SequencedOp {
+                    seq: stored.seq,
+                    op: Op::from_parts(stored.meta, payload),
+                },
+                end,
+            ),
+            Err(_) => Scan::Corrupt("op payload does not decode"),
+        },
+        ScanParts::Invalid => Scan::Invalid,
+        ScanParts::Corrupt(reason) => Scan::Corrupt(reason),
+    }
+}
+
+/// What the shared frame scanner found at one offset (ADR 0024): the
+/// record as stored — payload still the verbatim string.
+enum ScanParts {
+    /// A valid frame; the offset just past it.
+    Op(StoredOp, usize),
+    /// Structurally incomplete or checksum-failed — a torn tail or
+    /// mid-file damage; the caller classifies by resync (ADR 0018).
+    Invalid,
+    /// Checksum-valid bytes that cannot be a stored record — the writer
+    /// never frames such bytes; loud without resync.
+    Corrupt(&'static str),
+}
+
+/// The shared half of [`scan_frame`]: framing, checksum, and the record's
+/// JSON — the payload interior stays an unopened string (ADR 0024).
+fn scan_frame_parts(bytes: &[u8], offset: usize) -> ScanParts {
     let remaining = bytes.len() - offset;
     if remaining < FRAME_OVERHEAD {
-        return Scan::Invalid;
+        return ScanParts::Invalid;
     }
     let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("length field"));
     if u64::from(len) > (remaining - FRAME_OVERHEAD) as u64 {
-        return Scan::Invalid;
+        return ScanParts::Invalid;
     }
     let end = offset + FRAME_OVERHEAD + len as usize;
     let body = &bytes[offset + FRAME_OVERHEAD..end];
@@ -162,21 +210,11 @@ fn scan_frame(bytes: &[u8], offset: usize) -> Scan {
             .expect("checksum field"),
     );
     if fnv1a64(body) != checksum {
-        return Scan::Invalid;
+        return ScanParts::Invalid;
     }
-    let stored: StoredOp = match serde_json::from_slice(body) {
-        Ok(stored) => stored,
-        Err(_) => return Scan::Corrupt("stored op does not decode"),
-    };
-    match wire::decode_payload(&stored.payload) {
-        Ok(payload) => Scan::Op(
-            SequencedOp {
-                seq: stored.seq,
-                op: Op::from_parts(stored.meta, payload),
-            },
-            end,
-        ),
-        Err(_) => Scan::Corrupt("op payload does not decode"),
+    match serde_json::from_slice::<StoredOp>(body) {
+        Ok(stored) => ScanParts::Op(stored, end),
+        Err(_) => ScanParts::Corrupt("stored op does not decode"),
     }
 }
 
@@ -331,131 +369,15 @@ impl LocalStore {
         };
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        // A strict prefix of the magic is a torn create: no committed data
-        // can predate the header fsync, so recreate (ADR 0018).
-        if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC {
-            if MAGIC.starts_with(&bytes) {
+        let marker = match parse_header(&bytes, path)? {
+            HeaderState::TornCreate => {
                 Self::recreate(&mut file)?;
                 return Ok(Self::empty(path, file));
             }
-            return Err(StoreError::Foreign {
-                path: path.to_owned(),
-            });
-        }
-        // Version and reserved are checked the moment they are readable —
-        // before any recreate decision — so a truncated file from a future
-        // format is refused, never rewritten over. Version 0 is judged
-        // after the torn-create length check below (ADR 0018).
-        let version = if bytes.len() >= 10 {
-            Some(u16::from_le_bytes(
-                bytes[8..10].try_into().expect("version field"),
-            ))
-        } else {
-            None
+            HeaderState::Valid(marker) => marker,
         };
-        if let Some(version) = version
-            && version != 0
-            && version != FORMAT_VERSION
-        {
-            return Err(StoreError::UnsupportedVersion {
-                path: path.to_owned(),
-                found: version,
-                supported: FORMAT_VERSION,
-            });
-        }
-        let reserved = (bytes.len() >= 12)
-            .then(|| u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field")));
-        if let Some(reserved) = reserved
-            && version == Some(FORMAT_VERSION)
-            && reserved != 0
-        {
-            return Err(StoreError::UnsupportedVersion {
-                path: path.to_owned(),
-                found: reserved,
-                supported: FORMAT_VERSION,
-            });
-        }
-        // A torn create is a file that cannot hold committed data — the
-        // header write is one prefix, and frames only ever follow its
-        // fsync: a file too short to hold the header, or a full-length
-        // header that carries nothing (zero version, zero reserved, a
-        // marker claiming no commits — the crash-inside-create state,
-        // where the size is durable but the page is not), is recreated
-        // (ADR 0018).
-        if bytes.len() < HEADER_LEN {
-            Self::recreate(&mut file)?;
-            return Ok(Self::empty(path, file));
-        }
-        // `bytes.len() >= HEADER_LEN` holds here, so the reserved word
-        // was readable above.
-        let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
-        if version == Some(0) {
-            if bytes.len() == HEADER_LEN
-                && reserved == Some(0)
-                && !matches!(marker, Marker::Committed(1..))
-            {
-                Self::recreate(&mut file)?;
-                return Ok(Self::empty(path, file));
-            }
-            // A zero version beside frames — or beside a marker that
-            // claims commits — is damage or foreign: refused, never
-            // recreated over, or one flipped bit would silently wipe
-            // every committed op (ADR 0018).
-            return Err(StoreError::UnsupportedVersion {
-                path: path.to_owned(),
-                found: 0,
-                supported: FORMAT_VERSION,
-            });
-        }
 
-        let mut records = Vec::new();
-        let mut offset = HEADER_LEN;
-        let mut prev_seq = 0u64;
-        while offset < bytes.len() {
-            match scan_frame(&bytes, offset) {
-                Scan::Op(record, end) => {
-                    // Records carry their sequences; the writer's are
-                    // strictly increasing, 1-based, within the u32
-                    // marker's reach — anything else is tampering, loud
-                    // (ADR 0018).
-                    if record.seq == 0 || record.seq <= prev_seq || record.seq > u64::from(u32::MAX)
-                    {
-                        return Err(StoreError::Corrupt {
-                            path: path.to_owned(),
-                            offset: offset as u64,
-                            reason: "record sequence must increase within 1..=u32::MAX",
-                        });
-                    }
-                    prev_seq = record.seq;
-                    records.push(record);
-                    offset = end;
-                }
-                Scan::Invalid => {
-                    // Classify by resync: ONE checksum-valid frame beyond
-                    // the damage proves mid-file corruption — loud, file
-                    // untouched. No valid frame after it is the crash
-                    // window's torn tail: cut it and make the cut durable
-                    // (ADR 0018).
-                    if valid_frame_follows(&bytes, offset + 1) {
-                        return Err(StoreError::Corrupt {
-                            path: path.to_owned(),
-                            offset: offset as u64,
-                            reason: "frame is invalid but a valid frame follows it",
-                        });
-                    }
-                    file.set_len(offset as u64)?;
-                    file.sync_all()?;
-                    break;
-                }
-                Scan::Corrupt(reason) => {
-                    return Err(StoreError::Corrupt {
-                        path: path.to_owned(),
-                        offset: offset as u64,
-                        reason,
-                    });
-                }
-            }
-        }
+        let (records, offset, file_max) = walk_frames(&mut file, &bytes, path, scan_op_frame)?;
 
         // Resume the sequence space above everything ever acknowledged or
         // ever claimed by a record on disk — the loaded tip, or the
@@ -464,11 +386,7 @@ impl LocalStore {
         // and never reuses a sequence a peer may have seen (ADR 0018). A
         // pending or torn marker grants nothing: its commit never acked,
         // so the loaded frames are all that was observable.
-        let file_max = prev_seq;
-        let acked = match marker {
-            Marker::Committed(committed) => committed.max(file_max),
-            Marker::Pending(_) | Marker::Torn => file_max,
-        };
+        let acked = resume_above(marker, file_max);
         let mut log = OpLog::resuming_at(acked + 1);
         for record in records {
             log.append_sequenced(record.seq, record.op)
@@ -478,7 +396,7 @@ impl LocalStore {
             log,
             path: path.to_owned(),
             file,
-            durable_len: offset as u64,
+            durable_len: offset,
             hwm: acked,
             poisoned: false,
         })
@@ -585,24 +503,450 @@ impl LocalStore {
     /// just seen the path not exist (single writer per path is the
     /// caller's contract).
     fn create(path: &Path) -> Result<Self, StoreError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        file.write_all(&header())?;
-        file.sync_data()?;
-        sync_parent_dir(path);
+        let file = create_log_file(path)?;
         Ok(Self::empty(path, file))
     }
 
     /// Rewrite the header over a torn create (no committed data exists).
     fn recreate(file: &mut File) -> Result<(), StoreError> {
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header())?;
-        Ok(file.sync_data()?)
+        rewrite_header(file)
+    }
+}
+
+/// Create a fresh log file: the header (version, zero marker) durable
+/// first, then the directory entry (ADR 0018). Shared by both stores; the
+/// caller has just seen the path not exist (single writer per path is the
+/// caller's contract).
+fn create_log_file(path: &Path) -> Result<File, StoreError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(&header())?;
+    file.sync_data()?;
+    sync_parent_dir(path);
+    Ok(file)
+}
+
+/// Rewrite the header over a torn create — no committed data exists
+/// (ADR 0018).
+fn rewrite_header(file: &mut File) -> Result<(), StoreError> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header())?;
+    Ok(file.sync_data()?)
+}
+
+/// What boot found in the header region (ADRs 0018, 0024 — shared by both
+/// stores).
+enum HeaderState {
+    /// A full supported header; the commit marker it carries. Frames, if
+    /// any, start at `HEADER_LEN`.
+    Valid(Marker),
+    /// A torn create: no committed data can predate the header fsync, so
+    /// the caller recreates over it (ADR 0018).
+    TornCreate,
+}
+
+/// Parse magic, version, reserved word, and the torn-create shapes
+/// (ADR 0018). Version and reserved are checked the moment they are
+/// readable — before any recreate decision — so a truncated file from a
+/// future format is refused, never rewritten over.
+fn parse_header(bytes: &[u8], path: &Path) -> Result<HeaderState, StoreError> {
+    // A strict prefix of the magic is a torn create; anything else foreign.
+    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC {
+        if MAGIC.starts_with(bytes) {
+            return Ok(HeaderState::TornCreate);
+        }
+        return Err(StoreError::Foreign {
+            path: path.to_owned(),
+        });
+    }
+    let version = if bytes.len() >= 10 {
+        Some(u16::from_le_bytes(
+            bytes[8..10].try_into().expect("version field"),
+        ))
+    } else {
+        None
+    };
+    if let Some(version) = version
+        && version != 0
+        && version != FORMAT_VERSION
+    {
+        return Err(StoreError::UnsupportedVersion {
+            path: path.to_owned(),
+            found: version,
+            supported: FORMAT_VERSION,
+        });
+    }
+    let reserved = (bytes.len() >= 12)
+        .then(|| u16::from_le_bytes(bytes[10..12].try_into().expect("reserved field")));
+    if let Some(reserved) = reserved
+        && version == Some(FORMAT_VERSION)
+        && reserved != 0
+    {
+        return Err(StoreError::UnsupportedVersion {
+            path: path.to_owned(),
+            found: reserved,
+            supported: FORMAT_VERSION,
+        });
+    }
+    // A torn create is a file that cannot hold committed data — the
+    // header write is one prefix, and frames only ever follow its fsync:
+    // a file too short to hold the header, or a full-length header that
+    // carries nothing (zero version, zero reserved, a marker claiming no
+    // commits — the crash-inside-create state, where the size is durable
+    // but the page is not), is recreated (ADR 0018).
+    if bytes.len() < HEADER_LEN {
+        return Ok(HeaderState::TornCreate);
+    }
+    // `bytes.len() >= HEADER_LEN` holds here, so the reserved word was
+    // readable above.
+    let marker = parse_marker(&bytes[HWM_OFFSET..HEADER_LEN]);
+    if version == Some(0) {
+        if bytes.len() == HEADER_LEN
+            && reserved == Some(0)
+            && !matches!(marker, Marker::Committed(1..))
+        {
+            return Ok(HeaderState::TornCreate);
+        }
+        // A zero version beside frames — or beside a marker that claims
+        // commits — is damage or foreign: refused, never recreated over,
+        // or one flipped bit would silently wipe every committed op
+        // (ADR 0018).
+        return Err(StoreError::UnsupportedVersion {
+            path: path.to_owned(),
+            found: 0,
+            supported: FORMAT_VERSION,
+        });
+    }
+    Ok(HeaderState::Valid(marker))
+}
+
+/// One step of boot's frame walk (ADRs 0018, 0024): what the store-specific
+/// decoder found at an offset.
+enum Step<T> {
+    /// A valid frame: its sequence, the store's lifted record, and the
+    /// offset just past it.
+    Op { seq: u64, record: T, end: usize },
+    /// Structurally incomplete or checksum-failed — torn tail or mid-file
+    /// damage; the walk classifies by resync.
+    Invalid,
+    /// Checksum-valid bytes that cannot be a stored record — loud without
+    /// resync.
+    Corrupt(&'static str),
+}
+
+/// The client store's step: payload-decoded ops for replay (ADR 0018).
+fn scan_op_frame(bytes: &[u8], offset: usize) -> Step<SequencedOp> {
+    match scan_frame(bytes, offset) {
+        Scan::Op(record, end) => Step::Op {
+            seq: record.seq,
+            record,
+            end,
+        },
+        Scan::Invalid => Step::Invalid,
+        Scan::Corrupt(reason) => Step::Corrupt(reason),
+    }
+}
+
+/// The relay store's step: the record verbatim, payload string unopened
+/// (ADR 0024).
+fn scan_parts_frame(bytes: &[u8], offset: usize) -> Step<StoredOp> {
+    match scan_frame_parts(bytes, offset) {
+        ScanParts::Op(stored, end) => Step::Op {
+            seq: stored.seq,
+            record: stored,
+            end,
+        },
+        ScanParts::Invalid => Step::Invalid,
+        ScanParts::Corrupt(reason) => Step::Corrupt(reason),
+    }
+}
+
+/// Boot's frame walk (ADR 0018), shared by both stores: records in file
+/// order with their sequences checked monotonic and in the u32 marker's
+/// reach, the torn tail cut and the cut made durable, mid-file damage loud
+/// by resync proof. Returns the lifted records, the offset committed data
+/// ends at, and the highest sequence ever framed.
+fn walk_frames<T>(
+    file: &mut File,
+    bytes: &[u8],
+    path: &Path,
+    step: fn(&[u8], usize) -> Step<T>,
+) -> Result<(Vec<T>, u64, u64), StoreError> {
+    let mut records = Vec::new();
+    let mut offset = HEADER_LEN;
+    let mut prev_seq = 0u64;
+    while offset < bytes.len() {
+        match step(bytes, offset) {
+            Step::Op { seq, record, end } => {
+                // Records carry their sequences; the writer's are strictly
+                // increasing, 1-based, within the u32 marker's reach —
+                // anything else is tampering, loud (ADR 0018).
+                if seq == 0 || seq <= prev_seq || seq > u64::from(u32::MAX) {
+                    return Err(StoreError::Corrupt {
+                        path: path.to_owned(),
+                        offset: offset as u64,
+                        reason: "record sequence must increase within 1..=u32::MAX",
+                    });
+                }
+                prev_seq = seq;
+                records.push(record);
+                offset = end;
+            }
+            Step::Invalid => {
+                // Classify by resync: ONE checksum-valid frame beyond the
+                // damage proves mid-file corruption — loud, file
+                // untouched. No valid frame after it is the crash window's
+                // torn tail: cut it and make the cut durable (ADR 0018).
+                if valid_frame_follows(bytes, offset + 1) {
+                    return Err(StoreError::Corrupt {
+                        path: path.to_owned(),
+                        offset: offset as u64,
+                        reason: "frame is invalid but a valid frame follows it",
+                    });
+                }
+                file.set_len(offset as u64)?;
+                file.sync_all()?;
+                break;
+            }
+            Step::Corrupt(reason) => {
+                return Err(StoreError::Corrupt {
+                    path: path.to_owned(),
+                    offset: offset as u64,
+                    reason,
+                });
+            }
+        }
+    }
+    Ok((records, offset as u64, prev_seq))
+}
+
+/// The sequence a fresh append resumes from, per the marker and the
+/// highest framed sequence (ADR 0018): above everything ever acknowledged
+/// or ever claimed by a record on disk. A pending or torn marker grants
+/// nothing — its commit never acked.
+fn resume_above(marker: Marker, file_max: u64) -> u64 {
+    match marker {
+        Marker::Committed(committed) => committed.max(file_max),
+        Marker::Pending(_) | Marker::Torn => file_max,
+    }
+}
+
+/// One relay-served record (ADR 0024): sequence, server-visible metadata,
+/// and the payload as the exact string the transport carried.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PartsRow<'a> {
+    pub seq: u64,
+    pub meta: &'a OpMeta,
+    pub payload: &'a str,
+}
+
+/// The string-native oplog store (ADR 0024): [ADR 0018]'s durable format
+/// with the payload kept as the verbatim string the transport carried —
+/// never decoded, never validated. This is the rendezvous relay's whole
+/// durable state per scope, and the shape [ADR 0018] anticipated for the
+/// day the payload string holds ciphertext: what the string holds changes,
+/// the framing does not. Sequencing, `op_id` dedupe, scope fixity, the
+/// two-phase commit, torn-tail repair, and never-reuse-a-sequence follow
+/// [`LocalStore`] exactly — the one difference is that no payload
+/// interior is ever opened.
+#[derive(Debug)]
+pub struct OpaqueStore {
+    rows: Vec<StoredOp>,
+    seen: HashMap<OpId, u64>,
+    scope: Option<ScopeId>,
+    path: PathBuf,
+    file: File,
+    /// The file length the last successful commit covers — the boundary a
+    /// failed append rolls back to.
+    durable_len: u64,
+    /// The last acknowledged sequence — what the header's committed
+    /// marker holds (or would).
+    hwm: u64,
+    /// The sequence the next append assigns — resumed above everything
+    /// ever acknowledged or framed (ADR 0018).
+    next_seq: u64,
+    /// Set when a failed append could not roll back (ADR 0018).
+    poisoned: bool,
+}
+
+impl OpaqueStore {
+    /// Open (creating if absent) the store at `path`, rebuilding the
+    /// in-memory rows, `op_id` index, and scope from disk. An uncommitted
+    /// torn tail is repaired; foreign, corrupt, and unsupported files
+    /// fail loudly; committed sequences are never reused (ADR 0018). A
+    /// file mixing scopes is a loud [`StoreError::Scope`], exactly as a
+    /// client store's boot replay would refuse one.
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
+        let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self::empty(path, create_log_file(path)?));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let marker = match parse_header(&bytes, path)? {
+            HeaderState::TornCreate => {
+                rewrite_header(&mut file)?;
+                return Ok(Self::empty(path, file));
+            }
+            HeaderState::Valid(marker) => marker,
+        };
+        let (rows, durable_len, file_max) = walk_frames(&mut file, &bytes, path, scan_parts_frame)?;
+        let acked = resume_above(marker, file_max);
+        let mut scope = None;
+        let mut seen = HashMap::new();
+        for row in &rows {
+            if let Some(log_scope) = scope
+                && log_scope != row.meta.scope
+            {
+                return Err(LogError::ScopeMismatch {
+                    op_scope: row.meta.scope,
+                    log_scope,
+                }
+                .into());
+            }
+            scope = Some(row.meta.scope);
+            seen.insert(row.meta.op_id, row.seq);
+        }
+        Ok(Self {
+            rows,
+            seen,
+            scope,
+            path: path.to_owned(),
+            file,
+            durable_len,
+            hwm: acked,
+            next_seq: acked + 1,
+            poisoned: false,
+        })
+    }
+
+    /// Append one record from its wire parts; returns its canonical
+    /// sequence. The payload string is stored verbatim — no decode, no
+    /// validation, whatever it holds (ADR 0024). Scoping checks first (the
+    /// scope is metadata), then dedupe by `op_id`: re-appending returns
+    /// the original sequence and writes nothing, regardless of payload
+    /// bytes (safe retries, ADR 0007). The commit is two-phase exactly as
+    /// [`LocalStore::append`] (ADR 0018).
+    pub fn append_parts(&mut self, meta: OpMeta, payload: &str) -> Result<u64, StoreError> {
+        if self.poisoned {
+            return Err(StoreError::Poisoned {
+                path: self.path.clone(),
+            });
+        }
+        // The single-writer contract: the file must still end where the
+        // last commit left it.
+        if self.file.metadata()?.len() != self.durable_len {
+            return Err(StoreError::Corrupt {
+                path: self.path.clone(),
+                offset: self.durable_len,
+                reason: "file no longer ends at the committed boundary (single-writer contract violated)",
+            });
+        }
+        if let Some(log_scope) = self.scope
+            && log_scope != meta.scope
+        {
+            return Err(LogError::ScopeMismatch {
+                op_scope: meta.scope,
+                log_scope,
+            }
+            .into());
+        }
+        if self.scope.is_none() {
+            self.scope = Some(meta.scope);
+        }
+        if let Some(seq) = self.seen.get(&meta.op_id) {
+            return Ok(*seq);
+        }
+        let seq = self.next_seq;
+        let frame = encode_frame_parts(seq, &meta, payload)?;
+        let committed_len = self.durable_len;
+        let previous_marker = marker_bytes(Marker::Committed(self.hwm))?;
+        // Phase one: the frame and its PENDING marker, durable together.
+        // The pending marker grants nothing — a crash can tear either
+        // phase (ADR 0018).
+        let pending = marker_bytes(Marker::Pending(seq))?;
+        if let Err(e) = commit_frame(&mut self.file, committed_len, &frame, &pending) {
+            // Restore the previous marker, drop any partial frame, and
+            // make both durable; if even the rollback fails the store is
+            // unusable until reopened (ADR 0018).
+            if rollback(&mut self.file, &previous_marker, committed_len).is_err() {
+                self.poisoned = true;
+            }
+            return Err(e.into());
+        }
+        // Phase two: the COMMITTED marker — durable only after the frame
+        // is, so a durable committed marker implies a durable frame.
+        let committed_marker = marker_bytes(Marker::Committed(seq))?;
+        let phase_two = commit_marker(&mut self.file, &committed_marker);
+        self.durable_len = committed_len + frame.len() as u64;
+        self.hwm = seq;
+        // Scope and dedupe were checked above; this append cannot fail. A
+        // phase-two failure still leaves the frame durable and the rows
+        // consistent — boot resolves any marker state — so the append
+        // stands and the error reports the failed ack (ADR 0018).
+        self.seen.insert(meta.op_id, seq);
+        self.rows.push(StoredOp {
+            seq,
+            meta,
+            payload: payload.to_owned(),
+        });
+        self.next_seq = seq + 1;
+        phase_two?;
+        Ok(seq)
+    }
+
+    /// The records with sequence greater than `since`, in canonical
+    /// order, payloads verbatim (ADRs 0007, 0024) — the same contract as
+    /// [`LocalStore::delta_since`].
+    pub fn delta_parts_since(&self, since: u64) -> impl Iterator<Item = PartsRow<'_>> {
+        self.rows
+            .iter()
+            .skip_while(move |row| row.seq <= since)
+            .map(|row| PartsRow {
+                seq: row.seq,
+                meta: &row.meta,
+                payload: &row.payload,
+            })
+    }
+
+    /// The highest assigned sequence.
+    pub fn tip(&self) -> u64 {
+        self.rows.last().map(|row| row.seq).unwrap_or(0)
+    }
+
+    /// The scope this store is fixed to — an org's or a budget's — once
+    /// the first record fixes it (ADR 0021).
+    pub fn scope_id(&self) -> Option<ScopeId> {
+        self.scope
+    }
+
+    /// The canonical sequence already assigned to `op_id`, if this store
+    /// holds it — the dedupe lookup behind a push response's `stored`
+    /// flag (ADR 0024).
+    pub fn seq_of(&self, op_id: &OpId) -> Option<u64> {
+        self.seen.get(op_id).copied()
+    }
+
+    fn empty(path: &Path, file: File) -> Self {
+        Self {
+            rows: Vec::new(),
+            seen: HashMap::new(),
+            scope: None,
+            path: path.to_owned(),
+            file,
+            durable_len: HEADER_LEN as u64,
+            hwm: 0,
+            next_seq: 1,
+            poisoned: false,
+        }
     }
 }
 
@@ -1848,5 +2192,206 @@ mod tests {
             other => panic!("expected a version refusal, got {other:?}"),
         }
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "untouched");
+    }
+
+    // ------------------------------------------------------------------
+    // OpaqueStore (ADR 0024): the same durable format, string-native —
+    // the payload is never decoded, so bytes that are not choke-point
+    // output (the ciphertext E2EE will produce) round-trip verbatim.
+    // ------------------------------------------------------------------
+
+    /// The meta half of a deterministic op, for building records from
+    /// parts.
+    fn meta(op_rand: u64, scope: ScopeId) -> OpMeta {
+        let mut op = conv::op(op_rand, 10, 0, conv::amount(1).0, conv::amount(1).1);
+        op.scope = scope;
+        op.into_parts().0
+    }
+
+    fn budget_scope() -> ScopeId {
+        ScopeId::Budget(conv::budget())
+    }
+
+    fn org_scope() -> ScopeId {
+        ScopeId::Org(conv::org())
+    }
+
+    use crate::wire::OpPayload;
+
+    #[test]
+    fn opaque_rows_round_trip_verbatim_across_restarts() {
+        let tmp = TempDir::new("opaque-roundtrip");
+        let path = store_path(&tmp, "opaque");
+        let scope = budget_scope();
+        let payload = |text: &str| {
+            wire::encode_payload(&OpPayload {
+                entity_kind: crate::domain::EntityKind::Transaction,
+                entity_id: crate::ids::EntityId::new(v7(conv::ID_MS, 50)).unwrap(),
+                field: Field::Transaction(crate::domain::TransactionField::Memo),
+                value: Value::Text(text.into()),
+            })
+            .unwrap()
+        };
+        // A canonical payload string, and two that are NOT choke-point
+        // output — the ciphertext shapes E2EE will produce. All must ride
+        // untouched.
+        let plaintext = payload("groceries ₱");
+        let ciphertext = "enc:v1:AAAA-not-json-at-all==".to_string();
+        let keywrap = "{\"wrapped\":[\"opaque\",\"bytes\"]}".to_string();
+        let records = [
+            (meta(1, scope), plaintext),
+            (meta(2, scope), ciphertext.clone()),
+            (meta(3, scope), keywrap),
+        ];
+        let mut store = OpaqueStore::open(&path).unwrap();
+        for (i, (meta, payload)) in records.iter().enumerate() {
+            assert_eq!(
+                store.append_parts(meta.clone(), payload).unwrap(),
+                i as u64 + 1
+            );
+        }
+        assert_eq!(store.tip(), 3);
+        assert_eq!(store.scope_id(), Some(scope));
+        drop(store);
+
+        let reopened = OpaqueStore::open(&path).unwrap();
+        let rows: Vec<(u64, String)> = reopened
+            .delta_parts_since(0)
+            .map(|row| (row.seq, row.payload.to_owned()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, records[0].1.clone()),
+                (2, ciphertext),
+                (3, records[2].1.clone()),
+            ],
+            "payload strings ride verbatim, sequences dense"
+        );
+        // The cursor is exclusive, like the log's delta_since.
+        assert_eq!(reopened.delta_parts_since(2).next().unwrap().seq, 3);
+        assert!(reopened.delta_parts_since(3).next().is_none());
+    }
+
+    #[test]
+    fn opaque_dedupe_is_by_op_id_alone_across_restarts() {
+        let tmp = TempDir::new("opaque-dedupe");
+        let path = store_path(&tmp, "opaque");
+        let scope = budget_scope();
+        let first = meta(7, scope);
+        let mut store = OpaqueStore::open(&path).unwrap();
+        assert_eq!(store.append_parts(first.clone(), "first-bytes").unwrap(), 1);
+        // Same op_id, different payload bytes — the re-encrypted retry
+        // (ADR 0017): the original sequence comes back, nothing is
+        // written.
+        assert_eq!(store.append_parts(first.clone(), "other-bytes").unwrap(), 1);
+        assert_eq!(store.tip(), 1);
+        assert_eq!(store.seq_of(&first.op_id), Some(1));
+        drop(store);
+
+        let mut reopened = OpaqueStore::open(&path).unwrap();
+        assert_eq!(reopened.tip(), 1);
+        assert_eq!(
+            reopened.append_parts(first, "post-restart retry").unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened.append_parts(meta(8, scope), "fresh").unwrap(),
+            2,
+            "the sequence space continues"
+        );
+    }
+
+    #[test]
+    fn a_foreign_scope_is_rejected_at_append_and_boot() {
+        let tmp = TempDir::new("opaque-scope");
+        let path = store_path(&tmp, "opaque");
+        let mut store = OpaqueStore::open(&path).unwrap();
+        store
+            .append_parts(meta(1, budget_scope()), "bytes")
+            .unwrap();
+        // At append: the scope is metadata — exactly what a relay routes
+        // on (ADR 0021).
+        assert!(matches!(
+            store.append_parts(meta(2, org_scope()), "bytes"),
+            Err(StoreError::Scope(LogError::ScopeMismatch { .. }))
+        ));
+        assert_eq!(store.tip(), 1);
+        drop(store);
+
+        // At boot: a file mixing scopes is hand-crafted by appending a
+        // foreign record's frame behind the store's back.
+        let foreign = meta(2, org_scope());
+        let frame = encode_frame_parts(2, &foreign, "smuggled").unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&frame).unwrap();
+        drop(file);
+        assert!(matches!(
+            OpaqueStore::open(&path),
+            Err(StoreError::Scope(LogError::ScopeMismatch { .. }))
+        ));
+    }
+
+    #[test]
+    fn both_stores_read_the_same_file_format() {
+        // A relay-written file whose payloads happen to decode boots in
+        // the client store and replays identically — one format, two
+        // readers (ADRs 0018, 0024).
+        let tmp = TempDir::new("opaque-format");
+        let path = store_path(&tmp, "shared");
+        let (field, value) = conv::amount(42);
+        let ops: Vec<Op> = (1..=3)
+            .map(|i| conv::op(i, 10 + i, 0, field, value.clone()))
+            .collect();
+        let mut relay = OpaqueStore::open(&path).unwrap();
+        for op in &ops {
+            let (meta, payload) = op.clone().into_parts();
+            relay
+                .append_parts(meta, &wire::encode_payload(&payload).unwrap())
+                .unwrap();
+        }
+        drop(relay);
+
+        let client = LocalStore::open(&path).unwrap();
+        assert_eq!(
+            boot_session(&client).state(),
+            in_memory_session(&ops).state()
+        );
+    }
+
+    #[test]
+    fn an_opaque_torn_tail_is_repaired_and_sequences_are_not_reused() {
+        let tmp = TempDir::new("opaque-torn");
+        let path = store_path(&tmp, "opaque");
+        let scope = budget_scope();
+        let mut store = OpaqueStore::open(&path).unwrap();
+        store.append_parts(meta(1, scope), "one").unwrap();
+        store.append_parts(meta(2, scope), "two").unwrap();
+        drop(store);
+
+        // Tear the tail mid-frame, inside record 3's frame.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let full_len = bytes.len();
+        store = OpaqueStore::open(&path).unwrap();
+        store
+            .append_parts(meta(3, scope), "three-plus-padding")
+            .unwrap();
+        drop(store);
+        bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(full_len + 6);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reopened = OpaqueStore::open(&path).unwrap();
+        assert_eq!(reopened.tip(), 2, "the torn frame grants nothing");
+        assert_eq!(
+            reopened
+                .append_parts(meta(4, scope), "after-repair")
+                .unwrap(),
+            4,
+            "the committed-but-lost sequence 3 is never reused — a visible \
+             gap, exactly as the client store's repair contract (ADR 0018)"
+        );
+        let rows: Vec<u64> = reopened.delta_parts_since(0).map(|r| r.seq).collect();
+        assert_eq!(rows, vec![1, 2, 4]);
     }
 }
