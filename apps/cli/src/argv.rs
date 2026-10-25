@@ -89,7 +89,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, UsageError> {
                 Ok(Cmd::Help)
             } else {
                 Err(UsageError(format!(
-                    "--help takes no arguments, got {rest:?}"
+                    "{first:?} takes no arguments, got {rest:?}"
                 )))
             }
         }
@@ -98,7 +98,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, UsageError> {
                 Ok(Cmd::Version)
             } else {
                 Err(UsageError(format!(
-                    "--version takes no arguments, got {rest:?}"
+                    "{first:?} takes no arguments, got {rest:?}"
                 )))
             }
         }
@@ -231,8 +231,18 @@ mod tests {
         assert_eq!(parse(&args(&["--help"])), Ok(Cmd::Help));
         assert_eq!(parse(&args(&["help"])), Ok(Cmd::Help));
         assert_eq!(parse(&args(&["--version"])), Ok(Cmd::Version));
-        // Trailing words are not swallowed.
-        assert!(parse(&args(&["help", "me"])).is_err());
-        assert!(parse(&args(&["--version", "extra"])).is_err());
+        // Trailing words are not swallowed, and the message names the
+        // invoked alias.
+        for (line, alias) in [
+            (args(&["help", "me"]), "help"),
+            (args(&["--version", "x"]), "--version"),
+        ] {
+            let err = parse(&line).err().unwrap();
+            assert!(
+                err.to_string()
+                    .contains(&format!("{alias:?} takes no arguments")),
+                "{err}"
+            );
+        }
     }
 }

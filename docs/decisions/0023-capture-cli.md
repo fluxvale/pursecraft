@@ -104,9 +104,12 @@ complete, minimal world and every later `add` re-ensures it read-then-mint:
    retries idempotent — a retry reuses entity ids, never mints twins.
    Publishing mirrors the core store's create discipline
    ([ADR 0018](0018-local-oplog-store.md)): a process-unique tmp file, file
-   fsync, atomic rename, directory fsync — then a read-back, so a concurrent
-   first-run creator whose rename loses the race fails loudly instead of
-   minting ops against a root it does not hold. A corrupt or future-version
+   fsync, atomic rename, directory fsync — then a read-back, so the common
+   concurrent first-run interleavings fail loudly instead of minting ops
+   against a root the loser does not hold (a rename landing in the
+   microsecond gap between another creator's rename and its read-back can
+   still slip through — accepted for a single-user CLI; a lock file is the
+   heavier closure if that ever matters). A corrupt or future-version
    identity file is refused loudly, never overwritten; deleting it orphans
    the stores (the file is the root).
 2. **Org log** — personal-org provisioning via the core's

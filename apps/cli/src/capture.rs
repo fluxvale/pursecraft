@@ -95,6 +95,12 @@ pub enum CaptureError {
         wanted: String,
         known: Vec<String>,
     },
+    /// The bootstrapped account is dead or missing — a loud dead-default
+    /// error, never a silent fabrication that `list` would then hide the
+    /// transaction behind.
+    NoDefaultAccount {
+        known: Vec<String>,
+    },
     /// The payee positional was empty (argv rejects this; the public API
     /// defends it too).
     EmptyPayee,
@@ -117,6 +123,20 @@ impl fmt::Display for CaptureError {
                     write!(
                         f,
                         "unknown account {wanted:?} (known: {})",
+                        known.join(", ")
+                    )
+                }
+            }
+            Self::NoDefaultAccount { known } => {
+                if known.is_empty() {
+                    write!(
+                        f,
+                        "the bootstrapped account no longer exists and no account does; pass --account after creating one"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "the bootstrapped account no longer exists (known: {}; pass --account <name>)",
                         known.join(", ")
                     )
                 }
@@ -462,19 +482,17 @@ fn resolve_account(
         .collect();
     accounts.sort();
     let find_by_name = |name: &str| accounts.iter().find(|(_, known)| known == name).cloned();
+    let known = || accounts.iter().map(|(_, name)| name.clone()).collect();
     match wanted {
         Some(wanted) => find_by_name(wanted).ok_or_else(|| CaptureError::UnknownAccount {
             wanted: wanted.to_owned(),
-            known: accounts.into_iter().map(|(_, name)| name).collect(),
+            known: known(),
         }),
         None => accounts
             .iter()
             .find(|(id, _)| *id == default)
             .cloned()
-            .ok_or_else(|| CaptureError::UnknownAccount {
-                wanted: ACCOUNT_NAME.to_owned(),
-                known: accounts.into_iter().map(|(_, name)| name).collect(),
-            }),
+            .ok_or_else(|| CaptureError::NoDefaultAccount { known: known() }),
     }
 }
 
@@ -892,6 +910,55 @@ mod tests {
             organization(org_session.state()).unwrap().name.as_deref(),
             Some(ORG_NAME)
         );
+    }
+
+    /// Crash window D: a capture tore after only its account op landed —
+    /// `list` shows the transaction with `?` cells, never a faked
+    /// `0.000`/blank (ADR 0023).
+    #[test]
+    fn a_torn_transaction_renders_unknown_cells() {
+        let tmp = TempDir::new("torn-txn");
+        let home = tmp.path();
+        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        let identity = load_identity(home).unwrap().unwrap();
+        let torn = EntityId::new(mint_uuid()).unwrap();
+        seed_budget_op(
+            home,
+            &identity,
+            Op {
+                op_id: OpId::new(mint_uuid()).unwrap(),
+                scope: ScopeId::Budget(identity.budget_id),
+                device_id: identity.device_id,
+                user_id: identity.user_id,
+                entity_kind: EntityKind::Transaction,
+                entity_id: torn,
+                field: Field::Transaction(TransactionField::AccountId),
+                value: Value::Id(identity.account_id),
+                hlc: Hlc {
+                    physical_ms: 1_000,
+                    logical: 0,
+                },
+            },
+        );
+
+        let list = crate::list::list(home).unwrap();
+        let torn_row = list
+            .lines()
+            .find(|l| l.contains('?'))
+            .unwrap_or_else(|| panic!("no torn row rendered\n{list}"));
+        // The amount column starts at 38 (10 date + 3 + 24 payee + 1).
+        assert_eq!(
+            torn_row[38..].trim(),
+            "?",
+            "a faked amount would hide the tear\n{list}"
+        );
+        assert!(!torn_row.contains("0.000"));
+        assert_eq!(
+            torn_row[..10].trim(),
+            "?",
+            "the torn date cell renders ? too"
+        );
+        assert!(list.contains("2 transactions"), "{list}");
     }
 
     #[test]
