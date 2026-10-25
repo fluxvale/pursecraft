@@ -33,7 +33,7 @@ struct SealedKeys {
 }
 
 fn sealed_keys(scope: ScopeId, org: OrgId) -> (ScopeCipher, SealedKeys) {
-    let device = DeviceKeypair::generate();
+    let device = DeviceKeypair::generate().unwrap();
     let secret = *device.to_secret_bytes();
     let mut chain = KeyChain::new(device);
     let org_wrap = chain.create_org(org).unwrap();
@@ -103,7 +103,7 @@ fn cipher() -> ScopeCipher {
     let org = OrgId::new(v7(conv::ID_MS, 1)).unwrap();
     let org_scope = ScopeId::Org(org);
     let budget_scope = ScopeId::Budget(conv::budget());
-    let mut chain = KeyChain::new(DeviceKeypair::generate());
+    let mut chain = KeyChain::new(DeviceKeypair::generate().unwrap());
     chain.create_org(org).unwrap();
     chain.add_log(org, org_scope).unwrap();
     chain.add_log(org, budget_scope).unwrap();
@@ -265,7 +265,7 @@ fn booting_a_ciphered_store_without_keys_is_cipher_error_not_corruption() {
     // A fresh device holds no keys: the refusal is a Cipher error —
     // intact bytes the reader cannot open (ADR 0022) — never
     // corruption, and the repair paths never touch the file.
-    let stranger = ScopeCipher::new(KeyChain::new(DeviceKeypair::generate()));
+    let stranger = ScopeCipher::new(KeyChain::new(DeviceKeypair::generate().unwrap()));
     match LocalStore::open_with(&path, stranger) {
         Err(StoreError::Cipher(_)) => {}
         other => panic!("expected a cipher refusal, got {other:?}"),

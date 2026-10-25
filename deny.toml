@@ -29,7 +29,9 @@ allow = [
     "FSL-1.1-ALv2",
     # The dalek family (x25519-dalek → curve25519-dalek → subtle) is
     # triple-licensed "MIT OR Apache-2.0 OR BSD-3-Clause"; the crypto
-    # lane's device-key wrapping pulled it in (ADR 0022). Deliberate
-    # addition, OSI/FSF-free, restricted to those deps' third option.
+    # lane's device-key wrapping pulled it in (ADR 0022). OSI/FSF-free.
+    # Note this allow list is global and descriptive of today's tree:
+    # any future BSD-3-Clause dep is admitted identically — adding one
+    # is a supply-chain decision to make consciously, not silently.
     "BSD-3-Clause",
 ]

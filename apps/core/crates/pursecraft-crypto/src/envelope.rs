@@ -10,9 +10,12 @@
 //!
 //! The shape is deliberately disjoint from a plaintext payload's (no
 //! `entity_kind`/`entity_id`/`field`/`value`, none of `v`/`e`/`n`/`c` on
-//! the plaintext side), so an envelope handed to a plaintext decoder — or
-//! plaintext handed to an envelope decoder — fails loudly, never
-//! silently: that is the strip/downgrade defense (ADR 0022).
+//! the plaintext side), and the envelope decoder refuses unknown fields,
+//! so no string parses as both — an envelope handed to a plaintext
+//! decoder, plaintext handed to an envelope decoder, or a doctored
+//! union of the two all fail loudly, never silently: that is the
+//! strip/downgrade defense (ADR 0022). Behind it, the AEAD remains the
+//! real gate — nothing decodes without authenticating.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,10 +24,14 @@ use zeroize::Zeroizing;
 use crate::error::CryptoError;
 use crate::keys::{DataKey, FORMAT_VERSION, aead_open, aead_seal};
 
-/// The wire shape of the envelope. Strict field types; unknown fields
-/// are ignored exactly like the lenient op decoder (ADR 0017) — the
-/// version marker is the gate, not field presence.
+/// The wire shape of the envelope. Strict field types, and strict on
+/// fields: unknown keys are refused, so no string parses as BOTH an
+/// envelope and a plaintext payload — that disjointness is the
+/// strip/downgrade defense (ADR 0022). (The plaintext payload decoder
+/// stays deliberately lenient per ADR 0017; strictness here alone makes
+/// the pair disjoint.) The version marker is the format gate.
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct EnvelopeWire {
     v: u16,
     e: u64,

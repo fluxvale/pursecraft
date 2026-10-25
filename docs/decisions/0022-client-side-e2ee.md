@@ -88,17 +88,30 @@ opener picks the right key without trial decryption.
   envelope with an epoch the reader lacks fails as `MissingEpoch` before
   any decryption, which is the signal to fetch new key material — the
   rendezvous lane's channel, not this slice.
+- **Honesty, a third way: revocation stops reads, not writes.** A
+  removed member still holds valid old-epoch keys and can keep *sealing*
+  new ops under them; survivors keep the history keys too, so those ops
+  decrypt and apply like any other. No keychain can detect this — the
+  removed member's own chain does not know it was removed. Gating op
+  submission on live membership is therefore an explicit requirement the
+  auth/rendezvous slice inherits (member-signed ops or server-side
+  membership checks at append), named here so it is a requirement, not a
+  surprise.
 - **Invites** wrap the current epoch key to the invitee's device (grant
   history by wrapping all past epoch keys too — both are one call; which
   policy applies is the capture lane's). New-device restore is the same
   operation.
-- **Adoption is explicit.** A keychain installs a wrapped key by calling
-  an install function with the wrap in hand; nothing auto-adopts key
-  material that arrives unbidden. Key-envelope **authenticity** (a member
-  proving a rotation is theirs) and **concurrent-rotation races** (two
-  survivors minting competing epoch N+1s) are the distribution channel's
-  contract — the rendezvous slice designs ordering/authentication there;
-  this slice ships the versioned formats it will carry.
+- **Adoption is explicit and one-per-slot.** A keychain installs a
+  wrapped key by calling an install function with the wrap in hand;
+  nothing auto-adopts key material that arrives unbidden. A slot that
+  already holds DIFFERENT material is a loud conflict — the
+  concurrent-rotation race (two survivors minting competing epoch N+1s)
+  is the rendezvous channel's to order, and this crate refuses to
+  resolve it silently; re-delivering the same key is an idempotent
+  no-op. Key-envelope **authenticity** (a member proving a rotation is
+  theirs) is likewise the distribution channel's contract — the
+  rendezvous slice designs ordering/authentication there; this slice
+  ships the versioned formats it will carry.
 
 ### Envelope v1 — the sealed payload format
 
@@ -117,13 +130,19 @@ debuggable like the rest of the wire (ADR 0017):
   plaintext and unauthenticated (ADR 0009); binding them would buy
   nothing — attribution authenticity is the auth slice's member-signing
   work.
-- **Shape-disjoint from plaintext by construction**: a v1 envelope has
-  none of `PayloadWire`'s required fields, and vice versa. An
-  envelope-mode decoder handed plaintext fails as *not an envelope*; a
-  plaintext decoder handed an envelope fails as *not a payload*. There is
-  no input both accept, so strip/downgrade confusion is loud in both
-  directions — the load-bearing property for "payload claiming encrypted
-  when not".
+- **Shape-disjoint from plaintext by construction**: the envelope
+  decoder refuses unknown fields, so a doctored string carrying both an
+  envelope's and a payload's fields parses as neither-side-trusted
+  input — an envelope-mode decoder handed any plaintext-flavored bytes
+  fails as *not an envelope*, and a plaintext decoder handed an
+  envelope fails as *not a payload* (it lacks every required payload
+  field). No input is accepted by both decoders, so strip/downgrade
+  confusion is loud in both directions — the load-bearing property for
+  "payload claiming encrypted when not". (The plaintext payload decoder
+  itself stays deliberately lenient per ADR 0017; the envelope's
+  strictness alone makes the pair disjoint. Behind the shapes, the AEAD
+  remains the gate: nothing inside an envelope is read without
+  authenticating.)
 - Envelope `v` is checked strictly; unknown versions fail loudly. Field
   types are strict. The format is now load-bearing alongside the wire
   format (ADR 0017) and freezes with it.
@@ -243,6 +262,10 @@ adapter in crypto — the CLI/API lanes get no new transitive deps).
 - The rendezvous slice inherits a stated contract: carry the versioned key
   records, at-least-once, origin-authenticated, and answer `MissingEpoch`
   with the current wraps. Concurrent rotation races are theirs to order.
+- Membership removal does not by itself stop a removed member from
+  writing stale-epoch ops survivors will honor (see the third honesty
+  clause above); membership-gated append is the auth slice's inherited
+  requirement.
 - Metadata attribution (`device_id`, `user_id`) remains forgeable by the
   transport until member signing lands (auth slice); state convergence is
   unaffected because resolution reads payload values only.

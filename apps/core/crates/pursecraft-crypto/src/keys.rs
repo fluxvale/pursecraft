@@ -15,7 +15,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey, StaticSecret};
+use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::b64serde;
@@ -132,12 +132,16 @@ pub struct DeviceKeypair {
 }
 
 impl DeviceKeypair {
-    /// A fresh keypair. Panics only if the OS random generator fails —
-    /// the dalek convention; nothing is half-created when it fires.
-    pub fn generate() -> Self {
-        Self {
-            secret: StaticSecret::random(),
-        }
+    /// A fresh keypair from the OS random generator. In line with the
+    /// crate's no-panic RNG stance, an OS RNG failure surfaces as
+    /// [`CryptoError::Rng`] — nothing is half-created when it fires.
+    pub fn generate() -> Result<Self, CryptoError> {
+        let bytes = Zeroizing::new(
+            <[u8; 32]>::try_generate().map_err(|e| CryptoError::Rng(e.to_string()))?,
+        );
+        Ok(Self {
+            secret: StaticSecret::from(*bytes),
+        })
     }
 
     /// Restore from keystore bytes ([`DeviceKeypair::to_secret_bytes`]).
@@ -282,9 +286,15 @@ pub(crate) fn wrap_org_key(
     key: &DataKey,
 ) -> Result<WrappedOrgKey, CryptoError> {
     let binding = org_binding(org, epoch);
-    let eph = EphemeralSecret::random();
-    let eph_public = XPublicKey::from(&eph).to_bytes();
-    let shared = eph.diffie_hellman(&XPublicKey::from(recipient.0));
+    // A single-use ephemeral by construction: minted as random bytes (an
+    // OS RNG failure surfaces as an error, not a panic), consumed by one
+    // ECDH, zeroized on drop.
+    let eph_secret = StaticSecret::from(
+        <[u8; 32]>::try_generate().map_err(|e| CryptoError::Rng(e.to_string()))?,
+    );
+    let eph_public =
+        x25519_dalek::x25519(eph_secret.to_bytes(), x25519_dalek::X25519_BASEPOINT_BYTES);
+    let shared = eph_secret.diffie_hellman(&XPublicKey::from(recipient.0));
     if !shared.was_contributory() {
         // A degenerate shared secret; refusing is standard X25519 hygiene.
         return Err(CryptoError::Auth);

@@ -64,8 +64,8 @@ fn pair() -> Pair {
     let org_scope = ScopeId::Org(org);
     let budget_scope = ScopeId::Budget(budget());
 
-    let mut a = KeyChain::new(DeviceKeypair::generate());
-    let b_device = DeviceKeypair::generate();
+    let mut a = KeyChain::new(DeviceKeypair::generate().unwrap());
+    let b_device = DeviceKeypair::generate().unwrap();
     let mut b = KeyChain::new(DeviceKeypair::from_secret_bytes(
         *b_device.to_secret_bytes(),
     ));
@@ -193,7 +193,7 @@ fn wrong_keys_are_rejected() {
     let sealed = p.a.seal_payload(&m, payload_json(1).as_bytes()).unwrap();
 
     // A complete outsider device: no key material at all.
-    let outsider = KeyChain::new(DeviceKeypair::generate());
+    let outsider = KeyChain::new(DeviceKeypair::generate().unwrap());
     assert_eq!(
         outsider.open_payload(&m, &sealed),
         Err(CryptoError::MissingEpoch {
@@ -207,7 +207,7 @@ fn wrong_keys_are_rejected() {
     // A member of a DIFFERENT org holding its own key for the same scope
     // id: the wrong key must fail authentication, never decode.
     let other_org = OrgId::new(v7(MS, 55)).unwrap();
-    let mut other = KeyChain::new(DeviceKeypair::generate());
+    let mut other = KeyChain::new(DeviceKeypair::generate().unwrap());
     other.create_org(other_org).unwrap();
     other.add_log(other_org, p.budget_scope).unwrap();
     assert_eq!(
@@ -217,7 +217,7 @@ fn wrong_keys_are_rejected() {
     );
 
     // A wrap addressed to the wrong device does not open for B.
-    let stranger = DeviceKeypair::generate();
+    let stranger = DeviceKeypair::generate().unwrap();
     let wraps =
         p.a.wrap_org_keys_to(&p.org, &stranger.public(), Grant::CurrentEpoch)
             .unwrap();
@@ -365,22 +365,169 @@ fn wraps_survive_their_wire_form_and_refuse_wrong_slots() {
 
     // Structural slots: a budget-scoped wrap needs its owning org named
     // (ADR 0021: the org of a budget log lives in the org log's data);
-    // the org-scoped install path refuses it outright.
-    let budget_wrap = p.a.add_log(p.org, p.budget_scope).unwrap();
+    // the org-scoped install path refuses it outright. A FRESH budget
+    // scope, because re-adding a registered scope is itself refused
+    // (asserted in add_log_and_create_org_refuse_re_registration).
+    let second_budget = ScopeId::Budget(BudgetId::new(v7(MS, 79)).unwrap());
+    let budget_wrap = p.a.add_log(p.org, second_budget).unwrap();
     assert_eq!(
         p.b.install_log_wrap(&budget_wrap),
         Err(CryptoError::WrongKeySlot),
         "a budget log wrap cannot install through the org-only path"
     );
     // And a scope registered under one org cannot gain keys through
-    // another org's epoch key: B holds none of the foreign org's keys,
-    // so the install fails loudly (no key material to try).
+    // another org's epoch key: B creates (and keys) the foreign org, so
+    // the org-key lookup SUCCEEDS and the refusal is the structural
+    // cross-org guard itself (chain.rs), not missing key material.
     let other_org = OrgId::new(v7(MS, 78)).unwrap();
-    assert!(
-        p.b.install_log_wrap_for_org(&budget_wrap, &other_org)
-            .is_err(),
-        "installing through a foreign org cannot succeed"
+    p.b.create_org(other_org).unwrap();
+    // Register the second budget under the REAL org on B first — via
+    // the org-scope-named install for its owning org.
+    p.b.install_log_wrap_for_org(&budget_wrap, &p.org).unwrap();
+    assert_eq!(
+        p.b.install_log_wrap_for_org(&budget_wrap, &other_org),
+        Err(CryptoError::WrongKeySlot),
+        "a scope registered under one org cannot gain keys through another"
     );
+}
+
+#[test]
+fn installs_refuse_to_swap_a_held_slot_but_redeliver_idempotently() {
+    // The rotation-race posture (ADR 0022): a slot may be filled once.
+    // DIFFERENT material for a held (org, epoch) slot is a loud
+    // conflict — never a silent swap that leaves this device holding a
+    // minority keyset; the SAME material (at-least-once redelivery, or
+    // the same key re-wrapped) is a no-op.
+    let mut p = pair();
+
+    // Same wrap, delivered twice: no-op.
+    let wraps =
+        p.a.wrap_org_keys_to(&p.org, &p.b.device_public(), Grant::CurrentEpoch)
+            .unwrap();
+    p.b.install_org_wrap(&wraps[0]).unwrap();
+    p.b.install_org_wrap(&wraps[0]).unwrap();
+
+    // A DIFFERENT org-epoch-0 key for the same org (a competing
+    // "creation", standing in for a competing rotation at one epoch):
+    // refused.
+    let mut rival = KeyChain::new(DeviceKeypair::generate().unwrap());
+    rival.create_org(p.org).unwrap();
+    let rival_wraps = rival
+        .wrap_org_keys_to(&p.org, &p.b.device_public(), Grant::CurrentEpoch)
+        .unwrap();
+    assert_eq!(
+        p.b.install_org_wrap(&rival_wraps[0]),
+        Err(CryptoError::WrongKeySlot),
+        "different material for a held org epoch slot is a loud conflict"
+    );
+
+    // The log-key side, in the realistic race shape: A rotates to
+    // epoch 1 (B installs the new org key and the rotation's log key),
+    // then a third chain C — holding the SAME epoch-1 org key — mints
+    // its own log key for the same (scope, epoch). The channel may
+    // deliver both; B must not silently adopt C's.
+    let rotation =
+        p.a.rotate(&p.org, &[p.a.device_public(), p.b.device_public()])
+            .unwrap();
+    let b_org_wraps =
+        p.a.wrap_org_keys_to(&p.org, &p.b.device_public(), Grant::CurrentEpoch)
+            .unwrap();
+    let mut c = KeyChain::new(DeviceKeypair::generate().unwrap());
+    // C receives A's invite wrap addressed to it — a distinct device.
+    let c_wraps =
+        p.a.wrap_org_keys_to(&p.org, &c.device_public(), Grant::CurrentEpoch)
+            .unwrap();
+    c.install_org_wrap(&c_wraps[0]).unwrap();
+    // B's own epoch-1 wrap carries the same key the rotation minted.
+    p.b.install_org_wrap(&b_org_wraps[0]).unwrap();
+    for wrap in &rotation.log_wraps {
+        match wrap.scope {
+            ScopeId::Org(_) => p.b.install_log_wrap(wrap).unwrap(),
+            ScopeId::Budget(_) => {
+                p.b.install_log_wrap_for_org(wrap, &p.org).unwrap();
+            }
+        }
+    }
+    // C mints a competing log key for (budget_scope, epoch 1) — a fresh
+    // registration on C's chain, sealed under the shared org key.
+    let competing = c.add_log(p.org, p.budget_scope).unwrap();
+    assert_eq!(
+        p.b.install_log_wrap_for_org(&competing, &p.org),
+        Err(CryptoError::WrongKeySlot),
+        "different material for a held log epoch slot is a loud conflict"
+    );
+    // And re-delivering the rotation's own wrap for that slot stays a
+    // no-op (B already installed it above).
+    for wrap in &rotation.log_wraps {
+        if wrap.scope == p.budget_scope {
+            p.b.install_log_wrap_for_org(wrap, &p.org).unwrap();
+        }
+    }
+}
+
+#[test]
+fn add_log_and_create_org_refuse_re_registration() {
+    let mut p = pair();
+    // One log, one registration: re-adding a registered scope (same org
+    // or cross-org) is refused — a silent replace would destroy every
+    // held epoch key for it (or re-bind it to another org, the hostile
+    // two-orgs-one-budget input installs refuse).
+    assert_eq!(
+        p.a.add_log(p.org, p.budget_scope),
+        Err(CryptoError::WrongKeySlot),
+        "re-adding a registered scope under its own org is refused"
+    );
+    let other_org = OrgId::new(v7(MS, 80)).unwrap();
+    assert_eq!(
+        p.a.add_log(other_org, p.budget_scope),
+        Err(CryptoError::WrongKeySlot),
+        "re-registering a scope under a different org is refused"
+    );
+    // And an org is creatable exactly once — even by a chain that only
+    // ever held later epochs (invited at epoch 3), so a down-mint
+    // inside an org with history is impossible.
+    let mut late_joiner = KeyChain::new(DeviceKeypair::generate().unwrap());
+    let mut minter = KeyChain::new(DeviceKeypair::generate().unwrap());
+    minter.create_org(p.org).unwrap();
+    for _ in 0..3 {
+        minter.rotate(&p.org, &[minter.device_public()]).unwrap();
+    }
+    let late = minter
+        .wrap_org_keys_to(&p.org, &late_joiner.device_public(), Grant::CurrentEpoch)
+        .unwrap();
+    late_joiner.install_org_wrap(&late[0]).unwrap();
+    assert_eq!(
+        late_joiner.create_org(p.org),
+        Err(CryptoError::WrongKeySlot),
+        "a chain that knows the org at all cannot re-create it"
+    );
+}
+
+#[test]
+fn no_string_parses_as_both_envelope_and_payload() {
+    // The strict-envelope half of the shape-disjointness (ADR 0022): a
+    // doctored UNION of an envelope and a plaintext payload — the only
+    // candidate for a string both decoders might accept — is refused by
+    // the envelope parser (unknown fields denied), while a real envelope
+    // round-trips.
+    let p = pair();
+    let m = meta(1, p.budget_scope);
+    let plaintext = payload_json(1);
+    let sealed = p.a.seal_payload(&m, plaintext.as_bytes()).unwrap();
+
+    let mut union: serde_json::Value = serde_json::from_str(&sealed).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
+    for (key, value) in payload.as_object().unwrap() {
+        union[key.as_str()] = value.clone();
+    }
+    let union = serde_json::to_string(&union).unwrap();
+    assert_eq!(
+        p.b.open_payload(&m, &union),
+        Err(CryptoError::NotAnEnvelope),
+        "an envelope carrying foreign payload fields is not an envelope"
+    );
+    // The untouched envelope still opens.
+    assert!(p.b.open_payload(&m, &sealed).is_ok());
 }
 
 #[test]
@@ -420,7 +567,7 @@ fn invites_grant_exactly_what_was_wrapped() {
 
     // A current-only invite to a fresh device grants no history: the
     // newcomer can read epoch 1 but not epoch 0.
-    let newcomer_device = DeviceKeypair::generate();
+    let newcomer_device = DeviceKeypair::generate().unwrap();
     let mut newcomer = KeyChain::new(DeviceKeypair::from_secret_bytes(
         *newcomer_device.to_secret_bytes(),
     ));

@@ -89,22 +89,31 @@ impl KeyChain {
     /// Mint an org's epoch-0 key and keep it. Returns the wrap to THIS
     /// device — the org creator's copy; the channel distributes wraps to
     /// later members (invites wrap from the holder side, so no other
-    /// wrap is needed at creation).
+    /// wrap is needed at creation). Refused if this chain knows the org
+    /// AT ALL — a down-mint inside an org that already has history is
+    /// exactly the misbinding this crate refuses.
     pub fn create_org(&mut self, org: OrgId) -> Result<WrappedOrgKey, CryptoError> {
-        let key = DataKey::generate()?;
-        let entry = self.orgs.entry(org).or_default();
-        if entry.epochs.contains_key(&0) {
+        if self.orgs.contains_key(&org) {
             return Err(CryptoError::WrongKeySlot);
         }
+        let key = DataKey::generate()?;
         let wrap = wrap_org_key(&self.device.public(), &org, 0, &key)?;
-        entry.epochs.insert(0, key);
+        self.orgs.entry(org).or_default().epochs.insert(0, key);
         Ok(wrap)
     }
 
     /// Mint a data key for `scope` (the org's own log or one of its
     /// budget logs) under the org's current epoch, and return the wrap
-    /// under that epoch key — the record other members install.
+    /// under that epoch key — the record other members install. One log,
+    /// one registration: re-adding a known scope would silently destroy
+    /// every held epoch key for it (and a cross-org re-add would re-bind
+    /// it, the hostile-input case installs refuse), so both are loud.
+    /// New epochs for an existing log come from [`KeyChain::rotate`] or
+    /// wraps, never from here.
     pub fn add_log(&mut self, org: OrgId, scope: ScopeId) -> Result<WrappedLogKey, CryptoError> {
+        if self.logs.contains_key(&scope) {
+            return Err(CryptoError::WrongKeySlot);
+        }
         let epoch = self.current_epoch(&org).ok_or(CryptoError::MissingEpoch {
             scope: ScopeId::Org(org),
             epoch: 0,
@@ -208,13 +217,15 @@ impl KeyChain {
     /// rotation). The wrap must be addressed to this device; its
     /// `(org, epoch)` identity is authenticated by the construction
     /// itself (ADR 0022) — doctored wraps fail and nothing is stored.
+    /// A slot already holding DIFFERENT material is a conflict — the
+    /// concurrent-rotation race the channel must order (ADR 0022) — and
+    /// is refused loudly; re-delivering the same key (at-least-once) is
+    /// an idempotent no-op.
     pub fn install_org_wrap(&mut self, wrap: &WrappedOrgKey) -> Result<(), CryptoError> {
         let key = open_org_wrap(&self.device, wrap)?;
-        self.orgs
-            .entry(wrap.org)
-            .or_default()
-            .epochs
-            .insert(wrap.epoch, key);
+        let epochs = &mut self.orgs.entry(wrap.org).or_default().epochs;
+        conflict_check(epochs.get(&wrap.epoch), &key)?;
+        epochs.insert(wrap.epoch, key);
         Ok(())
     }
 
@@ -271,6 +282,9 @@ impl KeyChain {
             org,
             epochs: HashMap::new(),
         });
+        // Same-slot conflict as in install_org_wrap: a differing key for
+        // an epoch this chain already holds is the rotation race — loud.
+        conflict_check(entry.epochs.get(&wrap.epoch), &key)?;
         entry.org = org;
         entry.epochs.insert(wrap.epoch, key);
         Ok(())
@@ -330,4 +344,17 @@ impl KeyChain {
         let epoch = self.highest_log_epoch(scope)?;
         Some((epoch, self.log_key(scope, epoch)?))
     }
+}
+
+/// Same-slot install policy (ADR 0022's rotation-race posture): a slot
+/// may be filled once; DIFFERENT material for a held slot is a loud
+/// conflict, identical material is an idempotent no-op (at-least-once
+/// redelivery). The byte comparison is local idempotence bookkeeping on
+/// keys this device already holds — not a protocol oracle — so plain
+/// equality is fine here.
+fn conflict_check(held: Option<&DataKey>, incoming: &DataKey) -> Result<(), CryptoError> {
+    if held.is_some_and(|held| held.as_bytes() != incoming.as_bytes()) {
+        return Err(CryptoError::WrongKeySlot);
+    }
+    Ok(())
 }
