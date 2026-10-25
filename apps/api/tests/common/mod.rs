@@ -98,7 +98,9 @@ pub struct TestRelay {
 }
 
 impl TestRelay {
-    /// A fresh relay with its own scratch data directory.
+    /// A fresh relay with its own scratch data directory (the only
+    /// constructor — `at` is private so a `Drop` that cleans up can never
+    /// delete a directory a caller handed in).
     pub fn new(label: &str) -> Self {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -109,7 +111,7 @@ impl TestRelay {
         Self::at(&dir)
     }
 
-    pub fn at(dir: &Path) -> Self {
+    fn at(dir: &Path) -> Self {
         let router = pursecraft_api::router(Arc::new(AppState::open(dir).unwrap()));
         Self {
             dir: dir.to_owned(),
@@ -174,8 +176,10 @@ impl TestRelay {
 
 impl Drop for TestRelay {
     /// Best-effort scratch cleanup, like the core testkit's `TempDir`:
-    /// a panicking test that leaks its directory is harmless. Fields
-    /// (the router, and its open store files) drop before this runs.
+    /// a panicking test that leaks its directory is harmless. `Drop::drop`
+    /// runs BEFORE the fields (router, open store files) drop, so the
+    /// removal may unlink still-open files — fine on POSIX, and cleanup
+    /// is best-effort anyway.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }

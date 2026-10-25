@@ -256,6 +256,32 @@ struct PushResult {
     stored: bool,
 }
 
+/// The pull route's query parameters, extracted inside the error
+/// envelope — even non-UTF-8 query bytes answer in the relay's one error
+/// shape, never axum's plain-text rejection (ADR 0024).
+struct PullQuery {
+    since: Option<u64>,
+    limit: Option<u64>,
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PullQuery {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let params: Query<std::collections::HashMap<String, String>> =
+            Query::from_request_parts(parts, &())
+                .await
+                .map_err(|e| ApiError::bad_request(format!("query does not decode: {e}")))?;
+        Ok(Self {
+            since: query_u64(&params, "since")?,
+            limit: query_u64(&params, "limit")?,
+        })
+    }
+}
+
 /// Parse an optional u64 query parameter inside the error envelope —
 /// every relay error answers in the same shape (ADR 0024).
 fn query_u64(
@@ -466,15 +492,16 @@ async fn pull_ops(
     State(state): State<Arc<AppState>>,
     Path((kind, id)): Path<(String, String)>,
     headers: HeaderMap,
-    Query(query): Query<std::collections::HashMap<String, String>>,
+    query: PullQuery,
 ) -> Result<impl IntoResponse, ApiError> {
     let device = authenticate(&state, &headers)?;
     let scope = parse_scope(&kind, &id)?;
     require_grant(&state, scope, device)?;
-    let since = query_u64(&query, "since")?.unwrap_or(0);
+    let since = query.since.unwrap_or(0);
     // At least one op per page, whatever the client asked: an empty page
     // that claims `has_more` is a shape this protocol never emits.
-    let limit = query_u64(&query, "limit")?
+    let limit = query
+        .limit
         .unwrap_or(DEFAULT_PULL_LIMIT as u64)
         .clamp(1, MAX_PULL_LIMIT as u64) as usize;
     let Some(store) = state.scope_log(scope, false)? else {

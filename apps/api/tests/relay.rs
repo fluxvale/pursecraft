@@ -475,6 +475,27 @@ async fn a_short_ack_batch_is_loud_client_side() {
     a.apply_push_ack(&lying, &[first, second]);
 }
 
+/// The ack contract's other half: a full-length batch whose acks claim
+/// ops they are not for is refused too — a lying relay cannot mislabel
+/// sequences onto the wrong ops.
+#[tokio::test]
+#[should_panic(expected = "an ack must echo the op it claims")]
+async fn a_mislabeled_ack_is_loud_client_side() {
+    let scope = budget_scope();
+    let (_relay, mut a, _b, mut rng) = synced_pair(scope, 2).await;
+    let first = a.mint(scope, &mut rng);
+    let second = a.mint(scope, &mut rng);
+    let swapped_echo = serde_json::json!({
+        "v": 1,
+        "results": [
+            { "op_id": serde_json::to_value(second.op_id).unwrap(), "seq": 1, "stored": true },
+            { "op_id": serde_json::to_value(first.op_id).unwrap(), "seq": 2, "stored": true },
+        ],
+        "tip": 2,
+    });
+    a.apply_push_ack(&swapped_echo, &[first, second]);
+}
+
 /// The running-clock expiry path: a code past its TTL is refused without
 /// a restart to prune it first (ADR 0024).
 #[tokio::test]
@@ -695,6 +716,22 @@ async fn the_auth_boundary_holds() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Even non-UTF-8 query bytes answer inside the error envelope —
+    // axum's plain-text rejection is not part of this protocol's surface.
+    let (status, body) = relay
+        .request(
+            "GET",
+            &format!("/v1/{}/ops?since=%FF", common::scope_path(scope)),
+            Some(&a.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].is_string(),
+        "the rejection is enveloped, not plain text: {body}"
+    );
 
     // A payload past the cap is refused without landing.
     let huge = a_mint(&a, scope, &mut rng);
