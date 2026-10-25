@@ -172,6 +172,15 @@ impl TestRelay {
     }
 }
 
+impl Drop for TestRelay {
+    /// Best-effort scratch cleanup, like the core testkit's `TempDir`:
+    /// a panicking test that leaks its directory is harmless. Fields
+    /// (the router, and its open store files) drop before this runs.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 // ---------------------------------------------------------------------
 // A simulated device: credentials plus the core's sync session.
 // ---------------------------------------------------------------------
@@ -426,6 +435,35 @@ impl SimDevice {
         self.outbox.len()
     }
 
+    /// Apply a push response's acks: every pushed op must come back
+    /// acked, in order, under its own id — a short or lying ack batch is
+    /// a loud client failure, never a silent outbox drop (ADR 0024's
+    /// hostile-server contract on the ack channel).
+    pub fn apply_push_ack(&mut self, body: &serde_json::Value, ops: &[Op]) {
+        let results = body["results"].as_array().expect("the ack lists results");
+        assert_eq!(
+            results.len(),
+            ops.len(),
+            "a short ack batch is loud: {} acks for {} pushed ops",
+            results.len(),
+            ops.len()
+        );
+        let sequenced: Vec<SequencedOp> = results
+            .iter()
+            .zip(ops)
+            .map(|(result, op)| {
+                let acked: OpId =
+                    serde_json::from_value(result["op_id"].clone()).expect("ack op_id decodes");
+                assert_eq!(acked, op.op_id, "an ack must echo the op it claims");
+                SequencedOp {
+                    seq: result["seq"].as_u64().expect("ack seq decodes"),
+                    op: op.clone(),
+                }
+            })
+            .collect();
+        self.session.apply_delta(&sequenced).unwrap();
+    }
+
     /// Push the outbox, then pull-and-apply until caught up (paging by
     /// `limit`; the received batch may be shuffled first — arrival order
     /// must not matter, ADR 0017). Returns `last_seen`.
@@ -444,17 +482,7 @@ impl SimDevice {
             // A pushed op is the sender's own next input: apply it locally
             // too (capture semantics — the minting device already holds
             // the op, so its session's watermark must advance).
-            let sequenced: Vec<SequencedOp> = body["results"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .zip(&ops)
-                .map(|(result, op)| SequencedOp {
-                    seq: result["seq"].as_u64().unwrap(),
-                    op: op.clone(),
-                })
-                .collect();
-            self.session.apply_delta(&sequenced).unwrap();
+            self.apply_push_ack(&body, &ops);
         }
         loop {
             let pull = self

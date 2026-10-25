@@ -798,10 +798,13 @@ impl OpaqueStore {
             }
             HeaderState::Valid(marker) => marker,
         };
-        let (rows, durable_len, file_max) = walk_frames(&mut file, &bytes, path, scan_parts_frame)?;
+        let (mut rows, durable_len, file_max) =
+            walk_frames(&mut file, &bytes, path, scan_parts_frame)?;
         let acked = resume_above(marker, file_max);
+        // Scope fixity: every row must carry the same scope — a mixed
+        // file is loud, exactly as LocalStore's boot replay refuses one
+        // (ADRs 0018, 0024).
         let mut scope = None;
-        let mut seen = HashMap::new();
         for row in &rows {
             if let Some(log_scope) = scope
                 && log_scope != row.meta.scope
@@ -813,8 +816,18 @@ impl OpaqueStore {
                 .into());
             }
             scope = Some(row.meta.scope);
-            seen.insert(row.meta.op_id, row.seq);
         }
+        // Dedupe follows [`LocalStore`]'s boot (ADR 0024): the FIRST row
+        // for an op_id wins — a crafted file's later twin is skipped,
+        // never served.
+        let mut seen = HashMap::new();
+        rows.retain(|row| match seen.entry(row.meta.op_id) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(row.seq);
+                true
+            }
+        });
         Ok(Self {
             rows,
             seen,
@@ -2357,6 +2370,36 @@ mod tests {
             boot_session(&client).state(),
             in_memory_session(&ops).state()
         );
+    }
+
+    #[test]
+    fn an_opaque_boot_collapses_duplicate_op_id_rows_first_wins() {
+        // A crafted file carrying the same op_id twice serves the FIRST
+        // row only — the same first-wins rule the client store's boot
+        // replay applies (ADRs 0018, 0024).
+        let tmp = TempDir::new("opaque-dup");
+        let path = store_path(&tmp, "opaque");
+        let scope = budget_scope();
+        let mut store = OpaqueStore::open(&path).unwrap();
+        store.append_parts(meta(1, scope), "first").unwrap();
+        drop(store);
+
+        // Hand-append a later twin frame under the same op_id (honest
+        // framing, monotonic sequence — only the id collides).
+        let twin = meta(1, scope);
+        let frame = encode_frame_parts(2, &twin, "smuggled-twin").unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&frame).unwrap();
+        drop(file);
+
+        let reopened = OpaqueStore::open(&path).unwrap();
+        let rows: Vec<(u64, &str)> = reopened
+            .delta_parts_since(0)
+            .map(|row| (row.seq, row.payload))
+            .collect();
+        assert_eq!(rows, vec![(1, "first")], "the twin is skipped, not served");
+        assert_eq!(reopened.tip(), 1);
+        assert_eq!(reopened.seq_of(&twin.op_id), Some(1));
     }
 
     #[test]

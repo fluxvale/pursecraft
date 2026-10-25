@@ -237,6 +237,18 @@ impl AuthDb {
         code: &str,
         device: DeviceId,
     ) -> Result<(), AuthError> {
+        self.redeem_pairing_code_at(scope, code, device, now_unix())
+    }
+
+    /// [`redeem_pairing_code`](Self::redeem_pairing_code) with an
+    /// explicit clock — the seam the expiry tests cross the TTL through.
+    pub fn redeem_pairing_code_at(
+        &mut self,
+        scope: ScopeId,
+        code: &str,
+        device: DeviceId,
+        now_unix: u64,
+    ) -> Result<(), AuthError> {
         let hash = sha256_hex(code);
         let key = scope_key(scope);
         let found = self
@@ -251,7 +263,7 @@ impl AuthDb {
         if record.scope != key {
             return Err(AuthError::InvalidPairingCode);
         }
-        if record.expires_at_unix <= now_unix() {
+        if record.expires_at_unix <= now_unix {
             return Err(AuthError::PairingCodeExpired);
         }
         let mut next = self.file.clone();
@@ -308,14 +320,24 @@ impl AuthDb {
 }
 
 /// Read the enrollment secret, creating it at first boot (mode 0600 —
-/// the operator reads it once and keeps it off the network).
+/// the operator reads it once and keeps it off the network). An emptied
+/// file is a loud boot failure, never a silent enrollment reopening: the
+/// operator who wants enrollment closed deletes the file only to mint a
+/// fresh secret (ADR 0024).
 fn ensure_enrollment_secret(data_dir: &Path) -> Result<String, AuthError> {
     let path = data_dir.join("enrollment.secret");
     match File::open(&path) {
         Ok(mut file) => {
             let mut secret = String::new();
             file.read_to_string(&mut secret)?;
-            return Ok(secret.trim_end().to_owned());
+            let secret = secret.trim_end().to_owned();
+            if secret.is_empty() {
+                return Err(AuthError::Io(io::Error::other(format!(
+                    "{} is empty — refill it with a fresh secret or delete it to regenerate",
+                    path.display()
+                ))));
+            }
+            return Ok(secret);
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),

@@ -1,6 +1,8 @@
 # 0013 — Domains, Hosting, and Single-Image Deployment
 
-- **Status:** Accepted
+- **Status:** Accepted — the sync server's storage row ("Axum + Postgres")
+  is amended by [ADR 0024](0024-rendezvous-sync-relay.md): the relay
+  persists in embedded per-scope log files, not Postgres.
 - **Date:** 2026-10-15
 
 ## Context

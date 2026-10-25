@@ -256,10 +256,19 @@ struct PushResult {
     stored: bool,
 }
 
-#[derive(Deserialize)]
-struct PullQuery {
-    since: Option<u64>,
-    limit: Option<usize>,
+/// Parse an optional u64 query parameter inside the error envelope —
+/// every relay error answers in the same shape (ADR 0024).
+fn query_u64(
+    params: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Result<Option<u64>, ApiError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse()
+            .map(Some)
+            .map_err(|e| ApiError::bad_request(format!("query parameter {key}: {e}"))),
+    }
 }
 
 #[derive(Serialize)]
@@ -457,16 +466,17 @@ async fn pull_ops(
     State(state): State<Arc<AppState>>,
     Path((kind, id)): Path<(String, String)>,
     headers: HeaderMap,
-    Query(query): Query<PullQuery>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let device = authenticate(&state, &headers)?;
     let scope = parse_scope(&kind, &id)?;
     require_grant(&state, scope, device)?;
-    let since = query.since.unwrap_or(0);
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_PULL_LIMIT)
-        .min(MAX_PULL_LIMIT);
+    let since = query_u64(&query, "since")?.unwrap_or(0);
+    // At least one op per page, whatever the client asked: an empty page
+    // that claims `has_more` is a shape this protocol never emits.
+    let limit = query_u64(&query, "limit")?
+        .unwrap_or(DEFAULT_PULL_LIMIT as u64)
+        .clamp(1, MAX_PULL_LIMIT as u64) as usize;
     let Some(store) = state.scope_log(scope, false)? else {
         return Ok((
             StatusCode::OK,

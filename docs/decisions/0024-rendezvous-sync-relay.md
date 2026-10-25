@@ -59,7 +59,10 @@ the server routes on, [ADR 0021]):
   (`stored: false` = `op_id` duplicate, safe retry) plus the log `tip`.
 - **Pull** returns `{ v, ops: [{ seq, meta, payload }], tip, has_more }`:
   ops with sequence greater than `since` (exclusive cursor — exactly
-  [`OpLog::delta_since`], [ADR 0017]), in canonical order, paged by `limit`.
+  [`OpLog::delta_since`], [ADR 0017]), in canonical order, paged by
+  `limit` (clamped to at least one op — an empty page claiming
+  `has_more` is a shape the relay never emits, so the pull loop always
+  terminates).
   The client's cursor is its `SyncSession::last_seen` — the **contiguous
   resume watermark**, so a pull can never strand an unprocessed op behind
   the cursor. The client decodes payloads itself; a payload that does not

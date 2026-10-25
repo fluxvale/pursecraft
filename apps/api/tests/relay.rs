@@ -283,7 +283,7 @@ async fn synced_pair(scope: ScopeId, count: usize) -> (TestRelay, SimDevice, Sim
 #[tokio::test]
 async fn a_tampered_payload_is_loud_on_every_client() {
     let scope = budget_scope();
-    let (mut relay, a, b, mut rng) = synced_pair(scope, 6).await;
+    let (mut relay, _a, b, mut rng) = synced_pair(scope, 6).await;
 
     // A malicious operator rewrites one stored payload — honest framing,
     // new bytes (the disk-level power ADR 0024 assumes).
@@ -294,33 +294,10 @@ async fn a_tampered_payload_is_loud_on_every_client() {
     rewrite_frames(&path, &records);
     relay.restart();
 
-    // A caught-up device re-pulling the log hits the tampered op and the
-    // decode is loud — the error propagates, nothing is skipped.
-    let err = a
-        .device
-        .pull(&mut relay, scope, 0, u64::MAX as usize)
-        .await
-        .err();
-    // The pull itself succeeds (bytes are well-framed); applying them is
-    // what fails — the client surface the transport slice owns.
-    assert!(err.is_none());
-    let pull = a
-        .device
-        .pull(&mut relay, scope, 0, u64::MAX as usize)
-        .await
-        .unwrap();
-    let mut applied = false;
-    for wire in &pull.ops {
-        match pursecraft_core::wire::decode_payload(&wire.payload) {
-            Ok(_) => {}
-            Err(_) => {
-                applied = true;
-            }
-        }
-    }
-    assert!(applied, "the tampered payload must fail decode loudly");
-
-    // A fresh device sees the same corruption, never a silent skip.
+    // The tampered bytes are well-framed, so the pull succeeds — and
+    // every client that syncs through the real machinery hits the loud
+    // decode failure, never a silent skip. (The caught-up-device variant
+    // is the swap test below.)
     let mut c = SimDevice::enroll(&mut relay, 3, 0).await;
     let code = b.device.mint_code(&mut relay, scope).await;
     c.device.pair(&mut relay, scope, &code).await;
@@ -457,6 +434,74 @@ async fn a_damaged_log_serves_nothing_loudly() {
         ),
         "a damaged log must fail loudly, got {result:?}"
     );
+
+    // The containment claim is pinned, not just stated: the same relay
+    // serves the undamaged scope next door.
+    let other = org_scope();
+    a.device.create_scope(&mut relay, other).await;
+    let (status, body) = relay
+        .request(
+            "GET",
+            &format!("/v1/{}/ops", common::scope_path(other)),
+            Some(&a.device.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A lying ack channel is loud client-side: the ack application refuses
+/// a batch shorter than the push — a server that acks ops it did not
+/// store cannot make the simulated client silently drop its outbox tail
+/// (ADR 0024's hostile-server contract, ack path).
+#[tokio::test]
+#[should_panic(expected = "a short ack batch is loud")]
+async fn a_short_ack_batch_is_loud_client_side() {
+    let scope = budget_scope();
+    let (_relay, mut a, _b, mut rng) = synced_pair(scope, 2).await;
+    let first = a.mint(scope, &mut rng);
+    let second = a.mint(scope, &mut rng);
+    let lying = serde_json::json!({
+        "v": 1,
+        "results": [{
+            "op_id": serde_json::to_value(first.op_id).unwrap(),
+            "seq": 1,
+            "stored": true,
+        }],
+        "tip": 1,
+    });
+    // One ack for two pushed ops: the same application path `sync` uses
+    // must refuse it.
+    a.apply_push_ack(&lying, &[first, second]);
+}
+
+/// The running-clock expiry path: a code past its TTL is refused without
+/// a restart to prune it first (ADR 0024).
+#[tokio::test]
+async fn an_expired_code_is_refused_by_the_running_clock() {
+    let scope = budget_scope();
+    let mut relay = TestRelay::new("expiry-running");
+    let a = Device::enroll(&mut relay).await;
+    let code = a.create_scope(&mut relay, scope).await;
+
+    // A second database instance over the persisted file: the code is on
+    // disk, and the redeem-time check sees the TTL directly.
+    let mut db = pursecraft_api::auth::AuthDb::open(&relay.dir).unwrap();
+    let joiner = pursecraft_core::ids::DeviceId::new(uuid::Uuid::nil()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let past_ttl = now + pursecraft_api::auth::PAIRING_TTL_SECS + 1;
+    assert!(matches!(
+        db.redeem_pairing_code_at(scope, &code, joiner, past_ttl),
+        Err(pursecraft_api::auth::AuthError::PairingCodeExpired)
+    ));
+    // Within the TTL the same code still redeems — the boundary is the
+    // TTL, not the check.
+    let joiner = pursecraft_core::ids::DeviceId::new(uuid::Uuid::max()).unwrap();
+    db.redeem_pairing_code_at(scope, &code, joiner, now)
+        .unwrap();
 }
 
 #[tokio::test]
@@ -742,10 +787,4 @@ fn a_mint(device: &Device, scope: ScopeId, rng: &mut Rng) -> pursecraft_core::op
             logical: 0,
         },
     }
-}
-
-/// The payload string for an op, test-side.
-#[allow(dead_code)]
-fn payload_of(op: &pursecraft_core::ops::Op) -> String {
-    encode_payload(&op.clone().into_parts().1).unwrap()
 }
