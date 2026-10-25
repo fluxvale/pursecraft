@@ -51,8 +51,8 @@ pursecraft list
   field, [ADR 0011](0011-capture-first-mobile.md)), a signed amount, today's
   date by default, the bootstrapped account by default. It is quiet by
   default: one confirmation line showing exactly what was stored —
-  `added coffee -4.500 on 2026-10-25 (Wallet)` — plus a bootstrap line the
-  first time anything is created. Feedback first, never noise.
+  `added coffee -4.500 on 2026-10-25 (Wallet, new payee)` — plus a bootstrap
+  line the first time anything is created. Feedback first, never noise.
 - **`list`** is a minimal recap, not a browser: the last 10 visible
   transactions newest-first (date, resolved payee, exact 3-decimal amount),
   with a count footer. Visibility and payee resolution come from the core's
@@ -96,14 +96,19 @@ Transactions and their payees/accounts live in the **budget log**; the
 ([ADR 0021](0021-organizations-own-budgets.md)). The first `add` bootstraps a
 complete, minimal world and every later `add` re-ensures it read-then-mint:
 
-1. **Identity file** (`<home>/identity.json`, written atomically via
-   tmp+rename before any op exists): `device_id`, `user_id` (auth is later;
-   both minted locally as opaque UUIDv4 per [ADR 0016](0016-core-domain-model.md)'s
+1. **Identity file** (`<home>/identity.json`, published durably and alone
+   before any op exists): `device_id`, `user_id` (auth is later; both minted
+   locally as opaque UUIDv4 per [ADR 0016](0016-core-domain-model.md)'s
    any-version rule), plus the bootstrapped `org_id`, `membership_id`,
    `budget_id`, and `account_id`. Persisting the ids is what makes bootstrap
-   retries idempotent — a retry reuses entity ids, never mints twins. A
-   corrupt or future-version identity file is refused loudly, never
-   overwritten; deleting it orphans the stores (the file is the root).
+   retries idempotent — a retry reuses entity ids, never mints twins.
+   Publishing mirrors the core store's create discipline
+   ([ADR 0018](0018-local-oplog-store.md)): a process-unique tmp file, file
+   fsync, atomic rename, directory fsync — then a read-back, so a concurrent
+   first-run creator whose rename loses the race fails loudly instead of
+   minting ops against a root it does not hold. A corrupt or future-version
+   identity file is refused loudly, never overwritten; deleting it orphans
+   the stores (the file is the root).
 2. **Org log** — personal-org provisioning via the core's
    `provision_personal_org` (the read-then-mint contract's reference
    implementation: it probes the booted org state and emits only missing
@@ -148,18 +153,23 @@ $XDG_DATA_HOME/pursecraft/      (default on unix)
 
 Non-unix falls back to `~/.pursecraft`. The single-writer contract is
 [ADR 0018](0018-local-oplog-store.md)'s: one CLI invocation at a time per
-home; a racing append fails loudly rather than corrupting.
+home; a racing append — or a racing first-run identity create — fails loudly
+rather than corrupting or silently forking the world.
 
 ### Dependencies and safety rails
 
-`uuid` (v7 feature — id minting, [ADR 0007](0007-oplog-sync-protocol.md)),
+`uuid` (id bit handling only — v7 ids are minted in this crate from the
+clock and OS entropy, so no `rng` feature and no `rand` tree),
 `serde`/`serde_json` (identity file; already in the lockfile), and `jiff`
 (std-only, local civil date for the `today` default — a UTC-only "today"
 would misdate every capture west of midnight UTC; license `Unlicense OR MIT`,
-satisfied by the deny-list's MIT). No floats (workspace guard), no `unsafe`
+satisfied by the deny-list's MIT; the resolved unix build pulls just
+`jiff-core`, while Cargo.lock additionally pins jiff's optional and
+other-target dependencies). No floats (workspace guard), no `unsafe`
 (workspace forbid) — which rules out `std::env::set_var` in tests, so the
-library is fully injectable: explicit home paths, explicit `today`, argv as a
-slice; `main.rs` is the only place env and clock are read.
+library is fully injectable: explicit home paths, explicit `today`, argv as
+a slice; the environment is read only in `data_home()` and the thin
+`main.rs` (help, version, and usage errors answer without touching it).
 
 ## Alternatives considered
 

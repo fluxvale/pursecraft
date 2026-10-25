@@ -53,6 +53,12 @@ pub enum IdentityError {
         path: PathBuf,
         found: u16,
     },
+    /// A concurrent creator published a different identity and ours lost
+    /// the rename race; retry the command (ADR 0023 — the loser must not
+    /// mint ops into a world whose root it does not hold).
+    Raced {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for IdentityError {
@@ -66,6 +72,10 @@ impl fmt::Display for IdentityError {
             Self::Unsupported { path, found } => write!(
                 f,
                 "{path:?} has identity version {found}, this pursecraft supports {IDENTITY_VERSION}"
+            ),
+            Self::Raced { path } => write!(
+                f,
+                "{path:?} was created concurrently by another pursecraft; rerun the command"
             ),
         }
     }
@@ -94,8 +104,9 @@ impl std::error::Error for NoHomeError {}
 
 /// Resolve the data home from explicit overrides (ADR 0023): the pure core
 /// of [`data_home`] so resolution is testable without touching the process
-/// environment. `env` wins outright; then XDG + `pursecraft`; then the
-/// user home + the platform suffix.
+/// environment. `env` wins outright; then XDG + `pursecraft` (a relative
+/// XDG value is ignored, per the XDG spec); then the user home + the
+/// platform suffix.
 pub fn resolve_home(
     env: Option<&str>,
     xdg: Option<&str>,
@@ -104,7 +115,10 @@ pub fn resolve_home(
     if let Some(env) = env.filter(|s| !s.is_empty()) {
         return Ok(PathBuf::from(env));
     }
-    if let Some(xdg) = xdg.filter(|s| !s.is_empty()) {
+    if let Some(xdg) = xdg
+        .filter(|s| !s.is_empty())
+        .filter(|s| Path::new(s).is_absolute())
+    {
         return Ok(PathBuf::from(xdg).join("pursecraft"));
     }
     match user.filter(|s| !s.is_empty()) {
@@ -122,7 +136,7 @@ fn home_suffix() -> &'static str {
 /// The per-user data suffix under the home directory.
 #[cfg(not(unix))]
 fn home_suffix() -> &'static str {
-    "pursecraft"
+    ".pursecraft"
 }
 
 /// The data home of this process (ADR 0023): `PURSECRAFT_HOME`, then
@@ -181,15 +195,40 @@ pub fn load_or_create_identity(home: &Path) -> Result<(Identity, bool), Identity
         budget_id: BudgetId::new(mint_uuid()).expect("minted v7"),
         account_id: EntityId::new(mint_uuid()).expect("minted v7"),
     };
-    // Atomic publish: tmp file in the same directory, then rename.
+    publish_identity(home, &identity)?;
+    Ok((identity, true))
+}
+
+/// Publish a freshly minted identity durably and alone: a process-unique
+/// tmp file (a concurrent creator writes its own), file fsync, atomic
+/// rename, then a directory fsync — the core store's create discipline
+/// (ADR 0018). Finally the published file is read back: if a concurrent
+/// creator's rename landed after ours, ours lost, and the caller fails
+/// loudly instead of minting ops against a root it does not hold.
+fn publish_identity(home: &Path, identity: &Identity) -> Result<(), IdentityError> {
     let path = identity_path(home);
-    let tmp = home.join(format!("{IDENTITY_FILE}.tmp"));
+    let tmp = home.join(format!("{IDENTITY_FILE}.{}.tmp", std::process::id()));
     let mut file = fs::File::create(&tmp)?;
-    let encoded = serde_json::to_string_pretty(&identity).map_err(IdentityError::Encode)?;
+    let encoded = serde_json::to_string_pretty(identity).map_err(IdentityError::Encode)?;
     file.write_all(encoded.as_bytes())?;
     file.sync_all()?;
     fs::rename(&tmp, &path)?;
-    Ok((identity, true))
+    sync_dir(home);
+    if read_identity(&path)? != *identity {
+        return Err(IdentityError::Raced { path });
+    }
+    Ok(())
+}
+
+/// Best-effort durability of a freshly created file's directory entry
+/// (POSIX; the core's `sync_parent_dir` discipline, ADR 0018).
+fn sync_dir(home: &Path) {
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(home) {
+        let _ = dir.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = home;
 }
 
 /// Read and validate the identity file at `path`.
@@ -220,6 +259,12 @@ mod tests {
         assert_eq!(env.unwrap(), PathBuf::from("/x/env"));
         let xdg = resolve_home(None, Some("/x/xdg"), Some("/x/home"));
         assert_eq!(xdg.unwrap(), PathBuf::from("/x/xdg/pursecraft"));
+        // A relative XDG value is ignored per the XDG spec.
+        let relative = resolve_home(None, Some("rel/xdg"), Some("/x/home"));
+        assert_eq!(
+            relative.unwrap(),
+            PathBuf::from("/x/home").join(home_suffix())
+        );
         let home = resolve_home(None, None, Some("/x/home"));
         assert_eq!(home.unwrap(), PathBuf::from("/x/home").join(home_suffix()));
         assert_eq!(resolve_home(None, None, None), Err(NoHomeError));
@@ -247,8 +292,12 @@ mod tests {
         assert!(!created, "the second call reads, never remints");
         assert_eq!(first, again);
         // The file landed atomically: no tmp straggler, real content.
-        assert!(!tmp.path().join("identity.json.tmp").exists());
-        assert!(tmp.path().join("identity.json").exists());
+        let strays: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(strays, ["identity.json"]);
     }
 
     #[test]

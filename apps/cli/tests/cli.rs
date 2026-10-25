@@ -45,7 +45,8 @@ fn ctx(home: &Path) -> Context {
 
 fn run_args(home: &Path, args: &[&str]) -> pursecraft_cli::Output {
     let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    run(&argv, &ctx(home))
+    let ctx = ctx(home);
+    run(&argv, || Ok(ctx))
 }
 
 #[test]
@@ -65,6 +66,26 @@ fn help_version_and_usage_exit_codes() {
     assert_eq!(usage.code, 2);
     assert!(usage.stderr.contains("unknown command"), "{}", usage.stderr);
     assert!(usage.stderr.contains("usage: pursecraft add"));
+}
+
+/// Help, version, and usage errors answer without touching the
+/// environment: a failing context supplier must not break them (ADR 0023).
+#[test]
+fn meta_commands_need_no_environment() {
+    let argv = |a: &[&str]| -> Vec<String> { a.iter().map(|s| s.to_string()).collect() };
+    for meta in [["--help"], ["help"], ["--version"], ["version"], ["bogus"]] {
+        let out = run(&argv(&meta), || Err(pursecraft_cli::home::NoHomeError));
+        assert_eq!(out.code, if meta[0] == "bogus" { 2 } else { 0 }, "{meta:?}");
+        assert!(
+            !out.stderr.contains("data home"),
+            "{meta:?}: {}",
+            out.stderr
+        );
+    }
+    // …while a data-needing command surfaces the environment failure.
+    let out = run(&argv(&["list"]), || Err(pursecraft_cli::home::NoHomeError));
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("no data home"), "{}", out.stderr);
 }
 
 #[test]

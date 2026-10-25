@@ -84,8 +84,24 @@ pub fn parse(args: &[String]) -> Result<Cmd, UsageError> {
                 Err(UsageError(format!("list takes no arguments, got {rest:?}")))
             }
         }
-        "--help" | "help" => Ok(Cmd::Help),
-        "--version" | "version" => Ok(Cmd::Version),
+        "--help" | "help" => {
+            if rest.is_empty() {
+                Ok(Cmd::Help)
+            } else {
+                Err(UsageError(format!(
+                    "--help takes no arguments, got {rest:?}"
+                )))
+            }
+        }
+        "--version" | "version" => {
+            if rest.is_empty() {
+                Ok(Cmd::Version)
+            } else {
+                Err(UsageError(format!(
+                    "--version takes no arguments, got {rest:?}"
+                )))
+            }
+        }
         other => Err(UsageError(format!("unknown command {other:?}"))),
     }
 }
@@ -215,5 +231,8 @@ mod tests {
         assert_eq!(parse(&args(&["--help"])), Ok(Cmd::Help));
         assert_eq!(parse(&args(&["help"])), Ok(Cmd::Help));
         assert_eq!(parse(&args(&["--version"])), Ok(Cmd::Version));
+        // Trailing words are not swallowed.
+        assert!(parse(&args(&["help", "me"])).is_err());
+        assert!(parse(&args(&["--version", "extra"])).is_err());
     }
 }

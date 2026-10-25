@@ -13,10 +13,11 @@ use uuid::Uuid;
 
 /// Mint a fresh UUIDv7: current unix millisecond, version 7, RFC 4122
 /// variant, and — per RFC 9562's monotonicity recommendation — a 12-bit
-/// per-process counter in `rand_a`, so ids minted within the same
-/// millisecond stay strictly increasing (same-process capture order is
-/// lexicographic id order, which downstream tiebreaks rely on). The 48
-/// `rand_b` bits are OS randomness.
+/// per-process counter in `rand_a`, so ids minted by one process stay
+/// strictly increasing within a millisecond until the counter wraps at
+/// 4096 (beyond that rate, same-ms order falls back to the random bits —
+/// downstream tiebreaks treat it as clock skew). The 48 `rand_b` bits are
+/// OS randomness.
 pub fn mint_uuid() -> Uuid {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let ms = unix_ms();

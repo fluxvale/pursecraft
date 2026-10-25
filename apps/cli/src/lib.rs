@@ -1,9 +1,9 @@
 //! The `pursecraft` command-line app (ADR 0023): fast local-first
 //! transaction capture riding the shared core — one-shot argv commands,
 //! offline by design, every minted op through the single payload sink
-//! ([`sink`]). The library is fully injectable (home path, today's
-//! date, argv slice); [`main`](../../src/main.rs) is the only place the
-//! environment and clock are read.
+//! ([`sink`]). The library is fully injectable (home path, today's date,
+//! argv slice); the thin binary `main.rs` is the only reader of the
+//! process environment.
 
 pub mod amount;
 pub mod argv;
@@ -59,13 +59,18 @@ impl Output {
 }
 
 /// Run one command line to its printable outcome (ADR 0023). Exit codes:
-/// `0` success, `2` usage errors, `1` everything else.
-pub fn run(args: &[String], ctx: &Context) -> Output {
+/// `0` success, `2` usage errors, `1` everything else. `ctx` supplies the
+/// data home and today only when a command actually needs them — help,
+/// version, and usage errors answer without touching the environment.
+pub fn run(args: &[String], ctx: impl FnOnce() -> Result<Context, home::NoHomeError>) -> Output {
     match argv::parse(args) {
         Ok(argv::Cmd::Help) => Output::ok(format!("{}\n", argv::HELP.trim_end())),
         Ok(argv::Cmd::Version) => Output::ok(format!("pursecraft {}\n", env!("CARGO_PKG_VERSION"))),
-        Ok(argv::Cmd::List) => match list::list(&ctx.home) {
-            Ok(text) => Output::ok(text),
+        Ok(argv::Cmd::List) => match ctx() {
+            Ok(ctx) => match list::list(&ctx.home) {
+                Ok(text) => Output::ok(text),
+                Err(e) => Output::fail(format!("error: {e}\n")),
+            },
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
         Ok(argv::Cmd::Add {
@@ -73,18 +78,21 @@ pub fn run(args: &[String], ctx: &Context) -> Output {
             amount,
             date,
             account,
-        }) => {
-            let raw = capture::RawAdd {
-                payee: &payee,
-                amount: &amount,
-                date: date.as_deref(),
-                account: account.as_deref(),
-            };
-            match capture::add(&ctx.home, &raw, ctx.today) {
-                Ok(receipt) => Output::ok(receipt.confirmation()),
-                Err(e) => Output::fail(format!("error: {e}\n")),
+        }) => match ctx() {
+            Ok(ctx) => {
+                let raw = capture::RawAdd {
+                    payee: &payee,
+                    amount: &amount,
+                    date: date.as_deref(),
+                    account: account.as_deref(),
+                };
+                match capture::add(&ctx.home, &raw, ctx.today) {
+                    Ok(receipt) => Output::ok(receipt.confirmation()),
+                    Err(e) => Output::fail(format!("error: {e}\n")),
+                }
             }
-        }
+            Err(e) => Output::fail(format!("error: {e}\n")),
+        },
         Err(e) => Output::usage(&e.to_string()),
     }
 }

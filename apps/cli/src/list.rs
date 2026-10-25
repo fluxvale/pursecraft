@@ -1,4 +1,4 @@
-//! The minimal recap (ADR 2023): a read-only projection of recent
+//! The minimal recap (ADR 0023): a read-only projection of recent
 //! transactions — newest first, resolved payees, exact amounts. Not a
 //! browser; visibility and payee resolution come from the core's
 //! projections ([ADR 0016](../../../docs/decisions/0016-core-domain-model.md)).
@@ -9,7 +9,6 @@ use std::path::Path;
 use pursecraft_core::date::Date;
 use pursecraft_core::domain::{Entity, Transaction};
 use pursecraft_core::ids::{EntityId, TransactionId};
-use pursecraft_core::money::Milliunits;
 use pursecraft_core::ops::ApplyError;
 use pursecraft_core::resolve::{transaction_payee, transaction_visible};
 use pursecraft_core::store::{LocalStore, StoreError};
@@ -17,7 +16,7 @@ use pursecraft_core::sync::SyncSession;
 
 use crate::home::{IdentityError, budget_log, load_identity};
 
-/// How many transactions `list` shows (ADR 2023's minimal recap).
+/// How many transactions `list` shows (ADR 0023's minimal recap).
 pub const RECENT: usize = 10;
 
 /// A failed recap.
@@ -69,7 +68,7 @@ impl From<ApplyError> for ListError {
 
 const EMPTY: &str = "no transactions yet\n\ntry: pursecraft add coffee -4.50\n";
 
-/// Render the recap for the data home at `home` (ADR 2023): the last
+/// Render the recap for the data home at `home` (ADR 0023): the last
 /// [`RECENT`] visible transactions, newest first, with a count footer.
 /// Read-only — an absent world shows the getting-started hint.
 pub fn list(home: &Path) -> Result<String, ListError> {
@@ -85,7 +84,7 @@ pub fn list(home: &Path) -> Result<String, ListError> {
     session.apply_delta(store.delta_since(0))?;
     let state = session.state();
 
-    let mut rows: Vec<(Option<Date>, String, Milliunits, TransactionId)> = Vec::new();
+    let mut rows: Vec<(Option<Date>, String, String, String, TransactionId)> = Vec::new();
     for entity in state.entities() {
         let Entity::Transaction(txn) = entity else {
             continue;
@@ -101,15 +100,11 @@ pub fn list(home: &Path) -> Result<String, ListError> {
     // Newest first: date descending, then id descending (UUIDv7 is
     // chronological within clock skew — ADR 0016). Undated transactions
     // sort last.
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.3.cmp(&a.3)));
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.4.cmp(&a.4)));
 
     let total = rows.len();
     let mut out = format!("{:<10}   {:<24} {:>12}\n", "DATE", "PAYEE", "AMOUNT");
-    for (date, payee, amount, _) in rows.iter().take(RECENT) {
-        let date = date
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "?".to_owned());
-        let amount = amount.to_string();
+    for (_, date, payee, amount, _) in rows.iter().take(RECENT) {
         out.push_str(&format!("{date:<10}   {payee:<24} {amount:>12}\n"));
     }
     if total > RECENT {
@@ -122,11 +117,14 @@ pub fn list(home: &Path) -> Result<String, ListError> {
     Ok(out)
 }
 
-/// One recap row: date, resolved live payee name, exact amount.
+/// One recap row: (date key for ordering, date cell, resolved live payee
+/// name, amount cell, id for the tiebreak). Torn cells render `?` — a
+/// missing amount must never fake a real zero capture as `0.000`.
+#[allow(clippy::type_complexity)]
 fn row(
     state: &pursecraft_core::ops::ScopeState,
     txn: &Transaction,
-) -> (Option<Date>, String, Milliunits, TransactionId) {
+) -> (Option<Date>, String, String, String, TransactionId) {
     let payee = transaction_payee(state, txn)
         .and_then(|payee| state.entity(&EntityId::new(payee.as_uuid()).expect("stored v7")))
         .and_then(|entity| match entity {
@@ -134,10 +132,13 @@ fn row(
             _ => None,
         })
         .unwrap_or_default();
-    (
-        txn.date,
-        payee,
-        txn.amount.unwrap_or(Milliunits::ZERO),
-        txn.id,
-    )
+    let date = txn
+        .date
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let amount = txn
+        .amount
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    (txn.date, date, payee, amount, txn.id)
 }

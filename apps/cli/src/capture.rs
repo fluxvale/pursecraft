@@ -46,7 +46,7 @@ pub struct RawAdd<'a> {
     pub account: Option<&'a str>,
 }
 
-/// What one capture stored — the confirmation line's data (ADR 2023's
+/// What one capture stored — the confirmation line's data (ADR 0023's
 /// quiet-by-default feedback).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Receipt {
@@ -389,51 +389,62 @@ fn ensure_org(
 }
 
 /// Ensure the bootstrapped account exists in the budget log (ADR 0023):
-/// `name` + `kind`, probed, anchored. Returns whether anything was emitted.
+/// `name` + `kind`, each probed per-field so a partial write is completed,
+/// never redone. Stamped at the account's own mint ms. Returns whether
+/// anything was emitted.
 fn ensure_account(
     minter: &mut Minter,
     store: &mut LocalStore,
     identity: &Identity,
 ) -> Result<bool, CaptureError> {
     let session = boot(store)?;
-    let complete = matches!(
-        session.state().entity(&identity.account_id),
-        Some(Entity::Account(a)) if a.name.is_some() && a.kind.is_some()
-    );
-    if complete {
+    let (name_set, kind_set) = match session.state().entity(&identity.account_id) {
+        Some(Entity::Account(a)) => (a.name.is_some(), a.kind.is_some()),
+        _ => (false, false),
+    };
+    if name_set && kind_set {
         return Ok(false);
     }
     let scope = ScopeId::Budget(identity.budget_id);
     let anchor = anchored_at(identity.account_id);
     let account = identity.account_id;
-    sink::sink(
-        store,
-        minter.op_at(
-            anchor,
-            scope,
-            EntityKind::Account,
-            account,
-            Field::Account(AccountField::Name),
-            Value::Text(ACCOUNT_NAME.to_owned()),
-        ),
-    )?;
-    sink::sink(
-        store,
-        minter.op_at(
-            anchor,
-            scope,
-            EntityKind::Account,
-            account,
-            Field::Account(AccountField::Kind),
-            Value::AccountKind(AccountKind::Cash),
-        ),
-    )?;
-    Ok(true)
+    let mut emitted = false;
+    if !name_set {
+        sink::sink(
+            store,
+            minter.op_at(
+                anchor,
+                scope,
+                EntityKind::Account,
+                account,
+                Field::Account(AccountField::Name),
+                Value::Text(ACCOUNT_NAME.to_owned()),
+            ),
+        )?;
+        emitted = true;
+    }
+    if !kind_set {
+        sink::sink(
+            store,
+            minter.op_at(
+                anchor,
+                scope,
+                EntityKind::Account,
+                account,
+                Field::Account(AccountField::Kind),
+                Value::AccountKind(AccountKind::Cash),
+            ),
+        )?;
+        emitted = true;
+    }
+    Ok(emitted)
 }
 
 /// Resolve the capture account (ADR 0023): `wanted` by exact live name
 /// (earliest id on duplicates — ADR 0016's deterministic convention), or
-/// the bootstrapped account. Unknown names list what exists.
+/// the bootstrapped account — which must itself be live: a dead or missing
+/// default is a loud error, never a silent fabrication that `list` would
+/// then hide the transaction behind.
 fn resolve_account(
     state: &ScopeState,
     wanted: Option<&str>,
@@ -450,21 +461,21 @@ fn resolve_account(
         })
         .collect();
     accounts.sort();
-    let Some(wanted) = wanted else {
-        return Ok(accounts
+    let find_by_name = |name: &str| accounts.iter().find(|(_, known)| known == name).cloned();
+    match wanted {
+        Some(wanted) => find_by_name(wanted).ok_or_else(|| CaptureError::UnknownAccount {
+            wanted: wanted.to_owned(),
+            known: accounts.into_iter().map(|(_, name)| name).collect(),
+        }),
+        None => accounts
             .iter()
             .find(|(id, _)| *id == default)
             .cloned()
-            .unwrap_or_else(|| (default, ACCOUNT_NAME.to_owned())));
-    };
-    accounts
-        .iter()
-        .find(|(_, name)| name == wanted)
-        .cloned()
-        .ok_or_else(|| CaptureError::UnknownAccount {
-            wanted: wanted.to_owned(),
-            known: accounts.into_iter().map(|(_, name)| name).collect(),
-        })
+            .ok_or_else(|| CaptureError::UnknownAccount {
+                wanted: ACCOUNT_NAME.to_owned(),
+                known: accounts.into_iter().map(|(_, name)| name).collect(),
+            }),
+    }
 }
 
 /// Find the earliest-created live payee named exactly `name` (ADR 0023:
@@ -742,6 +753,147 @@ mod tests {
         );
     }
 
+    /// Seed one op into a fresh budget log (the torn attempt's landed
+    /// write), creating the directory `add` would have made.
+    fn seed_budget_op(home: &Path, identity: &Identity, op: Op) {
+        let path = budget_log(home, identity.budget_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = LocalStore::open(&path).unwrap();
+        sink::sink(&mut store, op).unwrap();
+    }
+
+    fn payee_name_op(identity: &Identity, payee: EntityId, name: &str) -> Op {
+        Op {
+            op_id: OpId::new(mint_uuid()).unwrap(),
+            scope: ScopeId::Budget(identity.budget_id),
+            device_id: identity.device_id,
+            user_id: identity.user_id,
+            entity_kind: EntityKind::Payee,
+            entity_id: payee,
+            field: Field::Payee(PayeeField::Name),
+            value: Value::Text(name.into()),
+            hlc: Hlc {
+                physical_ms: 1_000,
+                logical: 0,
+            },
+        }
+    }
+
+    /// Torn-bootstrap resume (issue #21 / ADR 0023): a partial first
+    /// attempt is completed by the next add, never redone. Crash window A:
+    /// the payee op landed, the transaction ops did not.
+    #[test]
+    fn a_payee_only_torn_capture_is_resumed_not_duplicated() {
+        let tmp = TempDir::new("torn-payee");
+        let home = tmp.path();
+        let (identity, _) = load_or_create_identity(home).unwrap();
+        seed_budget_op(
+            home,
+            &identity,
+            payee_name_op(&identity, EntityId::new(mint_uuid()).unwrap(), "coffee"),
+        );
+
+        let receipt = add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        assert!(!receipt.new_payee, "the torn attempt's payee is reused");
+        let (_, store) = reopened(home);
+        assert_eq!(store.tip(), 8, "payee(1) + account(2) + transaction(5)");
+        let mut session = SyncSession::new();
+        session.apply_delta(store.delta_since(0)).unwrap();
+        assert_eq!(
+            session
+                .state()
+                .entities()
+                .filter(|e| matches!(e, Entity::Payee(_)))
+                .count(),
+            1,
+            "no twin payee"
+        );
+    }
+
+    /// Crash window B: the account landed its `name` but not its `kind` —
+    /// the ensure step completes only the missing field.
+    #[test]
+    fn a_half_written_account_is_completed_not_redone() {
+        let tmp = TempDir::new("torn-account");
+        let home = tmp.path();
+        let (identity, _) = load_or_create_identity(home).unwrap();
+        seed_budget_op(
+            home,
+            &identity,
+            Op {
+                op_id: OpId::new(mint_uuid()).unwrap(),
+                scope: ScopeId::Budget(identity.budget_id),
+                device_id: identity.device_id,
+                user_id: identity.user_id,
+                entity_kind: EntityKind::Account,
+                entity_id: identity.account_id,
+                field: Field::Account(AccountField::Name),
+                value: Value::Text(ACCOUNT_NAME.into()),
+                hlc: anchored_at(identity.account_id),
+            },
+        );
+
+        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        let (_, store) = reopened(home);
+        // Seeded name + emitted kind + payee + 5 transaction ops.
+        assert_eq!(store.tip(), 8);
+        let fresh: Vec<Op> = store.delta_since(1).map(|s| s.op.clone()).collect();
+        assert_eq!(fresh.len(), 7, "only the missing kind op re-lands");
+        assert!(
+            !fresh.iter().any(|op| op.entity_kind == EntityKind::Account
+                && matches!(op.field, Field::Account(AccountField::Name))),
+            "the satisfied name write is never redone"
+        );
+    }
+
+    /// Crash window C: the org log holds only part of the provisioning
+    /// op-set — the next add completes it with the missing fields.
+    #[test]
+    fn a_partial_org_provisioning_is_completed() {
+        let tmp = TempDir::new("torn-org");
+        let home = tmp.path();
+        let (identity, _) = load_or_create_identity(home).unwrap();
+        let org_path = org_log(home, identity.org_id);
+        std::fs::create_dir_all(org_path.parent().unwrap()).unwrap();
+        let mut org_store = LocalStore::open(&org_path).unwrap();
+        let session = boot(&org_store).unwrap();
+        let ops = provision_personal_org(
+            session.state(),
+            PersonalOrgIds {
+                user: identity.user_id,
+                org: identity.org_id,
+                membership: identity.membership_id,
+            },
+            ORG_NAME,
+            identity.device_id,
+            || OpId::new(mint_uuid()).expect("minted v7"),
+        );
+        assert_eq!(ops.len(), 4);
+        for op in &ops[..2] {
+            sink::sink(&mut org_store, op.clone()).unwrap();
+        }
+        drop(org_store);
+
+        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        assert_eq!(
+            org_tip(home, &identity),
+            5,
+            "2 seeded + 2 completed + budget name"
+        );
+        let mut org_session = SyncSession::new();
+        let org_store = LocalStore::open(&org_log(home, identity.org_id)).unwrap();
+        org_session.apply_delta(org_store.delta_since(0)).unwrap();
+        assert_eq!(
+            membership_role(org_session.state(), identity.user_id),
+            Some(MembershipRole::Owner),
+            "the completed provisioning yields a whole world"
+        );
+        assert_eq!(
+            organization(org_session.state()).unwrap().name.as_deref(),
+            Some(ORG_NAME)
+        );
+    }
+
     #[test]
     fn flags_select_date_and_account() {
         let tmp = TempDir::new("flags");
@@ -802,11 +954,11 @@ mod tests {
         );
     }
 
-    /// The sink is the only append path (ADR 0023): a fresh scope cannot
-    /// smuggle ops anywhere but through it — exercised by minting into an
-    /// empty store and reading back through the same seam.
+    /// The sink dedupes at-least-once retries (ADR 0023's seam; the
+    /// only-append-through-sink invariant itself is enforced by review and
+    /// the round-trip tests above).
     #[test]
-    fn every_append_flows_through_the_sink() {
+    fn sink_dedupes_retries() {
         let tmp = TempDir::new("sink-only");
         let path = tmp.path().join("probe.ops");
         let mut store = LocalStore::open(&path).unwrap();
