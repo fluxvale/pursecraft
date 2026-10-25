@@ -1,5 +1,5 @@
 //! Op wire format: the metadata/payload split and the single serialization
-//! choke point (ADRs 0009, 0017).
+//! choke point (ADRs 0009, 0017, 0020).
 //!
 //! The server may only ever see [`OpMeta`]; [`OpPayload`] is opaque data it
 //! stores but never interprets, encrypted in a later slice. All payload
@@ -10,15 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{EntityKind, Field, Value};
 use crate::hlc::Hlc;
-use crate::ids::{BudgetId, DeviceId, EntityId, OpId, UserId};
+use crate::ids::{DeviceId, EntityId, OpId, ScopeId, UserId};
 use crate::ops::Op;
 
 /// Server-visible op metadata (ADR 0009): everything the rendezvous may
-/// read.
+/// read — including the typed log scope the future server routes
+/// authorization on (ADR 0021).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct OpMeta {
     pub op_id: OpId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub device_id: DeviceId,
     pub user_id: UserId,
     pub hlc: Hlc,
@@ -75,7 +76,7 @@ impl Op {
         (
             OpMeta {
                 op_id: self.op_id,
-                budget_id: self.budget_id,
+                scope: self.scope,
                 device_id: self.device_id,
                 user_id: self.user_id,
                 hlc: self.hlc,
@@ -93,7 +94,7 @@ impl Op {
     pub fn from_parts(meta: OpMeta, payload: OpPayload) -> Self {
         Self {
             op_id: meta.op_id,
-            budget_id: meta.budget_id,
+            scope: meta.scope,
             device_id: meta.device_id,
             user_id: meta.user_id,
             hlc: meta.hlc,
@@ -123,20 +124,21 @@ mod tests {
     use crate::date::{Date, Month};
     use crate::domain::{
         AccountField, AccountKind, BudgetField, CategoryField, CategoryGroupField, Cleared,
-        EntityKind, MonthCategoryField, PayeeField, TransactionField,
+        EntityKind, MembershipField, MembershipRole, MonthCategoryField, OrgField, PayeeField,
+        TransactionField,
     };
     use crate::hlc::Hlc;
-    use crate::ids::TransactionId;
+    use crate::ids::{ScopeId, TransactionId};
     use crate::money::Milliunits;
     use crate::testkit::v7;
     use uuid::Uuid;
 
     const MS: u64 = 1 << 40;
 
-    fn op(kind: EntityKind, entity_rand: u64, field: Field, value: Value) -> Op {
+    fn op(scope: ScopeId, kind: EntityKind, entity_rand: u64, field: Field, value: Value) -> Op {
         Op {
             op_id: crate::ids::OpId::new(v7(MS, entity_rand)).unwrap(),
-            budget_id: crate::ids::BudgetId::new(v7(1, 1)).unwrap(),
+            scope,
             device_id: DeviceId::new(Uuid::nil()).unwrap(),
             user_id: UserId::new(Uuid::max()).unwrap(),
             entity_kind: kind,
@@ -150,131 +152,175 @@ mod tests {
         }
     }
 
+    fn budget_op(kind: EntityKind, entity_rand: u64, field: Field, value: Value) -> Op {
+        op(
+            ScopeId::Budget(crate::ids::BudgetId::new(v7(1, 1)).unwrap()),
+            kind,
+            entity_rand,
+            field,
+            value,
+        )
+    }
+
+    fn org_op(kind: EntityKind, entity_rand: u64, field: Field, value: Value) -> Op {
+        op(
+            ScopeId::Org(crate::ids::OrgId::new(v7(MS, 1)).unwrap()),
+            kind,
+            entity_rand,
+            field,
+            value,
+        )
+    }
+
     fn id(rand: u64) -> Value {
         Value::Id(EntityId::new(v7(MS, rand)).unwrap())
     }
 
     /// One op per (entity kind × field), covering every `Value` variant —
     /// including calendar edges, empty and non-ASCII text, and extreme
-    /// milliunits.
+    /// milliunits. Org-scope entities (ADR 0021) ride org ops.
     fn every_variant() -> Vec<Op> {
         vec![
-            op(
-                EntityKind::Budget,
+            org_op(
+                EntityKind::Organization,
                 1,
-                Field::Budget(BudgetField::Name),
+                Field::Organization(OrgField::Name),
                 Value::Text("Home ₱".into()),
             ),
-            op(
+            org_op(
+                EntityKind::Organization,
+                1,
+                Field::Organization(OrgField::PersonalFor),
+                Value::User(UserId::new(Uuid::max()).unwrap()),
+            ),
+            org_op(
+                EntityKind::Membership,
+                8,
+                Field::Membership(MembershipField::UserId),
+                Value::User(UserId::new(Uuid::nil()).unwrap()),
+            ),
+            org_op(
+                EntityKind::Membership,
+                8,
+                Field::Membership(MembershipField::Role),
+                Value::Role(MembershipRole::Viewer),
+            ),
+            org_op(
+                EntityKind::Budget,
+                9,
+                Field::Budget(BudgetField::Name),
+                Value::Text("Household".into()),
+            ),
+            budget_op(
                 EntityKind::Account,
                 2,
                 Field::Account(AccountField::Name),
                 Value::Text(String::new()),
             ),
-            op(
+            budget_op(
                 EntityKind::Account,
                 2,
                 Field::Account(AccountField::Kind),
                 Value::AccountKind(AccountKind::OtherLiability),
             ),
-            op(
+            budget_op(
                 EntityKind::CategoryGroup,
                 3,
                 Field::CategoryGroup(CategoryGroupField::Name),
                 Value::Text("Bills".into()),
             ),
-            op(
+            budget_op(
                 EntityKind::Category,
                 4,
                 Field::Category(CategoryField::Name),
                 Value::Text("Power".into()),
             ),
-            op(
+            budget_op(
                 EntityKind::Category,
                 4,
                 Field::Category(CategoryField::GroupId),
                 id(3),
             ),
-            op(
+            budget_op(
                 EntityKind::Category,
                 4,
                 Field::Category(CategoryField::Note),
                 Value::Text("note — em dash".into()),
             ),
-            op(
+            budget_op(
                 EntityKind::Payee,
                 5,
                 Field::Payee(PayeeField::Name),
                 Value::Text("Meralco".into()),
             ),
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Transaction(TransactionField::AccountId),
                 id(2),
             ),
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Transaction(TransactionField::Date),
                 Value::Date(Date::new(2024, 2, 29).unwrap()),
             ),
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Transaction(TransactionField::Amount),
                 Value::Milliunits(Milliunits::MIN),
             ),
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Transaction(TransactionField::Amount),
                 Value::Milliunits(Milliunits::MAX),
             ),
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Transaction(TransactionField::PayeeId),
                 id(5),
             ),
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Transaction(TransactionField::CategoryId),
                 id(4),
             ),
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Transaction(TransactionField::Memo),
                 Value::Text("groceries".into()),
             ),
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Transaction(TransactionField::Cleared),
                 Value::Cleared(Cleared::Reconciled),
             ),
-            op(
+            budget_op(
                 EntityKind::MonthCategory,
                 7,
                 Field::MonthCategory(MonthCategoryField::Month),
                 Value::Month(Month::new(2026, 1).unwrap()),
             ),
-            op(
+            budget_op(
                 EntityKind::MonthCategory,
                 7,
                 Field::MonthCategory(MonthCategoryField::CategoryId),
                 id(4),
             ),
-            op(
+            budget_op(
                 EntityKind::MonthCategory,
                 7,
                 Field::MonthCategory(MonthCategoryField::Budgeted),
                 Value::Milliunits(Milliunits::from_major(-45)),
             ),
             // The tombstone field rides the same wire.
-            op(
+            budget_op(
                 EntityKind::Transaction,
                 6,
                 Field::Deleted,
@@ -299,7 +345,7 @@ mod tests {
     fn payload_encoding_is_what_the_wire_says_it_is() {
         // Money travels as bare integer milliunits (ADR 0006): no float, no
         // decimal string.
-        let amount = op(
+        let amount = budget_op(
             EntityKind::Transaction,
             6,
             Field::Transaction(TransactionField::Amount),
@@ -308,7 +354,7 @@ mod tests {
         let wire = encode_payload(&amount.into_parts().1).unwrap();
         assert!(wire.contains(r#""value":{"Milliunits":-45000}}"#), "{wire}");
         // Dates and months are strict strings.
-        let date = op(
+        let date = budget_op(
             EntityKind::Transaction,
             6,
             Field::Transaction(TransactionField::Date),
@@ -316,7 +362,7 @@ mod tests {
         );
         let wire = encode_payload(&date.into_parts().1).unwrap();
         assert!(wire.contains(r#""Date":"2026-10-23""#), "{wire}");
-        let month = op(
+        let month = budget_op(
             EntityKind::MonthCategory,
             7,
             Field::MonthCategory(MonthCategoryField::Month),
@@ -335,7 +381,7 @@ mod tests {
             for secret in ["entity_kind", "entity_id", "\"field\"", "\"value\""] {
                 assert!(!meta_wire.contains(secret), "{secret} leaked into meta");
             }
-            for meta_key in ["op_id", "budget_id", "device_id", "user_id", "hlc"] {
+            for meta_key in ["op_id", "scope", "device_id", "user_id", "hlc"] {
                 assert!(
                     !payload_wire.contains(meta_key),
                     "{meta_key} leaked into the payload"
@@ -369,7 +415,7 @@ mod tests {
         // the receive path; physical_ms past i64::MAX is not a wall clock
         // and lets later ticks run off the u64 cliff. Both are rejected at
         // decode (ADR 0017).
-        let meta = op(
+        let meta = budget_op(
             EntityKind::Transaction,
             6,
             Field::Deleted,
@@ -479,7 +525,7 @@ mod tests {
         let (meta, payload) = op.clone().into_parts();
         // The five metadata fields live in OpMeta and only there.
         assert_eq!(meta.op_id, op.op_id);
-        assert_eq!(meta.budget_id, op.budget_id);
+        assert_eq!(meta.scope, op.scope);
         assert_eq!(meta.device_id, op.device_id);
         assert_eq!(meta.user_id, op.user_id);
         assert_eq!(meta.hlc, op.hlc);

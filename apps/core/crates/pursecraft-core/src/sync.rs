@@ -4,17 +4,17 @@
 //! [`OpLog`] is the in-memory shape of the future server: it assigns
 //! canonical per-budget sequences and inspects only server-visible
 //! metadata. [`SyncSession`] is the client: idempotent delta application
-//! onto [`BudgetState`], an HLC that absorbs every received op, and a
+//! onto [`ScopeState`], an HLC that absorbs every received op, and a
 //! monotonic `last_seen` cursor.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::hlc::Hlc;
-use crate::ids::{BudgetId, OpId};
-use crate::ops::{Applied, ApplyError, BudgetState, Op};
+use crate::ids::{OpId, ScopeId};
+use crate::ops::{Applied, ApplyError, Op, ScopeState};
 
-/// An op stamped with its canonical per-budget sequence (ADR 0007).
+/// An op stamped with its canonical per-log sequence (ADR 0007).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SequencedOp {
     pub seq: u64,
@@ -22,25 +22,26 @@ pub struct SequencedOp {
 }
 
 /// A rejected append — a scoping violation is loud, never merged
-/// ([ADR 0008]).
+/// ([ADRs 0008, 0020]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LogError {
-    /// The op is scoped to a budget other than this log's ([ADR 0008]).
-    BudgetMismatch {
-        op_budget: BudgetId,
-        log_budget: BudgetId,
+    /// The op is scoped to a log other than this one's ([ADR 0008],
+    /// [ADR 0021]).
+    ScopeMismatch {
+        op_scope: ScopeId,
+        log_scope: ScopeId,
     },
 }
 
 impl fmt::Display for LogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BudgetMismatch {
-                op_budget,
-                log_budget,
+            Self::ScopeMismatch {
+                op_scope,
+                log_scope,
             } => write!(
                 f,
-                "op budget {op_budget} does not belong to op log {log_budget}"
+                "op scope {op_scope:?} does not belong to op log {log_scope:?}"
             ),
         }
     }
@@ -48,17 +49,17 @@ impl fmt::Display for LogError {
 
 impl std::error::Error for LogError {}
 
-/// The append-only, per-budget canonical op log — the rendezvous model of
-/// [ADR 0007] as an in-memory type the future server drives. Sequences are
-/// 1-based and append order is the canonical order in a fresh log. The log
-/// touches only server-visible metadata: dedupe is by `op_id` alone
-/// (content is opaque under [ADR 0009] — an encrypted retry must dedupe
-/// like an identical one), and the loud same-id-different-content check
-/// lives in [`BudgetState::apply`], where plaintext always lives
-/// (ADR 0017).
+/// The append-only, per-scope canonical op log — the rendezvous model of
+/// [ADR 0007] as an in-memory type the future server drives; a log is
+/// scoped to one org or one budget (ADR 0021). Sequences are 1-based and
+/// append order is the canonical order in a fresh log. The log touches
+/// only server-visible metadata: dedupe is by `op_id` alone (content is
+/// opaque under [ADR 0009] — an encrypted retry must dedupe like an
+/// identical one), and the loud same-id-different-content check lives in
+/// [`ScopeState::apply`], where plaintext always lives (ADR 0017).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OpLog {
-    budget_id: Option<BudgetId>,
+    scope: Option<ScopeId>,
     ops: Vec<SequencedOp>,
     seen: HashMap<OpId, u64>,
     /// The sequence the next append assigns — 1 for a fresh log. A durable
@@ -70,7 +71,7 @@ pub struct OpLog {
 impl Default for OpLog {
     fn default() -> Self {
         Self {
-            budget_id: None,
+            scope: None,
             ops: Vec::new(),
             seen: HashMap::new(),
             next_seq: 1,
@@ -92,8 +93,8 @@ impl OpLog {
         }
     }
 
-    /// Append an op; returns its canonical sequence. Budget scoping is
-    /// checked first (it is metadata — exactly what a real server sees),
+    /// Append an op; returns its canonical sequence. Scope checking is
+    /// first (the scope is metadata — exactly what a real server sees),
     /// then dedupe by `op_id`: re-appending an op whose id is already
     /// stored returns the original sequence — safe retries ([ADR 0007]) —
     /// regardless of payload bytes. Errors leave the log untouched.
@@ -118,19 +119,19 @@ impl OpLog {
     /// The shared append: scope check, dedupe, then store under `seq`.
     /// Returns the op's sequence and whether it was newly stored.
     fn append_inner(&mut self, seq: u64, op: Op) -> Result<(u64, bool), LogError> {
-        if let Some(log_budget) = self.budget_id
-            && log_budget != op.budget_id
+        if let Some(log_scope) = self.scope
+            && log_scope != op.scope
         {
-            return Err(LogError::BudgetMismatch {
-                op_budget: op.budget_id,
-                log_budget,
+            return Err(LogError::ScopeMismatch {
+                op_scope: op.scope,
+                log_scope,
             });
         }
         if let Some(&seen) = self.seen.get(&op.op_id) {
             return Ok((seen, false));
         }
-        if self.budget_id.is_none() {
-            self.budget_id = Some(op.budget_id);
+        if self.scope.is_none() {
+            self.scope = Some(op.scope);
         }
         self.seen.insert(op.op_id, seq);
         self.ops.push(SequencedOp { seq, op });
@@ -150,9 +151,10 @@ impl OpLog {
         self.ops.last().map(|s| s.seq).unwrap_or(0)
     }
 
-    /// The budget this log is scoped to, once the first op fixes it.
-    pub fn budget_id(&self) -> Option<BudgetId> {
-        self.budget_id
+    /// The scope this log is fixed to, once the first op fixes it
+    /// (ADR 0021).
+    pub fn scope_id(&self) -> Option<ScopeId> {
+        self.scope
     }
 
     /// The canonical sequence already assigned to `op_id`, if the log holds
@@ -183,10 +185,10 @@ pub struct DeltaSummary {
 
 /// One device's client side: materialized state, the device's HLC, and the
 /// `last_seen` cursor (ADR 0017). The transport-free "sync session" the
-/// future transport drives.
+/// future transport drives — one per log scope (ADR 0021).
 #[derive(Clone, Debug)]
 pub struct SyncSession {
-    state: BudgetState,
+    state: ScopeState,
     clock: Hlc,
     /// The contiguous resume watermark: every sequence up to and including
     /// it has been processed. `delta_since(last_seen)` can never skip an
@@ -200,7 +202,7 @@ pub struct SyncSession {
 impl SyncSession {
     pub fn new() -> Self {
         Self {
-            state: BudgetState::new(),
+            state: ScopeState::new(),
             clock: Hlc::now(),
             last_seen: 0,
             pending: BTreeSet::new(),
@@ -252,8 +254,8 @@ impl SyncSession {
     }
 
     /// The materialized state — converges across devices by ADR 0017's
-    /// theorem.
-    pub fn state(&self) -> &BudgetState {
+    /// theorem, per scope (ADR 0021).
+    pub fn state(&self) -> &ScopeState {
         &self.state
     }
 
@@ -292,7 +294,7 @@ mod tests {
     use crate::money::Milliunits;
     use crate::testkit::conv::{
         DEVICES, HLC_BASE, ID_MS, OPS_PER_DEVICE, amount, budget, expected_tie_value, generate_ops,
-        materialized, op, sequenced, shuffle,
+        materialized, op, scopes, sequenced, shuffle,
     };
     use crate::testkit::{Rng, v7};
 
@@ -303,7 +305,7 @@ mod tests {
         assert_eq!(log.append(op(1, 10, 0, field, value.clone())), Ok(1));
         assert_eq!(log.append(op(2, 20, 0, field, value)), Ok(2));
         assert_eq!(log.tip(), 2);
-        assert_eq!(log.budget_id(), Some(budget()));
+        assert_eq!(log.scope_id(), Some(ScopeId::Budget(budget())));
         let seqs: Vec<u64> = log.delta_since(0).map(|s| s.seq).collect();
         assert_eq!(seqs, [1, 2], "append order is canonical order");
         assert!(log.delta_since(2).next().is_none());
@@ -388,25 +390,26 @@ mod tests {
     }
 
     #[test]
-    fn foreign_budget_append_is_rejected() {
+    fn foreign_scope_append_is_rejected() {
         let mut log = OpLog::new();
         let (field, value) = amount(1);
         let first = op(1, 10, 0, field, value);
         assert_eq!(log.append(first.clone()), Ok(1));
         let mut foreign = op(2, 20, 0, amount(0).0, amount(2).1);
-        foreign.budget_id = crate::ids::BudgetId::new(v7(9, 9)).unwrap();
+        foreign.scope = ScopeId::Budget(crate::ids::BudgetId::new(v7(9, 9)).unwrap());
         assert!(matches!(
             log.append(foreign.clone()),
-            Err(LogError::BudgetMismatch { .. })
+            Err(LogError::ScopeMismatch { .. })
         ));
         assert_eq!(log.tip(), 1);
         // Scoping is checked before dedupe: even an op REUSING a seen
-        // op_id is rejected when scoped to the wrong budget — budget_id
-        // is metadata, the one thing a real server always sees (ADR 0008).
+        // op_id is rejected when scoped to the wrong log — the scope
+        // is metadata, the one thing a real server always sees (ADRs
+        // 0008, 0020).
         foreign.op_id = first.op_id;
         assert!(matches!(
             log.append(foreign),
-            Err(LogError::BudgetMismatch { .. })
+            Err(LogError::ScopeMismatch { .. })
         ));
     }
 
@@ -436,7 +439,7 @@ mod tests {
             op(4, 30, 0, Field::Deleted, Value::Bool(true)),
         ];
         let mut rng = Rng::new(42);
-        let mut reference: Option<BudgetState> = None;
+        let mut reference: Option<ScopeState> = None;
         for _ in 0..8 {
             let mut delivery: Vec<SequencedOp> = ops
                 .iter()
@@ -562,7 +565,9 @@ mod tests {
     // duplicated delivery, per-device clock skew, equal-HLC ties,
     // tombstone races, dangling references — all xorshift-deterministic
     // per the ADR 0016 convention. The op stream generator and assertions
-    // live in `testkit::conv`, shared with the store suite (ADR 0018).
+    // live in `testkit::conv`, shared with the store suite (ADR 0018), and
+    // run over both log scopes (ADR 0021): the same theorem for org logs
+    // and budget logs.
     // ------------------------------------------------------------------
 
     const SEEDS: u64 = 25;
@@ -570,156 +575,162 @@ mod tests {
     /// Scenario (a): the rendezvous loop — devices push their ops to the
     /// log in a shuffled interleave and pull random-sized deltas, sometimes
     /// re-pulling overlaps (at-least-once delivery), until everyone has
-    /// everything.
+    /// everything. Both scopes (ADR 0021).
     #[test]
     fn n_devices_converge_through_the_rendezvous_loop() {
-        for seed in 1..=SEEDS {
-            let ops = generate_ops(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let mut rng = Rng::new(seed.wrapping_mul(0x5851_F42D_4C95_7F2D));
-            let mut log = OpLog::new();
-            let mut queues: Vec<std::collections::VecDeque<Op>> = (0..DEVICES)
-                .map(|d| {
-                    ops[d as usize * OPS_PER_DEVICE..(d as usize + 1) * OPS_PER_DEVICE]
-                        .iter()
-                        .cloned()
-                        .collect()
-                })
-                .collect();
-            let mut sessions: Vec<SyncSession> = (0..DEVICES).map(|_| SyncSession::new()).collect();
+        for scope in scopes() {
+            for seed in 1..=SEEDS {
+                let ops = generate_ops(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), scope);
+                let mut rng = Rng::new(seed.wrapping_mul(0x5851_F42D_4C95_7F2D));
+                let mut log = OpLog::new();
+                let mut queues: Vec<std::collections::VecDeque<Op>> = (0..DEVICES)
+                    .map(|d| {
+                        ops[d as usize * OPS_PER_DEVICE..(d as usize + 1) * OPS_PER_DEVICE]
+                            .iter()
+                            .cloned()
+                            .collect()
+                    })
+                    .collect();
+                let mut sessions: Vec<SyncSession> =
+                    (0..DEVICES).map(|_| SyncSession::new()).collect();
 
-            while queues.iter().any(|q| !q.is_empty()) {
-                let d = rng.below(DEVICES) as usize;
-                for _ in 0..1 + rng.below(4) {
-                    if let Some(op) = queues[d].pop_front() {
-                        log.append(op).expect("generated ops are well-formed");
+                while queues.iter().any(|q| !q.is_empty()) {
+                    let d = rng.below(DEVICES) as usize;
+                    for _ in 0..1 + rng.below(4) {
+                        if let Some(op) = queues[d].pop_front() {
+                            log.append(op).expect("generated ops are well-formed");
+                        }
+                    }
+                    for session in &mut sessions {
+                        if rng.below(3) == 0 {
+                            // Mostly pull only new ops; sometimes re-pull an
+                            // overlap — at-least-once delivery.
+                            let since = if rng.below(4) == 0 {
+                                session.last_seen().saturating_sub(rng.below(5))
+                            } else {
+                                session.last_seen()
+                            };
+                            session
+                                .apply_delta(log.delta_since(since))
+                                .expect("generated ops are well-formed");
+                        }
                     }
                 }
                 for session in &mut sessions {
-                    if rng.below(3) == 0 {
-                        // Mostly pull only new ops; sometimes re-pull an
-                        // overlap — at-least-once delivery.
-                        let since = if rng.below(4) == 0 {
-                            session.last_seen().saturating_sub(rng.below(5))
-                        } else {
-                            session.last_seen()
-                        };
-                        session
-                            .apply_delta(log.delta_since(since))
-                            .expect("generated ops are well-formed");
-                    }
+                    // First full drain brings the session to the tip (some ops
+                    // may never have been pulled); a second full re-delivery
+                    // must then be pure duplicates — at-least-once idempotence.
+                    let drained = session.apply_delta(log.delta_since(0)).unwrap();
+                    assert_eq!(drained.last_seen, log.tip());
+                    let summary = session.apply_delta(log.delta_since(0)).unwrap();
+                    assert_eq!(summary.last_seen, log.tip());
+                    assert_eq!(summary.applied, 0, "everything was already applied");
+                    assert_eq!(summary.stale, 0);
+                    assert_eq!(summary.duplicates, log.tip());
                 }
-            }
-            for session in &mut sessions {
-                // First full drain brings the session to the tip (some ops
-                // may never have been pulled); a second full re-delivery
-                // must then be pure duplicates — at-least-once idempotence.
-                let drained = session.apply_delta(log.delta_since(0)).unwrap();
-                assert_eq!(drained.last_seen, log.tip());
-                let summary = session.apply_delta(log.delta_since(0)).unwrap();
-                assert_eq!(summary.last_seen, log.tip());
-                assert_eq!(summary.applied, 0, "everything was already applied");
-                assert_eq!(summary.stale, 0);
-                assert_eq!(summary.duplicates, log.tip());
-            }
 
-            let reference = sessions[0].state().clone();
-            for (i, session) in sessions.iter().enumerate() {
-                assert_eq!(
-                    session.state(),
-                    &reference,
-                    "device {i} diverged (seed {seed})"
+                let reference = sessions[0].state().clone();
+                for (i, session) in sessions.iter().enumerate() {
+                    assert_eq!(
+                        session.state(),
+                        &reference,
+                        "device {i} diverged (seed {seed})"
+                    );
+                }
+                // The reference itself equals a fresh canonical-order session.
+                let mut canonical = SyncSession::new();
+                canonical
+                    .apply_delta(log.delta_since(0))
+                    .expect("generated ops are well-formed");
+                assert_eq!(canonical.state(), &reference, "seed {seed}");
+                assert_eq!(log.tip(), (DEVICES as usize * OPS_PER_DEVICE) as u64);
+
+                // The forced equal-HLC tie at the winning stamp: every
+                // replica's materialized value must be the op_id tie-break's
+                // pick — asserted directly, not just via state equality.
+                let (tie_entity, tie_field, tie_value) = expected_tie_value(&ops);
+                let mut replicas = sessions.iter().map(|s| s.state());
+                let first_tie = materialized(
+                    replicas.next().expect("at least one session"),
+                    tie_entity,
+                    tie_field,
                 );
-            }
-            // The reference itself equals a fresh canonical-order session.
-            let mut canonical = SyncSession::new();
-            canonical
-                .apply_delta(log.delta_since(0))
-                .expect("generated ops are well-formed");
-            assert_eq!(canonical.state(), &reference, "seed {seed}");
-            assert_eq!(log.tip(), (DEVICES as usize * OPS_PER_DEVICE) as u64);
-
-            // The forced equal-HLC tie at the winning stamp: every
-            // replica's materialized value must be the op_id tie-break's
-            // pick — asserted directly, not just via state equality.
-            let (tie_entity, tie_field, tie_value) = expected_tie_value(&ops);
-            let mut replicas = sessions.iter().map(|s| s.state());
-            let first_tie = materialized(
-                replicas.next().expect("at least one session"),
-                tie_entity,
-                tie_field,
-            );
-            assert_eq!(first_tie, Some(tie_value), "seed {seed}");
-            for state in replicas {
+                assert_eq!(first_tie, Some(tie_value), "seed {seed}");
+                for state in replicas {
+                    assert_eq!(
+                        materialized(state, tie_entity, tie_field),
+                        first_tie,
+                        "seed {seed}"
+                    );
+                }
                 assert_eq!(
-                    materialized(state, tie_entity, tie_field),
+                    materialized(canonical.state(), tie_entity, tie_field),
                     first_tie,
                     "seed {seed}"
                 );
             }
-            assert_eq!(
-                materialized(canonical.state(), tie_entity, tie_field),
-                first_tie,
-                "seed {seed}"
-            );
         }
     }
 
     /// Scenario (b): no log at all — each device receives the full op set
     /// as an independent shuffle with injected duplicates, in random batch
-    /// sizes; all must equal the generation-order reference.
+    /// sizes; all must equal the generation-order reference. Both scopes
+    /// (ADR 0021).
     #[test]
     fn n_devices_converge_from_shuffled_duplicated_delivery() {
-        for seed in 1..=SEEDS {
-            let ops = generate_ops(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9));
-            let (tie_entity, tie_field, tie_value) = expected_tie_value(&ops);
-            let mut reference = BudgetState::new();
-            for op in &ops {
-                reference
-                    .apply(op.clone())
-                    .expect("generated ops are well-formed");
-            }
-
-            let mut rng = Rng::new(seed.wrapping_mul(0x94D0_49BB_1331_11EB));
-            for device in 0..DEVICES {
-                let mut delivery: Vec<SequencedOp> = ops
-                    .iter()
-                    .enumerate()
-                    .map(|(i, op)| sequenced(i as u64 + 1, op.clone()))
-                    .collect();
-                shuffle(&mut rng, &mut delivery);
-                let duplicates = delivery.len() / 8;
-                for _ in 0..duplicates {
-                    let at = rng.below(delivery.len() as u64 + 1) as usize;
-                    let copy = delivery[rng.below(delivery.len() as u64) as usize].clone();
-                    delivery.insert(at, copy);
-                }
-                let mut session = SyncSession::new();
-                let mut rest = delivery.as_slice();
-                while !rest.is_empty() {
-                    let take = (1 + rng.below(7) as usize).min(rest.len());
-                    let (batch, tail) = rest.split_at(take);
-                    session
-                        .apply_delta(batch)
+        for scope in scopes() {
+            for seed in 1..=SEEDS {
+                let ops = generate_ops(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9), scope);
+                let (tie_entity, tie_field, tie_value) = expected_tie_value(&ops);
+                let mut reference = ScopeState::new();
+                for op in &ops {
+                    reference
+                        .apply(op.clone())
                         .expect("generated ops are well-formed");
-                    rest = tail;
+                }
+
+                let mut rng = Rng::new(seed.wrapping_mul(0x94D0_49BB_1331_11EB));
+                for device in 0..DEVICES {
+                    let mut delivery: Vec<SequencedOp> = ops
+                        .iter()
+                        .enumerate()
+                        .map(|(i, op)| sequenced(i as u64 + 1, op.clone()))
+                        .collect();
+                    shuffle(&mut rng, &mut delivery);
+                    let duplicates = delivery.len() / 8;
+                    for _ in 0..duplicates {
+                        let at = rng.below(delivery.len() as u64 + 1) as usize;
+                        let copy = delivery[rng.below(delivery.len() as u64) as usize].clone();
+                        delivery.insert(at, copy);
+                    }
+                    let mut session = SyncSession::new();
+                    let mut rest = delivery.as_slice();
+                    while !rest.is_empty() {
+                        let take = (1 + rng.below(7) as usize).min(rest.len());
+                        let (batch, tail) = rest.split_at(take);
+                        session
+                            .apply_delta(batch)
+                            .expect("generated ops are well-formed");
+                        rest = tail;
+                    }
+                    assert_eq!(
+                        session.state(),
+                        &reference,
+                        "device {device} diverged (seed {seed})"
+                    );
+                    assert_eq!(session.last_seen(), ops.len() as u64);
+                    assert_eq!(
+                        materialized(session.state(), tie_entity, tie_field),
+                        Some(tie_value.clone()),
+                        "device {device} tie-break (seed {seed})"
+                    );
                 }
                 assert_eq!(
-                    session.state(),
-                    &reference,
-                    "device {device} diverged (seed {seed})"
-                );
-                assert_eq!(session.last_seen(), ops.len() as u64);
-                assert_eq!(
-                    materialized(session.state(), tie_entity, tie_field),
-                    Some(tie_value.clone()),
-                    "device {device} tie-break (seed {seed})"
+                    materialized(&reference, tie_entity, tie_field),
+                    Some(tie_value),
+                    "reference tie-break (seed {seed})"
                 );
             }
-            assert_eq!(
-                materialized(&reference, tie_entity, tie_field),
-                Some(tie_value),
-                "reference tie-break (seed {seed})"
-            );
         }
     }
 }

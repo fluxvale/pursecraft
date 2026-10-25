@@ -1,5 +1,6 @@
-//! The durable local oplog store (ADRs 0007, 0009, 0017, 0018): the
-//! append-only framed file a real client boots the engine from.
+//! The durable local oplog store (ADRs 0007, 0009, 0017, 0018, 0020): the
+//! append-only framed file a real client boots the engine from — one file
+//! per log scope, an org's or a budget's, content-blind to the difference.
 //!
 //! [`LocalStore`] wraps the 0017 [`OpLog`] — records carry their canonical
 //! sequences, the `op_id` dedupe index is rebuilt on boot, and an append
@@ -15,14 +16,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::BudgetId;
+use crate::ids::ScopeId;
 use crate::ops::Op;
 use crate::sync::{LogError, OpLog, SequencedOp};
 use crate::wire::{self, OpMeta};
 
 /// File magic; a strict prefix of it is a torn create (ADR 0018).
 const MAGIC: [u8; 8] = *b"PCOPLOG\0";
-const FORMAT_VERSION: u16 = 1;
+/// Version 2: `OpMeta.scope` replaced `OpMeta.budget_id` (ADR 0021). No
+/// read-old migration ships — version 1 was never released and exists in
+/// no store outside test fixtures; a v1 file is refused loudly per ADR
+/// 0018's contract, never misread.
+const FORMAT_VERSION: u16 = 2;
 /// magic (8) + version (2) + reserved (2) + commit marker (8).
 const HEADER_LEN: usize = 20;
 /// Offset of the commit marker within the header.
@@ -503,12 +508,12 @@ impl LocalStore {
                 reason: "file no longer ends at the committed boundary (single-writer contract violated)",
             });
         }
-        if let Some(log_budget) = self.log.budget_id()
-            && log_budget != op.budget_id
+        if let Some(log_scope) = self.log.scope_id()
+            && log_scope != op.scope
         {
-            return Err(LogError::BudgetMismatch {
-                op_budget: op.budget_id,
-                log_budget,
+            return Err(LogError::ScopeMismatch {
+                op_scope: op.scope,
+                log_scope,
             }
             .into());
         }
@@ -558,9 +563,10 @@ impl LocalStore {
         self.log.tip()
     }
 
-    /// The budget this store is scoped to, once the first op fixes it.
-    pub fn budget_id(&self) -> Option<BudgetId> {
-        self.log.budget_id()
+    /// The scope this store is scoped to — an org or a budget — once the
+    /// first op fixes it (ADR 0021).
+    pub fn scope_id(&self) -> Option<ScopeId> {
+        self.log.scope_id()
     }
 
     fn empty(path: &Path, file: File) -> Self {
@@ -708,7 +714,7 @@ mod tests {
         let path = store_path(&tmp, "budget");
         let store = LocalStore::open(&path).unwrap();
         assert_eq!(store.tip(), 0);
-        assert_eq!(store.budget_id(), None);
+        assert_eq!(store.scope_id(), None);
         // The header — magic, version, zero marker — is on disk already,
         // and a reopen stays empty.
         let bytes = std::fs::read(&path).unwrap();
@@ -742,12 +748,12 @@ mod tests {
             assert_eq!(store.append(op.clone()).unwrap(), i as u64 + 1);
         }
         assert_eq!(store.tip(), 3);
-        assert_eq!(store.budget_id(), Some(conv::budget()));
+        assert_eq!(store.scope_id(), Some(ScopeId::Budget(conv::budget())));
         drop(store);
 
         let reopened = LocalStore::open(&path).unwrap();
         assert_eq!(reopened.tip(), 3);
-        assert_eq!(reopened.budget_id(), Some(conv::budget()));
+        assert_eq!(reopened.scope_id(), Some(ScopeId::Budget(conv::budget())));
         let seqs: Vec<u64> = reopened.delta_since(0).map(|s| s.seq).collect();
         assert_eq!(seqs, [1, 2, 3], "file order is canonical order");
         let booted: Vec<Op> = reopened.delta_since(0).map(|s| s.op.clone()).collect();
@@ -790,10 +796,10 @@ mod tests {
         let mut store = LocalStore::open(&path).unwrap();
         store.append(conv::op(1, 10, 0, field, value)).unwrap();
         let mut foreign = conv::op(2, 20, 0, conv::amount(0).0, conv::amount(2).1);
-        foreign.budget_id = BudgetId::new(v7(9, 9)).unwrap();
+        foreign.scope = ScopeId::Budget(crate::ids::BudgetId::new(v7(9, 9)).unwrap());
         assert!(matches!(
             store.append(foreign),
-            Err(StoreError::Scope(LogError::BudgetMismatch { .. }))
+            Err(StoreError::Scope(LogError::ScopeMismatch { .. }))
         ));
         assert_eq!(store.tip(), 1);
         drop(store);
@@ -835,56 +841,60 @@ mod tests {
 
     #[test]
     fn booting_from_the_store_equals_a_fresh_in_memory_replay() {
-        for seed in 1..=3u64 {
-            let ops = conv::generate_ops(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let expected = in_memory_session(&ops);
-            let tmp = TempDir::new("boot");
-            let path = store_path(&tmp, "budget");
-            let mut store = LocalStore::open(&path).unwrap();
-            for op in &ops {
-                store.append(op.clone()).unwrap();
+        for scope in conv::scopes() {
+            for seed in 1..=3u64 {
+                let ops = conv::generate_ops(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), scope);
+                let expected = in_memory_session(&ops);
+                let tmp = TempDir::new("boot");
+                let path = store_path(&tmp, "budget");
+                let mut store = LocalStore::open(&path).unwrap();
+                for op in &ops {
+                    store.append(op.clone()).unwrap();
+                }
+                // Boot from DISK, not the live handle — open() must re-read
+                // and re-validate every frame (ADR 0018).
+                drop(store);
+                let store = LocalStore::open(&path).unwrap();
+                let booted = boot_session(&store);
+                assert_eq!(booted.state(), expected.state(), "seed {seed}");
+                assert_eq!(booted.last_seen(), store.tip());
+                assert_eq!(store.tip(), ops.len() as u64);
             }
-            // Boot from DISK, not the live handle — open() must re-read
-            // and re-validate every frame (ADR 0018).
-            drop(store);
-            let store = LocalStore::open(&path).unwrap();
-            let booted = boot_session(&store);
-            assert_eq!(booted.state(), expected.state(), "seed {seed}");
-            assert_eq!(booted.last_seen(), store.tip());
-            assert_eq!(store.tip(), ops.len() as u64);
         }
     }
 
     #[test]
     fn reordered_and_duplicated_appends_boot_to_the_replay_state() {
-        for seed in 1..=3u64 {
-            let ops = conv::generate_ops(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9));
-            let expected = in_memory_session(&ops);
-            // Delivery order is shuffled and carries duplicates — a
-            // retrying, at-least-once writer (ADR 0007).
-            let mut rng = Rng::new(seed.wrapping_mul(0x94D0_49BB_1331_11EB));
-            let mut delivery = ops.clone();
-            conv::shuffle(&mut rng, &mut delivery);
-            for _ in 0..delivery.len() / 3 {
-                let at = rng.below(delivery.len() as u64 + 1) as usize;
-                let copy = delivery[rng.below(delivery.len() as u64) as usize].clone();
-                delivery.insert(at, copy);
+        for scope in conv::scopes() {
+            for seed in 1..=3u64 {
+                let ops = conv::generate_ops(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9), scope);
+                let expected = in_memory_session(&ops);
+                // Delivery order is shuffled and carries duplicates — a
+                // retrying, at-least-once writer (ADR 0007).
+                let mut rng = Rng::new(seed.wrapping_mul(0x94D0_49BB_1331_11EB));
+                let mut delivery = ops.clone();
+                conv::shuffle(&mut rng, &mut delivery);
+                for _ in 0..delivery.len() / 3 {
+                    let at = rng.below(delivery.len() as u64 + 1) as usize;
+                    let copy = delivery[rng.below(delivery.len() as u64) as usize].clone();
+                    delivery.insert(at, copy);
+                }
+                let tmp = TempDir::new("reorder");
+                let path = store_path(&tmp, "budget");
+                let mut store = LocalStore::open(&path).unwrap();
+                for op in &delivery {
+                    store.append(op.clone()).unwrap();
+                }
+                assert_eq!(store.tip(), ops.len() as u64, "dedupe collapses duplicates");
+                drop(store);
+                let booted = boot_session(&LocalStore::open(&path).unwrap());
+                assert_eq!(
+                    booted.state(),
+                    expected.state(),
+                    "boot equals canonical replay (seed {seed})"
+                );
+                assert_eq!(booted.last_seen(), ops.len() as u64);
             }
-            let tmp = TempDir::new("reorder");
-            let path = store_path(&tmp, "budget");
-            let mut store = LocalStore::open(&path).unwrap();
-            for op in &delivery {
-                store.append(op.clone()).unwrap();
-            }
-            assert_eq!(store.tip(), ops.len() as u64, "dedupe collapses duplicates");
-            drop(store);
-            let booted = boot_session(&LocalStore::open(&path).unwrap());
-            assert_eq!(
-                booted.state(),
-                expected.state(),
-                "boot equals canonical replay (seed {seed})"
-            );
-            assert_eq!(booted.last_seen(), ops.len() as u64);
         }
     }
 
@@ -1323,15 +1333,15 @@ mod tests {
             other => panic!("expected corruption, got {other:?}"),
         }
 
-        // (d) A valid frame scoped to a foreign budget: loud through the
-        // log's own scoping (ADR 0008).
+        // (d) A valid frame scoped to a foreign log: loud through the
+        // log's own scoping (ADRs 0008, 0020).
         let mut foreign = frame_body(1);
-        foreign["meta"]["budget_id"] = serde_json::json!(v7(9, 9).to_string());
+        foreign["meta"]["scope"] = serde_json::json!({"Budget": v7(9, 9).to_string()});
         let mut bytes = good[..starts[1]].to_vec();
         bytes.extend_from_slice(&reframe(&foreign));
         write("foreign-budget", &bytes);
         match LocalStore::open(&store_path(&tmp, "foreign-budget")) {
-            Err(StoreError::Scope(LogError::BudgetMismatch { .. })) => {}
+            Err(StoreError::Scope(LogError::ScopeMismatch { .. })) => {}
             other => panic!("expected a scoping rejection, got {other:?}"),
         }
 
@@ -1555,159 +1565,288 @@ mod tests {
 
     const STORE_SEEDS: u64 = 10;
 
+    /// Both scopes (ADR 0021): the budget log's proof, re-run as an org
+    /// log's — same engine, same store, org-entity pools.
     #[test]
     fn n_devices_converge_through_the_store_backed_rendezvous_loop() {
-        for seed in 1..=STORE_SEEDS {
-            let ops = conv::generate_ops(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let mut rng = Rng::new(seed.wrapping_mul(0x5851_F42D_4C95_7F2D));
-            let tmp = TempDir::new("rendezvous");
-            let path = store_path(&tmp, "budget");
-            let mut store = LocalStore::open(&path).unwrap();
-            let mut queues: Vec<std::collections::VecDeque<Op>> = (0..DEVICES)
-                .map(|d| {
-                    ops[d as usize * OPS_PER_DEVICE..(d as usize + 1) * OPS_PER_DEVICE]
-                        .iter()
-                        .cloned()
-                        .collect()
-                })
-                .collect();
-            let mut sessions: Vec<SyncSession> = (0..DEVICES).map(|_| SyncSession::new()).collect();
-            let mut turns = 0u64;
-            while queues.iter().any(|q| !q.is_empty()) {
-                turns += 1;
-                let d = rng.below(DEVICES) as usize;
-                for _ in 0..1 + rng.below(4) {
-                    if let Some(op) = queues[d].pop_front() {
-                        store.append(op).expect("generated ops are well-formed");
+        for scope in conv::scopes() {
+            for seed in 1..=STORE_SEEDS {
+                let ops = conv::generate_ops(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), scope);
+                let mut rng = Rng::new(seed.wrapping_mul(0x5851_F42D_4C95_7F2D));
+                let tmp = TempDir::new("rendezvous");
+                let path = store_path(&tmp, "budget");
+                let mut store = LocalStore::open(&path).unwrap();
+                let mut queues: Vec<std::collections::VecDeque<Op>> = (0..DEVICES)
+                    .map(|d| {
+                        ops[d as usize * OPS_PER_DEVICE..(d as usize + 1) * OPS_PER_DEVICE]
+                            .iter()
+                            .cloned()
+                            .collect()
+                    })
+                    .collect();
+                let mut sessions: Vec<SyncSession> =
+                    (0..DEVICES).map(|_| SyncSession::new()).collect();
+                let mut turns = 0u64;
+                while queues.iter().any(|q| !q.is_empty()) {
+                    turns += 1;
+                    let d = rng.below(DEVICES) as usize;
+                    for _ in 0..1 + rng.below(4) {
+                        if let Some(op) = queues[d].pop_front() {
+                            store.append(op).expect("generated ops are well-formed");
+                        }
+                    }
+                    for session in &mut sessions {
+                        if rng.below(3) == 0 {
+                            // Mostly pull only new ops; sometimes re-pull an
+                            // overlap — at-least-once delivery.
+                            let since = if rng.below(4) == 0 {
+                                session.last_seen().saturating_sub(rng.below(5))
+                            } else {
+                                session.last_seen()
+                            };
+                            session
+                                .apply_delta(store.delta_since(since))
+                                .expect("generated ops are well-formed");
+                        }
+                    }
+                    match turns {
+                        // The rendezvous crashes and reboots from disk.
+                        30 | 70 => store = LocalStore::open(&path).unwrap(),
+                        // Device 0 reboots: a fresh session booted from the store.
+                        50 => sessions[0] = boot_session(&store),
+                        _ => {}
                     }
                 }
                 for session in &mut sessions {
-                    if rng.below(3) == 0 {
-                        // Mostly pull only new ops; sometimes re-pull an
-                        // overlap — at-least-once delivery.
-                        let since = if rng.below(4) == 0 {
-                            session.last_seen().saturating_sub(rng.below(5))
-                        } else {
-                            session.last_seen()
-                        };
-                        session
-                            .apply_delta(store.delta_since(since))
-                            .expect("generated ops are well-formed");
-                    }
+                    // First full drain brings the session to the tip; a second
+                    // full re-delivery must be pure duplicates.
+                    let drained = session.apply_delta(store.delta_since(0)).unwrap();
+                    assert_eq!(drained.last_seen, store.tip());
+                    let summary = session.apply_delta(store.delta_since(0)).unwrap();
+                    assert_eq!(summary.last_seen, store.tip());
+                    assert_eq!(summary.applied, 0, "everything was already applied");
+                    assert_eq!(summary.stale, 0);
+                    assert_eq!(summary.duplicates, store.tip());
                 }
-                match turns {
-                    // The rendezvous crashes and reboots from disk.
-                    30 | 70 => store = LocalStore::open(&path).unwrap(),
-                    // Device 0 reboots: a fresh session booted from the store.
-                    50 => sessions[0] = boot_session(&store),
-                    _ => {}
-                }
-            }
-            for session in &mut sessions {
-                // First full drain brings the session to the tip; a second
-                // full re-delivery must be pure duplicates.
-                let drained = session.apply_delta(store.delta_since(0)).unwrap();
-                assert_eq!(drained.last_seen, store.tip());
-                let summary = session.apply_delta(store.delta_since(0)).unwrap();
-                assert_eq!(summary.last_seen, store.tip());
-                assert_eq!(summary.applied, 0, "everything was already applied");
-                assert_eq!(summary.stale, 0);
-                assert_eq!(summary.duplicates, store.tip());
-            }
 
-            let reference = sessions[0].state().clone();
-            for (i, session) in sessions.iter().enumerate() {
-                assert_eq!(
-                    session.state(),
-                    &reference,
-                    "device {i} diverged (seed {seed})"
+                let reference = sessions[0].state().clone();
+                for (i, session) in sessions.iter().enumerate() {
+                    assert_eq!(
+                        session.state(),
+                        &reference,
+                        "device {i} diverged (seed {seed})"
+                    );
+                }
+                // The reference equals a session booted from the store itself.
+                let canonical = boot_session(&store);
+                assert_eq!(canonical.state(), &reference, "seed {seed}");
+                assert_eq!(canonical.last_seen(), store.tip());
+                assert_eq!(store.tip(), (DEVICES as usize * OPS_PER_DEVICE) as u64);
+
+                // The forced equal-HLC tie: every replica's materialized value
+                // is the op_id tie-break's pick (ADR 0016), asserted directly.
+                let (tie_entity, tie_field, tie_value) = conv::expected_tie_value(&ops);
+                let mut replicas = sessions.iter().map(|s| s.state());
+                let first_tie = conv::materialized(
+                    replicas.next().expect("at least one session"),
+                    tie_entity,
+                    tie_field,
                 );
-            }
-            // The reference equals a session booted from the store itself.
-            let canonical = boot_session(&store);
-            assert_eq!(canonical.state(), &reference, "seed {seed}");
-            assert_eq!(canonical.last_seen(), store.tip());
-            assert_eq!(store.tip(), (DEVICES as usize * OPS_PER_DEVICE) as u64);
-
-            // The forced equal-HLC tie: every replica's materialized value
-            // is the op_id tie-break's pick (ADR 0016), asserted directly.
-            let (tie_entity, tie_field, tie_value) = conv::expected_tie_value(&ops);
-            let mut replicas = sessions.iter().map(|s| s.state());
-            let first_tie = conv::materialized(
-                replicas.next().expect("at least one session"),
-                tie_entity,
-                tie_field,
-            );
-            assert_eq!(first_tie, Some(tie_value), "seed {seed}");
-            for state in replicas {
+                assert_eq!(first_tie, Some(tie_value), "seed {seed}");
+                for state in replicas {
+                    assert_eq!(
+                        conv::materialized(state, tie_entity, tie_field),
+                        first_tie,
+                        "seed {seed}"
+                    );
+                }
                 assert_eq!(
-                    conv::materialized(state, tie_entity, tie_field),
+                    conv::materialized(canonical.state(), tie_entity, tie_field),
                     first_tie,
                     "seed {seed}"
                 );
             }
-            assert_eq!(
-                conv::materialized(canonical.state(), tie_entity, tie_field),
-                first_tie,
-                "seed {seed}"
-            );
         }
     }
 
+    /// Both scopes (ADR 0021): shuffled delivery against the store boot
+    /// state.
     #[test]
     fn shuffled_delivery_converges_to_the_store_boot_state() {
-        for seed in 1..=STORE_SEEDS {
-            let ops = conv::generate_ops(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9));
-            let tmp = TempDir::new("delivery");
-            let mut store = LocalStore::open(&store_path(&tmp, "budget")).unwrap();
-            for op in &ops {
-                store.append(op.clone()).unwrap();
-            }
-            // The reference is a session booted FROM the store (ADR 0018).
-            let reference = boot_session(&store);
-            let (tie_entity, tie_field, tie_value) = conv::expected_tie_value(&ops);
-            assert_eq!(
-                conv::materialized(reference.state(), tie_entity, tie_field),
-                Some(tie_value.clone()),
-                "reference tie-break (seed {seed})"
-            );
-
-            let mut rng = Rng::new(seed.wrapping_mul(0x94D0_49BB_1331_11EB));
-            for device in 0..DEVICES {
-                let mut delivery: Vec<SequencedOp> = ops
-                    .iter()
-                    .enumerate()
-                    .map(|(i, op)| conv::sequenced(i as u64 + 1, op.clone()))
-                    .collect();
-                conv::shuffle(&mut rng, &mut delivery);
-                let duplicates = delivery.len() / 8;
-                for _ in 0..duplicates {
-                    let at = rng.below(delivery.len() as u64 + 1) as usize;
-                    let copy = delivery[rng.below(delivery.len() as u64) as usize].clone();
-                    delivery.insert(at, copy);
+        for scope in conv::scopes() {
+            for seed in 1..=STORE_SEEDS {
+                let ops = conv::generate_ops(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9), scope);
+                let tmp = TempDir::new("delivery");
+                let mut store = LocalStore::open(&store_path(&tmp, "budget")).unwrap();
+                for op in &ops {
+                    store.append(op.clone()).unwrap();
                 }
-                let mut session = SyncSession::new();
-                let mut rest = delivery.as_slice();
-                while !rest.is_empty() {
-                    let take = (1 + rng.below(7) as usize).min(rest.len());
-                    let (batch, tail) = rest.split_at(take);
-                    session
-                        .apply_delta(batch)
-                        .expect("generated ops are well-formed");
-                    rest = tail;
-                }
+                // The reference is a session booted FROM the store (ADR 0018).
+                let reference = boot_session(&store);
+                let (tie_entity, tie_field, tie_value) = conv::expected_tie_value(&ops);
                 assert_eq!(
-                    session.state(),
-                    reference.state(),
-                    "device {device} diverged (seed {seed})"
-                );
-                assert_eq!(session.last_seen(), ops.len() as u64);
-                assert_eq!(
-                    conv::materialized(session.state(), tie_entity, tie_field),
+                    conv::materialized(reference.state(), tie_entity, tie_field),
                     Some(tie_value.clone()),
-                    "device {device} tie-break (seed {seed})"
+                    "reference tie-break (seed {seed})"
                 );
+
+                let mut rng = Rng::new(seed.wrapping_mul(0x94D0_49BB_1331_11EB));
+                for device in 0..DEVICES {
+                    let mut delivery: Vec<SequencedOp> = ops
+                        .iter()
+                        .enumerate()
+                        .map(|(i, op)| conv::sequenced(i as u64 + 1, op.clone()))
+                        .collect();
+                    conv::shuffle(&mut rng, &mut delivery);
+                    let duplicates = delivery.len() / 8;
+                    for _ in 0..duplicates {
+                        let at = rng.below(delivery.len() as u64 + 1) as usize;
+                        let copy = delivery[rng.below(delivery.len() as u64) as usize].clone();
+                        delivery.insert(at, copy);
+                    }
+                    let mut session = SyncSession::new();
+                    let mut rest = delivery.as_slice();
+                    while !rest.is_empty() {
+                        let take = (1 + rng.below(7) as usize).min(rest.len());
+                        let (batch, tail) = rest.split_at(take);
+                        session
+                            .apply_delta(batch)
+                            .expect("generated ops are well-formed");
+                        rest = tail;
+                    }
+                    assert_eq!(
+                        session.state(),
+                        reference.state(),
+                        "device {device} diverged (seed {seed})"
+                    );
+                    assert_eq!(session.last_seen(), ops.len() as u64);
+                    assert_eq!(
+                        conv::materialized(session.state(), tie_entity, tie_field),
+                        Some(tie_value.clone()),
+                        "device {device} tie-break (seed {seed})"
+                    );
+                }
             }
         }
+    }
+
+    /// Boot-from-store for an org log specifically (ADR 0021): org ops
+    /// persist, boot, and resolve exactly as budget ops do — here
+    /// asserted on the org projections, not just state equality.
+    #[test]
+    fn an_org_store_boots_into_the_resolved_org_state() {
+        use crate::domain::{EntityKind, Field, OrgField, Value};
+        use crate::ids::{EntityId, OrgId, UserId};
+        use crate::ops::Op;
+
+        let ms: u64 = 1 << 40;
+        let org = OrgId::new(v7(ms, 1)).unwrap();
+        let scope = ScopeId::Org(org);
+        let terence = UserId::new(v7(ms, 90)).unwrap();
+        let partner = UserId::new(v7(ms, 91)).unwrap();
+        let write = |i: u64, kind: EntityKind, entity_rand: u64, field: Field, value: Value| Op {
+            op_id: crate::ids::OpId::new(v7(ms + i, i)).unwrap(),
+            scope,
+            device_id: crate::ids::DeviceId::new(Uuid::nil()).unwrap(),
+            user_id: terence,
+            entity_kind: kind,
+            entity_id: EntityId::new(v7(ms, entity_rand)).unwrap(),
+            field,
+            value,
+            hlc: crate::hlc::Hlc {
+                physical_ms: ms + i,
+                logical: 0,
+            },
+        };
+        let ops = vec![
+            write(
+                1,
+                EntityKind::Organization,
+                1,
+                Field::Organization(OrgField::PersonalFor),
+                Value::User(terence),
+            ),
+            write(
+                2,
+                EntityKind::Membership,
+                2,
+                Field::Membership(crate::domain::MembershipField::UserId),
+                Value::User(terence),
+            ),
+            write(
+                3,
+                EntityKind::Membership,
+                2,
+                Field::Membership(crate::domain::MembershipField::Role),
+                Value::Role(crate::domain::MembershipRole::Owner),
+            ),
+            write(
+                4,
+                EntityKind::Membership,
+                3,
+                Field::Membership(crate::domain::MembershipField::UserId),
+                Value::User(partner),
+            ),
+            write(
+                5,
+                EntityKind::Membership,
+                3,
+                Field::Membership(crate::domain::MembershipField::Role),
+                Value::Role(crate::domain::MembershipRole::Viewer),
+            ),
+            write(
+                6,
+                EntityKind::Budget,
+                4,
+                Field::Budget(crate::domain::BudgetField::Name),
+                Value::Text("Home".into()),
+            ),
+        ];
+
+        let tmp = TempDir::new("orgstore");
+        let path = store_path(&tmp, "org");
+        let mut store = LocalStore::open(&path).unwrap();
+        for op in &ops {
+            store.append(op.clone()).unwrap();
+        }
+        assert_eq!(store.scope_id(), Some(scope));
+        drop(store);
+
+        // Boot: reopen from disk, replay, and resolve — the personal org
+        // invariant and both roles survive the round trip.
+        let reopened = LocalStore::open(&path).unwrap();
+        assert_eq!(reopened.scope_id(), Some(scope));
+        let session = boot_session(&reopened);
+        let state = session.state();
+        assert_eq!(crate::org::live_personal_orgs([state], terence), vec![org]);
+        assert_eq!(
+            crate::org::membership_role(state, terence),
+            Some(crate::domain::MembershipRole::Owner)
+        );
+        assert_eq!(
+            crate::org::membership_role(state, partner),
+            Some(crate::domain::MembershipRole::Viewer)
+        );
+        assert_eq!(crate::org::visible_budgets(state).len(), 1);
+    }
+
+    /// Version 1 stores (the pre-scope meta shape) are refused loudly —
+    /// never misread (ADRs 0018, 0020). Nothing was ever released on v1,
+    /// so no read-old migration exists.
+    #[test]
+    fn a_version_1_store_is_refused_loudly() {
+        let tmp = TempDir::new("v1");
+        let path = store_path(&tmp, "v1");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PCOPLOG\0");
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // version 1
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&marker_bytes(Marker::Committed(0)).unwrap());
+        std::fs::write(&path, &bytes).unwrap();
+        match LocalStore::open(&path) {
+            Err(StoreError::UnsupportedVersion { found, .. }) => assert_eq!(found, 1),
+            other => panic!("expected a version refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "untouched");
     }
 }

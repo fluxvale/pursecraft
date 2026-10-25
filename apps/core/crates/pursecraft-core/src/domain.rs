@@ -1,18 +1,18 @@
 //! Domain entities and the typed field/value vocabulary ops write
-//! (ADRs 0007, 0008, 0016).
+//! (ADRs 0007, 0016, 0020).
 //!
-//! Every entity carries the same envelope: a UUIDv7 id, the `budget_id`
-//! scope, and a `deleted` tombstone flag modeled as an ordinary field so
-//! deletes ride the same per-field LWW path as any other write. Entity
-//! fields are `Option` until an op sets them — money must never default
-//! silently to zero (ADR 0016).
+//! Every entity carries the same envelope: a UUIDv7 id, the `scope` of its
+//! log (an org or a budget, ADR 0021), and a `deleted` tombstone flag
+//! modeled as an ordinary field so deletes ride the same per-field LWW path
+//! as any other write. Entity fields are `Option` until an op sets them —
+//! money must never default silently to zero (ADR 0016).
 
 use serde::{Deserialize, Serialize};
 
 use crate::date::{Date, Month};
 use crate::ids::{
-    AccountId, BudgetId, CategoryGroupId, CategoryId, EntityId, MonthCategoryId, PayeeId,
-    TransactionId,
+    AccountId, BudgetId, CategoryGroupId, CategoryId, EntityId, MonthCategoryId, OrgId, PayeeId,
+    ScopeId, TransactionId, UserId,
 };
 use crate::money::Milliunits;
 
@@ -39,10 +39,47 @@ pub enum Cleared {
     Reconciled,
 }
 
+/// A user's role in an organization (ADR 0021): ADR 0008's owner/editor/
+/// viewer set, transferred to the org level. Roles are data — enforcing
+/// them is the auth slice's job.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum MembershipRole {
+    Owner,
+    Editor,
+    Viewer,
+}
+
+/// An organization — the ownership scope for budgets (ADR 0021). Exactly
+/// one per org log, its id equal to the log's scope; `personal_for` marks
+/// the default org every user is provisioned with.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Organization {
+    pub id: OrgId,
+    pub scope: ScopeId,
+    pub deleted: bool,
+    pub name: Option<String>,
+    pub personal_for: Option<UserId>,
+}
+
+/// A user's membership in an organization, with a role (ADR 0021). Lives
+/// in the org's log; well-formed data has one per (org, user), and racing
+/// twins resolve deterministically to the earliest-created (ADR 0021).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Membership {
+    pub id: EntityId,
+    pub scope: ScopeId,
+    pub deleted: bool,
+    pub user_id: Option<UserId>,
+    pub role: Option<MembershipRole>,
+}
+
+/// A budget, owned by the organization whose log this entity lives in —
+/// the scope is the tie (ADR 0021). Budget *content* entities live in the
+/// budget's own log; this entity is the org-visible registry entry.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Budget {
     pub id: BudgetId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub deleted: bool,
     pub name: Option<String>,
 }
@@ -50,7 +87,7 @@ pub struct Budget {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Account {
     pub id: AccountId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub deleted: bool,
     pub name: Option<String>,
     pub kind: Option<AccountKind>,
@@ -59,7 +96,7 @@ pub struct Account {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CategoryGroup {
     pub id: CategoryGroupId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub deleted: bool,
     pub name: Option<String>,
 }
@@ -67,7 +104,7 @@ pub struct CategoryGroup {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Category {
     pub id: CategoryId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub deleted: bool,
     pub name: Option<String>,
     pub group_id: Option<CategoryGroupId>,
@@ -77,7 +114,7 @@ pub struct Category {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Payee {
     pub id: PayeeId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub deleted: bool,
     pub name: Option<String>,
 }
@@ -85,7 +122,7 @@ pub struct Payee {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Transaction {
     pub id: TransactionId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub deleted: bool,
     pub account_id: Option<AccountId>,
     pub date: Option<Date>,
@@ -101,7 +138,7 @@ pub struct Transaction {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct MonthCategory {
     pub id: MonthCategoryId,
-    pub budget_id: BudgetId,
+    pub scope: ScopeId,
     pub deleted: bool,
     pub month: Option<Month>,
     pub category_id: Option<CategoryId>,
@@ -110,6 +147,8 @@ pub struct MonthCategory {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum EntityKind {
+    Organization,
+    Membership,
     Budget,
     Account,
     CategoryGroup,
@@ -121,6 +160,8 @@ pub enum EntityKind {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Entity {
+    Organization(Organization),
+    Membership(Membership),
     Budget(Budget),
     Account(Account),
     CategoryGroup(CategoryGroup),
@@ -133,6 +174,8 @@ pub enum Entity {
 impl Entity {
     pub const fn kind(&self) -> EntityKind {
         match self {
+            Self::Organization(_) => EntityKind::Organization,
+            Self::Membership(_) => EntityKind::Membership,
             Self::Budget(_) => EntityKind::Budget,
             Self::Account(_) => EntityKind::Account,
             Self::CategoryGroup(_) => EntityKind::CategoryGroup,
@@ -145,31 +188,45 @@ impl Entity {
 
     /// An all-`None`, not-deleted entity of `kind` — materialized by the
     /// first op that targets `id` (ADR 0016).
-    pub(crate) fn shell(kind: EntityKind, id: EntityId, budget_id: BudgetId) -> Self {
+    pub(crate) fn shell(kind: EntityKind, id: EntityId, scope: ScopeId) -> Self {
         let uuid = id.as_uuid();
         match kind {
+            EntityKind::Organization => Self::Organization(Organization {
+                id: OrgId::from_raw(uuid),
+                scope,
+                deleted: false,
+                name: None,
+                personal_for: None,
+            }),
+            EntityKind::Membership => Self::Membership(Membership {
+                id,
+                scope,
+                deleted: false,
+                user_id: None,
+                role: None,
+            }),
             EntityKind::Budget => Self::Budget(Budget {
                 id: BudgetId::from_raw(uuid),
-                budget_id,
+                scope,
                 deleted: false,
                 name: None,
             }),
             EntityKind::Account => Self::Account(Account {
                 id: AccountId::from_raw(uuid),
-                budget_id,
+                scope,
                 deleted: false,
                 name: None,
                 kind: None,
             }),
             EntityKind::CategoryGroup => Self::CategoryGroup(CategoryGroup {
                 id: CategoryGroupId::from_raw(uuid),
-                budget_id,
+                scope,
                 deleted: false,
                 name: None,
             }),
             EntityKind::Category => Self::Category(Category {
                 id: CategoryId::from_raw(uuid),
-                budget_id,
+                scope,
                 deleted: false,
                 name: None,
                 group_id: None,
@@ -177,13 +234,13 @@ impl Entity {
             }),
             EntityKind::Payee => Self::Payee(Payee {
                 id: PayeeId::from_raw(uuid),
-                budget_id,
+                scope,
                 deleted: false,
                 name: None,
             }),
             EntityKind::Transaction => Self::Transaction(Transaction {
                 id: TransactionId::from_raw(uuid),
-                budget_id,
+                scope,
                 deleted: false,
                 account_id: None,
                 date: None,
@@ -195,7 +252,7 @@ impl Entity {
             }),
             EntityKind::MonthCategory => Self::MonthCategory(MonthCategory {
                 id: MonthCategoryId::from_raw(uuid),
-                budget_id,
+                scope,
                 deleted: false,
                 month: None,
                 category_id: None,
@@ -211,6 +268,8 @@ impl Entity {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Field {
     Deleted,
+    Organization(OrgField),
+    Membership(MembershipField),
     Budget(BudgetField),
     Account(AccountField),
     CategoryGroup(CategoryGroupField),
@@ -218,6 +277,18 @@ pub enum Field {
     Payee(PayeeField),
     Transaction(TransactionField),
     MonthCategory(MonthCategoryField),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum OrgField {
+    Name,
+    PersonalFor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum MembershipField {
+    UserId,
+    Role,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
@@ -267,13 +338,15 @@ pub enum MonthCategoryField {
 }
 
 /// A field value — the closed vocabulary the op log writes, and the future
-/// single serialization choke point (ADR 0009, ADR 0016).
+/// single serialization choke point (ADR 0009, ADR 0016, ADR 0021).
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Value {
     Bool(bool),
     Text(String),
     Milliunits(Milliunits),
     Id(EntityId),
+    User(UserId),
+    Role(MembershipRole),
     Date(Date),
     Month(Month),
     AccountKind(AccountKind),
@@ -305,6 +378,20 @@ impl Value {
     pub(crate) fn into_id(self) -> Option<EntityId> {
         match self {
             Self::Id(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_user(self) -> Option<UserId> {
+        match self {
+            Self::User(u) => Some(u),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_role(self) -> Option<MembershipRole> {
+        match self {
+            Self::Role(r) => Some(r),
             _ => None,
         }
     }

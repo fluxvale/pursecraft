@@ -1,12 +1,14 @@
-//! Deterministic referential resolution at projection time (ADRs 0007, 0016).
+//! Deterministic referential resolution at projection time (ADRs 0007, 0016)
+//! — budget-content projections; org-level resolution lives in
+//! [`crate::org`] (ADR 0021).
 //!
-//! Resolution is a pure projection over [`BudgetState`] — it never mutates
+//! Resolution is a pure projection over [`ScopeState`] — it never mutates
 //! stored state, so the op log stays faithful and the rules can change
 //! without migrating data.
 
 use crate::domain::{Category, Entity, MonthCategory, Transaction};
 use crate::ids::{AccountId, CategoryGroupId, CategoryId, EntityId, PayeeId};
-use crate::ops::BudgetState;
+use crate::ops::ScopeState;
 
 /// Where a transaction's category assignment lands after resolution.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,7 +22,7 @@ pub enum CategoryResolution {
 /// YNAB-style re-parent (ADR 0007): a deleted or missing category falls
 /// back to the earliest-created surviving category — minimum UUIDv7, which
 /// is chronological within clock skew — else uncategorized (ADR 0016).
-pub fn transaction_category(state: &BudgetState, txn: &Transaction) -> CategoryResolution {
+pub fn transaction_category(state: &ScopeState, txn: &Transaction) -> CategoryResolution {
     let Some(&requested) = txn.category_id.as_ref() else {
         return CategoryResolution::Uncategorized;
     };
@@ -34,7 +36,7 @@ pub fn transaction_category(state: &BudgetState, txn: &Transaction) -> CategoryR
 }
 
 /// The earliest-created surviving category in the budget, if any.
-pub fn fallback_category(state: &BudgetState) -> Option<CategoryId> {
+pub fn fallback_category(state: &ScopeState) -> Option<CategoryId> {
     state
         .entities()
         .filter_map(|e| match e {
@@ -46,7 +48,7 @@ pub fn fallback_category(state: &BudgetState) -> Option<CategoryId> {
 
 /// A transaction is visible only if it and its account survive; deleting an
 /// account hides its transactions (cascade tombstone, ADR 0016).
-pub fn transaction_visible(state: &BudgetState, txn: &Transaction) -> bool {
+pub fn transaction_visible(state: &ScopeState, txn: &Transaction) -> bool {
     !txn.deleted
         && txn
             .account_id
@@ -54,13 +56,13 @@ pub fn transaction_visible(state: &BudgetState, txn: &Transaction) -> bool {
 }
 
 /// A deleted or missing payee resolves to "no payee" (ADR 0016).
-pub fn transaction_payee(state: &BudgetState, txn: &Transaction) -> Option<PayeeId> {
+pub fn transaction_payee(state: &ScopeState, txn: &Transaction) -> Option<PayeeId> {
     txn.payee_id.filter(|&payee| payee_alive(state, payee))
 }
 
 /// A category whose group is deleted or missing renders ungrouped — no
 /// data-losing re-parent (ADR 0016).
-pub fn category_group(state: &BudgetState, category: &Category) -> Option<CategoryGroupId> {
+pub fn category_group(state: &ScopeState, category: &Category) -> Option<CategoryGroupId> {
     category.group_id.filter(|&group| {
         matches!(
             state.entity(&EntityId::from_raw(group.as_uuid())),
@@ -71,25 +73,25 @@ pub fn category_group(state: &BudgetState, category: &Category) -> Option<Catego
 
 /// A month × category cell is visible only if its category survives
 /// (ADR 0016).
-pub fn month_category_visible(state: &BudgetState, cell: &MonthCategory) -> bool {
+pub fn month_category_visible(state: &ScopeState, cell: &MonthCategory) -> bool {
     !cell.deleted && cell.category_id.is_some_and(|c| category_alive(state, c))
 }
 
-fn category_alive(state: &BudgetState, id: CategoryId) -> bool {
+fn category_alive(state: &ScopeState, id: CategoryId) -> bool {
     matches!(
         state.entity(&EntityId::from_raw(id.as_uuid())),
         Some(Entity::Category(c)) if !c.deleted
     )
 }
 
-fn account_alive(state: &BudgetState, id: AccountId) -> bool {
+fn account_alive(state: &ScopeState, id: AccountId) -> bool {
     matches!(
         state.entity(&EntityId::from_raw(id.as_uuid())),
         Some(Entity::Account(a)) if !a.deleted
     )
 }
 
-fn payee_alive(state: &BudgetState, id: PayeeId) -> bool {
+fn payee_alive(state: &ScopeState, id: PayeeId) -> bool {
     matches!(
         state.entity(&EntityId::from_raw(id.as_uuid())),
         Some(Entity::Payee(p)) if !p.deleted
@@ -105,7 +107,9 @@ mod tests {
         TransactionField, Value,
     };
     use crate::hlc::Hlc;
-    use crate::ids::{BudgetId, DeviceId, MonthCategoryId, PayeeId, TransactionId, UserId};
+    use crate::ids::{
+        BudgetId, DeviceId, MonthCategoryId, PayeeId, ScopeId, TransactionId, UserId,
+    };
     use crate::money::Milliunits;
     use crate::ops::{Applied, Op};
     use crate::testkit::v7;
@@ -115,7 +119,7 @@ mod tests {
     /// increasing HLCs into one budget.
     #[derive(Default)]
     struct Fixture {
-        state: BudgetState,
+        state: ScopeState,
         ms: u64,
     }
 
@@ -130,7 +134,7 @@ mod tests {
             self.ms += 1;
             let op = Op {
                 op_id: crate::ids::OpId::new(v7(self.ms, entity_rand)).unwrap(),
-                budget_id: budget(),
+                scope: ScopeId::Budget(budget()),
                 device_id: DeviceId::new(Uuid::nil()).unwrap(),
                 user_id: UserId::new(Uuid::nil()).unwrap(),
                 entity_kind: kind,
@@ -158,7 +162,7 @@ mod tests {
         fn synthetic_txn(category: Option<CategoryId>) -> Transaction {
             Transaction {
                 id: TransactionId::new(v7(100, TXN)).unwrap(),
-                budget_id: budget(),
+                scope: ScopeId::Budget(budget()),
                 deleted: false,
                 account_id: None,
                 date: None,
@@ -422,7 +426,7 @@ mod tests {
         let fx = fx_with_categories();
         let cell = MonthCategory {
             id: MonthCategoryId::new(v7(100, CELL_RAND)).unwrap(),
-            budget_id: budget(),
+            scope: ScopeId::Budget(budget()),
             deleted: false,
             month: Some(Month::new(2026, 10).unwrap()),
             category_id: None,

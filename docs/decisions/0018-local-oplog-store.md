@@ -23,7 +23,10 @@ it true by construction and to test it byte for byte.
 new dependency) persists ops as an append-only sequence of checksummed
 frames in one file:
 
-- **Header** (20 bytes): magic `PCOPLOG\0`; u16 format version (1); u16
+- **Header** (20 bytes): magic `PCOPLOG\0`; u16 format version (1)
+  *(bumped to 2 by [ADR 0021](0021-organizations-own-budgets.md) — the
+  meta shape changed (`budget_id` → `scope`); v1 files are refused
+  loudly, and none shipped)*; u16
   reserved — zero today, and a future extension must set it, because
   readers refuse a set reserved word rather than misread the file; and the
   **two-phase commit marker** (see durability below).
@@ -66,7 +69,8 @@ not fit the entity kind, say) therefore stores fine and wedges replay
 loudly and deterministically at its sequence — exactly the engine's
 designed behavior for a bad op inside any delta (ADR 0017: the first
 failing op aborts the delta, the cursor stops, retrying reproduces the
-error). Capture mints ops through `BudgetState::apply` and cannot mint
+error). Capture mints ops through `BudgetState::apply` *(renamed
+  `ScopeState::apply`, ADR [0020](0021-organizations-own-budgets.md))* and cannot mint
 them; a hostile member feeding them is the transport/auth slice's
 problem — the same posture as ADR 0017's HLC poisoning. The wedge
 localizes deterministically: applying `delta_since(0)` one op at a time
@@ -154,8 +158,10 @@ other platforms rely on the create-fsync alone).
 ### Integration
 
 `LocalStore` wraps the 0017 `OpLog` and mirrors its surface — `append`
-(budget scoping + `op_id` dedupe + durable commit), `delta_since`, `tip`,
-`budget_id` — so the engine's convergence proofs run against the backed
+(scope scoping + `op_id` dedupe + durable commit), `delta_since`, `tip`,
+`budget_id` *(→ `scope_id`, and the scoping is an org's or a budget's —
+[ADR 0021](0021-organizations-own-budgets.md))* — so the engine's
+convergence proofs run against the backed
 engine, not a parallel toy: the rendezvous loop is re-run with a
 store-backed log, mid-run restarts (drop and reopen from disk) included,
 and every device state is asserted equal to a fresh session booted from
