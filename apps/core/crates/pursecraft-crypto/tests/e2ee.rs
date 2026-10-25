@@ -5,7 +5,7 @@
 
 use pursecraft_core::hlc::Hlc;
 use pursecraft_core::ids::{BudgetId, DeviceId, OpId, OrgId, ScopeId, UserId};
-use pursecraft_core::wire::OpMeta;
+use pursecraft_core::wire::{OpMeta, PayloadCipher};
 use uuid::Uuid;
 
 use pursecraft_crypto::{CryptoError, DeviceKeypair, Grant, KeyChain};
@@ -333,13 +333,14 @@ fn plaintext_and_envelopes_are_shape_disjoint() {
 #[test]
 fn wraps_survive_their_wire_form_and_refuse_wrong_slots() {
     let mut p = pair();
-    // The wire form round-trips (the channel relays opaque bytes).
+    // The wire form round-trips (the channel relays opaque bytes — plain
+    // serde over the versioned record, ADR 0022).
     let invite =
         p.a.wrap_org_keys_to(&p.org, &p.b.device_public(), Grant::AllEpochs)
             .unwrap();
     assert_eq!(invite.len(), 1, "epoch 0 is the only epoch so far");
-    let wire = invite[0].to_wire().unwrap();
-    let back = pursecraft_crypto::WrappedOrgKey::from_wire(&wire).unwrap();
+    let wire = serde_json::to_string(&invite[0]).unwrap();
+    let back: pursecraft_crypto::WrappedOrgKey = serde_json::from_str(&wire).unwrap();
     assert_eq!(back, invite[0]);
 
     // A doctored wrap — relabeled onto another epoch or org — derives
@@ -613,4 +614,69 @@ fn b64_encode(bytes: &[u8]) -> String {
 fn render(mut json: serde_json::Value, field: &str, bytes: &[u8]) -> String {
     json[field] = serde_json::Value::String(b64_encode(bytes));
     serde_json::to_string(&json).unwrap()
+}
+
+#[test]
+fn rotation_touches_only_its_own_orgs_logs() {
+    // A device in two orgs rotates one: the other org's keys — and the
+    // envelopes still sealed under them — are untouched (the `continue`
+    // in rotate's log walk, ADR 0021's scope isolation).
+    let mut p = pair();
+    let second_org = OrgId::new(v7(MS, 90)).unwrap();
+    let second_budget = ScopeId::Budget(BudgetId::new(v7(MS, 91)).unwrap());
+    p.a.create_org(second_org).unwrap();
+    p.a.add_log(second_org, second_budget).unwrap();
+
+    let before =
+        p.a.seal_payload(&meta(1, second_budget), b"other org's data")
+            .unwrap();
+    let rotation = p.a.rotate(&p.org, &[p.a.device_public()]).unwrap();
+    // The rotation re-keyed exactly the first org's two logs — the
+    // second org's budget log is not among them.
+    assert_eq!(rotation.log_wraps.len(), 2);
+    assert!(rotation.log_wraps.iter().all(|w| w.scope != second_budget));
+
+    // And the untouched org's envelope still opens at its own epoch.
+    assert_eq!(
+        String::from_utf8(p.a.open_payload(&meta(1, second_budget), &before).unwrap()).unwrap(),
+        "other org's data"
+    );
+    // While the rotated org now seals one epoch higher.
+    let after =
+        p.a.seal_payload(&meta(2, p.budget_scope), b"fresh epoch")
+            .unwrap();
+    assert!(after.contains(r#""e":1"#), "{after}");
+}
+
+#[test]
+fn sealing_for_a_scope_without_keys_is_loudly_refused() {
+    // No key material for the scope at all: the seal side answers
+    // MissingEpoch before minting anything (the writer-side twin of the
+    // reader-side staleness error — an app wiring bug surfaces
+    // immediately, never as a silently-unreadable op).
+    let p = pair();
+    let unknown = ScopeId::Budget(BudgetId::new(v7(MS, 92)).unwrap());
+    assert_eq!(
+        p.a.seal_payload(&meta(1, unknown), b"nowhere to seal"),
+        Err(CryptoError::MissingEpoch {
+            scope: unknown,
+            epoch: 0,
+            held: None,
+        })
+    );
+}
+
+#[test]
+fn the_cipher_round_trips_its_keychain() {
+    // ScopeCipher consumes the chain; into_inner hands it back for the
+    // chain-level operations (rotate, invite) without losing any keys.
+    let p = pair();
+    let cipher = pursecraft_crypto::ScopeCipher::new(p.a);
+    let m = meta(1, p.budget_scope);
+    let sealed = cipher.seal(&m, "payload".into()).unwrap();
+    let chain = cipher.into_inner();
+    assert_eq!(
+        String::from_utf8(chain.open_payload(&m, &sealed).unwrap()).unwrap(),
+        "payload"
+    );
 }

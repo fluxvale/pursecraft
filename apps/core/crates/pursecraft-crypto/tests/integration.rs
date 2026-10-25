@@ -264,12 +264,29 @@ fn booting_a_ciphered_store_without_keys_is_cipher_error_not_corruption() {
 
     // A fresh device holds no keys: the refusal is a Cipher error —
     // intact bytes the reader cannot open (ADR 0022) — never
-    // corruption, and the repair paths never touch the file.
+    // corruption, and the repair paths never touch the file. Its
+    // Display carries the crypto crate's diagnosis verbatim, and the
+    // boxed cause stays reachable through `source()`.
     let stranger = ScopeCipher::new(KeyChain::new(DeviceKeypair::generate().unwrap()));
-    match LocalStore::open_with(&path, stranger) {
-        Err(StoreError::Cipher(_)) => {}
+    let err = match LocalStore::open_with(&path, stranger) {
+        Err(e @ StoreError::Cipher(_)) => e,
         other => panic!("expected a cipher refusal, got {other:?}"),
-    }
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("payload cipher refused a record"),
+        "{message}"
+    );
+    assert!(
+        message.contains("no key material for")
+            || message.contains("stale keys for")
+            || message.contains("not an E2EE envelope"),
+        "the crypto diagnosis surfaces verbatim: {message}"
+    );
+    let cause = std::error::Error::source(&err)
+        .expect("a Cipher error carries its cause")
+        .to_string();
+    assert!(cause.contains("epoch"), "{cause}");
     assert_eq!(std::fs::read(&path).unwrap(), before, "untouched");
 
     // A plaintext-mode reader on the same file also fails loudly — the

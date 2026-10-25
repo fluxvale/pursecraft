@@ -86,22 +86,17 @@ pub(crate) fn aead_seal(
 
 /// The open half of [`aead_seal`]. One error for everything the AEAD
 /// refuses — tamper, wrong key, wrong binding — returned as zeroized
-/// bytes the caller copies out.
+/// bytes the caller copies out. Ciphertext shorter than the 16-byte tag
+/// fails here too — the AEAD's own length check answers it.
 pub(crate) fn aead_open(
     key: &DataKey,
     aad: &[u8],
-    nonce: &[u8],
+    nonce: &[u8; 24],
     ciphertext: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-    if nonce.len() != 24 || ciphertext.len() < 16 {
-        // The tag is 16 bytes; shorter can never authenticate. The AEAD
-        // would say the same thing less clearly.
-        return Err(CryptoError::Auth);
-    }
-    let n: [u8; 24] = nonce.try_into().expect("length checked above");
     let plaintext = aead(key)
         .decrypt(
-            &XNonce::from(n),
+            &XNonce::from(*nonce),
             Payload {
                 msg: ciphertext,
                 aad,
@@ -234,18 +229,6 @@ pub struct WrappedOrgKey {
     pub c: Vec<u8>,
 }
 
-impl WrappedOrgKey {
-    /// Serialize to the opaque bytes the distribution channel carries.
-    pub fn to_wire(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
-    }
-
-    /// Parse from channel bytes.
-    pub fn from_wire(wire: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(wire)
-    }
-}
-
 /// A versioned record wrapping one per-log data key under its org's
 /// same-epoch epoch key (ADR 0022) — symmetric all the way down.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -262,18 +245,6 @@ pub struct WrappedLogKey {
     /// Ciphertext‖tag over the 32-byte log key.
     #[serde(with = "b64serde::bytes")]
     pub c: Vec<u8>,
-}
-
-impl WrappedLogKey {
-    /// Serialize to the opaque bytes the distribution channel carries.
-    pub fn to_wire(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
-    }
-
-    /// Parse from channel bytes.
-    pub fn from_wire(wire: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(wire)
-    }
 }
 
 /// Wrap `key` to `recipient` as an org-epoch-key record. Any key-holding
@@ -375,7 +346,7 @@ fn device_open(device: &DeviceKeypair, eph: &[u8; 32]) -> Result<Zeroizing<[u8; 
 fn unwrap_key(
     wrap_key: &DataKey,
     binding: &[u8],
-    n: &[u8],
+    n: &[u8; 24],
     c: &[u8],
 ) -> Result<DataKey, CryptoError> {
     let plaintext = aead_open(wrap_key, binding, n, c)?;
@@ -384,4 +355,87 @@ fn unwrap_key(
         .try_into()
         .map_err(|_| CryptoError::Auth)?;
     Ok(DataKey::new(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic UUIDv7, same construction as the core testkit.
+    fn v7(ms: u64, rand: u64) -> uuid::Uuid {
+        let rand = (rand & 0x3fff_ffff_ffff_ffff) as u128;
+        uuid::Uuid::from_u128(((ms as u128) << 80) | (7u128 << 76) | (2u128 << 62) | rand)
+    }
+
+    fn org() -> OrgId {
+        OrgId::new(v7(1 << 40, 1)).unwrap()
+    }
+
+    /// Debug output is log-facing: it must identify the key holder-side
+    /// without ever printing key material (ADR 0022's hygiene clause).
+    #[test]
+    fn debug_never_prints_key_material() {
+        let key = DataKey::new([0xA5; 32]);
+        assert_eq!(format!("{key:?}"), "DataKey(redacted)");
+        let device = DeviceKeypair::from_secret_bytes([0x5A; 32]);
+        assert_eq!(format!("{device:?}"), "DeviceKeypair(secret redacted)");
+        let public = device.public();
+        let debug = format!("{public:?}");
+        assert!(
+            debug.starts_with("DevicePublicKey(") && debug.ends_with(')'),
+            "{debug}"
+        );
+    }
+
+    /// A degenerate recipient public key (the all-zero point) yields a
+    /// non-contributory shared secret; the wrap refuses — X25519
+    /// hygiene: a hostile or garbage device key cannot be wrapped to.
+    #[test]
+    fn wrapping_to_a_low_order_recipient_is_refused() {
+        let low_order = DevicePublicKey([0u8; 32]);
+        let key = DataKey::new([7; 32]);
+        assert!(matches!(
+            wrap_org_key(&low_order, &org(), 0, &key),
+            Err(CryptoError::Auth)
+        ));
+    }
+
+    /// A wrap whose ephemeral public key is the all-zero point is the
+    /// unwrap-side injection: refused before anything derives.
+    #[test]
+    fn a_low_order_ephemeral_in_a_wrap_is_refused_at_open() {
+        let device = DeviceKeypair::from_secret_bytes([9; 32]);
+        let key = DataKey::new([7; 32]);
+        let o = org();
+        let mut wrap = wrap_org_key(&device.public(), &o, 0, &key).unwrap();
+        wrap.eph = [0u8; 32];
+        assert!(matches!(
+            open_org_wrap(&device, &wrap),
+            Err(CryptoError::Auth)
+        ));
+    }
+
+    /// Future wrap versions are refused loudly on both wrap kinds — the
+    /// version gate (ADR 0022), not a guess.
+    #[test]
+    fn future_wrap_versions_are_refused() {
+        let device = DeviceKeypair::from_secret_bytes([9; 32]);
+        let epoch_key = DataKey::new([3; 32]);
+        let o = org();
+        let scope = ScopeId::Org(o);
+        let mut org_wrap = wrap_org_key(&device.public(), &o, 0, &epoch_key).unwrap();
+        org_wrap.v = 2;
+        assert!(matches!(
+            open_org_wrap(&device, &org_wrap),
+            Err(CryptoError::UnsupportedVersion(2))
+        ));
+
+        let log_key = DataKey::new([4; 32]);
+        let mut log_wrap = wrap_log_key(&epoch_key, &scope, 0, &log_key).unwrap();
+        log_wrap.v = 7;
+        assert!(matches!(
+            open_log_wrap(&epoch_key, &log_wrap),
+            Err(CryptoError::UnsupportedVersion(7))
+        ));
+    }
 }

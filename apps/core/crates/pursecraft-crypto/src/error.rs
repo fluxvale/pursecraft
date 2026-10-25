@@ -74,3 +74,70 @@ impl fmt::Display for CryptoError {
 }
 
 impl std::error::Error for CryptoError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pursecraft_core::ids::{BudgetId, OrgId, ScopeId};
+
+    /// Deterministic UUIDv7, same construction as the core testkit.
+    fn v7(ms: u64, rand: u64) -> uuid::Uuid {
+        let rand = (rand & 0x3fff_ffff_ffff_ffff) as u128;
+        uuid::Uuid::from_u128(((ms as u128) << 80) | (7u128 << 76) | (2u128 << 62) | rand)
+    }
+
+    /// Every variant's Display — these strings are the operator-facing
+    /// half of the loud-failure posture: they surface verbatim through
+    /// `StoreError::Cipher` when a store refuses to open, so each says
+    /// what went wrong and (where action exists) what to do about it.
+    #[test]
+    fn every_variant_names_its_cause_in_display() {
+        let budget = BudgetId::new(v7(1 << 40, 1)).unwrap();
+        let org = OrgId::new(v7(1 << 40, 2)).unwrap();
+
+        assert_eq!(
+            CryptoError::Auth.to_string(),
+            "authentication failed: tampered ciphertext, wrong key, or wrong binding"
+        );
+        assert_eq!(
+            CryptoError::NotAnEnvelope.to_string(),
+            "not an E2EE envelope (v1 shape) — plaintext or foreign bytes"
+        );
+        assert_eq!(
+            CryptoError::UnsupportedVersion(3).to_string(),
+            "envelope/wrap version 3 is not supported (this is v1)"
+        );
+        assert_eq!(
+            CryptoError::MissingEpoch {
+                scope: ScopeId::Budget(budget),
+                epoch: 2,
+                held: None,
+            }
+            .to_string(),
+            format!(
+                "no key material for {:?} (needed at epoch 2) — fetch key wraps",
+                ScopeId::Budget(budget)
+            )
+        );
+        assert_eq!(
+            CryptoError::MissingEpoch {
+                scope: ScopeId::Org(org),
+                epoch: 5,
+                held: Some(2),
+            }
+            .to_string(),
+            format!(
+                "stale keys for {:?}: envelope is epoch 5, highest held is 2 — rotation happened elsewhere",
+                ScopeId::Org(org)
+            )
+        );
+        assert_eq!(
+            CryptoError::WrongKeySlot.to_string(),
+            "key wrap does not match the org/scope/epoch it was offered for"
+        );
+        assert_eq!(
+            CryptoError::Rng("entropy exhausted".into()).to_string(),
+            "OS random generator failed: entropy exhausted"
+        );
+    }
+}
