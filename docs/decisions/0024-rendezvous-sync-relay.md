@@ -212,7 +212,9 @@ single-writer check fails loudly otherwise, as [ADR 0018] specified).
 
 - `apps/api` becomes a real Axum service: router, handlers, auth DB, and a
   `pursecraft-api` library surface the integration tests drive in-process
-  (tower `oneshot` — no test HTTP client dependency).
+  (tower `oneshot` — no test HTTP client dependency). One license joins
+  `deny.toml`'s allowlist, deliberately: BSD-3-Clause, via axum's route
+  matcher `matchit`.
 - `pursecraft-core` gains the additive `OpaqueStore` ([ADR 0018] format,
   string-native); `LocalStore` behavior is untouched.
 - Two devices sync end-to-end through the relay today; the E2EE lane's
