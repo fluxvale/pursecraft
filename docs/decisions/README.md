@@ -44,4 +44,5 @@ their replacement.
 | [0019](0019-license-fsl.md) | License: FSL-1.1-ALv2 (source-available, SaaS + self-host) | Accepted |
 | [0020](0020-codecov-coverage.md) | Codecov coverage reporting and per-flag gates | Accepted |
 | [0021](0021-organizations-own-budgets.md) | Organizations own budgets: personal-org-per-user, memberships with roles | Accepted |
+| [0022](0022-client-side-e2ee.md) | Client-side E2EE: envelope encryption over the payload choke point | Accepted |
 | [0023](0023-capture-cli.md) | Capture CLI: fast local transaction capture | Accepted |

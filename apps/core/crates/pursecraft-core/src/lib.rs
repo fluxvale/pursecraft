@@ -22,29 +22,32 @@ pub mod store;
 pub mod sync;
 pub mod wire;
 
-/// Deterministic helpers for the crate's own tests (never public API).
-#[cfg(test)]
-pub(crate) mod testkit {
+/// Deterministic helpers for the crate's own tests and the E2EE
+/// integration suites (enabled as a hidden feature by
+/// `pursecraft-crypto`'s dev-dependency — never part of any real build).
+#[cfg(any(test, feature = "testkit"))]
+#[doc(hidden)]
+pub mod testkit {
     use std::path::{Path, PathBuf};
 
     use uuid::Uuid;
 
     /// Deterministic UUIDv7: `ms` timestamp plus an arbitrary disambiguator.
-    pub(crate) fn v7(ms: u64, rand: u64) -> Uuid {
+    pub fn v7(ms: u64, rand: u64) -> Uuid {
         let rand = (rand & 0x3fff_ffff_ffff_ffff) as u128;
         Uuid::from_u128(((ms as u128) << 80) | (7u128 << 76) | (2u128 << 62) | rand)
     }
 
     /// xorshift64* — deterministic, reproducible pseudo-randomness for
     /// property-test loops (ADR 0016: no proptest dependency).
-    pub(crate) struct Rng(u64);
+    pub struct Rng(u64);
 
     impl Rng {
-        pub(crate) fn new(seed: u64) -> Self {
+        pub fn new(seed: u64) -> Self {
             Self(seed | 1)
         }
 
-        pub(crate) fn next_u64(&mut self) -> u64 {
+        pub fn next_u64(&mut self) -> u64 {
             let mut x = self.0;
             x ^= x >> 12;
             x ^= x << 25;
@@ -53,12 +56,12 @@ pub(crate) mod testkit {
             x.wrapping_mul(0x2545_f491_4f6c_dd1d)
         }
 
-        pub(crate) fn next_i64(&mut self) -> i64 {
+        pub fn next_i64(&mut self) -> i64 {
             self.next_u64() as i64
         }
 
         /// Value in `0..n` (modulo bias is irrelevant for test properties).
-        pub(crate) fn below(&mut self, n: u64) -> u64 {
+        pub fn below(&mut self, n: u64) -> u64 {
             self.next_u64() % n
         }
     }
@@ -67,10 +70,10 @@ pub(crate) mod testkit {
     /// drop (best effort — a panicking test leaks its scratch dir, which
     /// is harmless). No tempfile dependency (ADR 0016: zero test
     /// dependencies).
-    pub(crate) struct TempDir(PathBuf);
+    pub struct TempDir(PathBuf);
 
     impl TempDir {
-        pub(crate) fn new(label: &str) -> Self {
+        pub fn new(label: &str) -> Self {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
@@ -82,7 +85,7 @@ pub(crate) mod testkit {
             Self(dir)
         }
 
-        pub(crate) fn path(&self) -> &Path {
+        pub fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -98,7 +101,7 @@ pub(crate) mod testkit {
     /// (ADR 0018) and parameterized over the log scope (ADR 0021: the same
     /// theorem, proved for org logs and budget logs). All loops are
     /// xorshift-deterministic per the ADR 0016 convention.
-    pub(crate) mod conv {
+    pub mod conv {
         use crate::domain::{
             AccountField, BudgetField, CategoryField, CategoryGroupField, EntityKind, Field,
             MembershipField, MembershipRole, MonthCategoryField, OrgField, PayeeField,
@@ -114,31 +117,31 @@ pub(crate) mod testkit {
 
         /// Synthetic stamps far above any real wall clock keep sessions'
         /// clock behavior deterministic (same trick as the hlc tests).
-        pub(crate) const HLC_BASE: u64 = 1 << 60;
+        pub const HLC_BASE: u64 = 1 << 60;
         /// v7-friendly ms for deterministic ids.
-        pub(crate) const ID_MS: u64 = 1 << 40;
+        pub const ID_MS: u64 = 1 << 40;
         const BUDGET_RAND: u64 = 1;
         const ORG_RAND: u64 = 2;
 
-        pub(crate) fn budget() -> BudgetId {
+        pub fn budget() -> BudgetId {
             BudgetId::new(v7(1, BUDGET_RAND)).unwrap()
         }
 
         /// The scope org of org-scope generations, on the same `ID_MS` base
         /// as pool entity ids — the org entity's id must equal the scope
         /// org id exactly (ADR 0021).
-        pub(crate) fn org() -> OrgId {
+        pub fn org() -> OrgId {
             OrgId::new(v7(ID_MS, ORG_RAND)).unwrap()
         }
 
         /// The two scopes the convergence loops prove (ADR 0021).
-        pub(crate) fn scopes() -> [ScopeId; 2] {
+        pub fn scopes() -> [ScopeId; 2] {
             [ScopeId::Budget(budget()), ScopeId::Org(org())]
         }
 
         /// One deterministic op. `op_rand` disambiguates the op id; `(ms,
         /// logical)` is the stamp.
-        pub(crate) fn op(op_rand: u64, ms: u64, logical: u32, field: Field, value: Value) -> Op {
+        pub fn op(op_rand: u64, ms: u64, logical: u32, field: Field, value: Value) -> Op {
             Op {
                 op_id: OpId::new(v7(ID_MS, op_rand)).unwrap(),
                 scope: ScopeId::Budget(budget()),
@@ -155,19 +158,19 @@ pub(crate) mod testkit {
             }
         }
 
-        pub(crate) fn sequenced(seq: u64, op: Op) -> SequencedOp {
+        pub fn sequenced(seq: u64, op: Op) -> SequencedOp {
             SequencedOp { seq, op }
         }
 
-        pub(crate) fn amount(milli: i64) -> (Field, Value) {
+        pub fn amount(milli: i64) -> (Field, Value) {
             (
                 Field::Transaction(TransactionField::Amount),
                 Value::Milliunits(Milliunits::from_milli(milli)),
             )
         }
 
-        pub(crate) const DEVICES: u64 = 5;
-        pub(crate) const OPS_PER_DEVICE: usize = 80;
+        pub const DEVICES: u64 = 5;
+        pub const OPS_PER_DEVICE: usize = 80;
         /// Fixed per-device offsets in ms: two devices share a clock (forcing
         /// equal-HLC ties broken by op_id), one runs a year ahead, one a day
         /// behind the base.
@@ -379,7 +382,7 @@ pub(crate) mod testkit {
         /// ops, per-device clock offsets, occasional same-ms logical bumps.
         /// Org-scope streams draw from the org pool — the organization
         /// entity pinned to the scope's own org id (ADR 0021).
-        pub(crate) fn generate_ops(seed: u64, scope: ScopeId) -> Vec<Op> {
+        pub fn generate_ops(seed: u64, scope: ScopeId) -> Vec<Op> {
             let mut rng = Rng::new(seed | 1);
             let pool = pool_for(scope);
             let mut ops = Vec::new();
@@ -444,11 +447,7 @@ pub(crate) mod testkit {
 
         /// The materialized value of one field — the test-side inverse of
         /// `set_field`, so convergence assertions can read state back.
-        pub(crate) fn materialized(
-            state: &ScopeState,
-            id: EntityId,
-            field: Field,
-        ) -> Option<Value> {
+        pub fn materialized(state: &ScopeState, id: EntityId, field: Field) -> Option<Value> {
             use crate::domain::Entity;
             match (state.entity(&id)?, field) {
                 (Entity::Organization(e), Field::Deleted) => Some(Value::Bool(e.deleted)),
@@ -536,7 +535,7 @@ pub(crate) mod testkit {
         /// The forced tie's independently computed expectation: the value of
         /// whichever tied op carries the greater `op_id` (ADR 0016's
         /// equal-HLC rule).
-        pub(crate) fn expected_tie_value(ops: &[Op]) -> (EntityId, Field, Value) {
+        pub fn expected_tie_value(ops: &[Op]) -> (EntityId, Field, Value) {
             let winner = if ops[TIE_WINNER].op_id > ops[TIE_MIRROR].op_id {
                 &ops[TIE_WINNER]
             } else {
@@ -545,11 +544,234 @@ pub(crate) mod testkit {
             (winner.entity_id, winner.field, winner.value.clone())
         }
 
-        pub(crate) fn shuffle<T>(rng: &mut Rng, slice: &mut [T]) {
+        pub fn shuffle<T>(rng: &mut Rng, slice: &mut [T]) {
             for i in (1..slice.len()).rev() {
                 let j = rng.below((i + 1) as u64) as usize;
                 slice.swap(i, j);
             }
+        }
+
+        /// One op per (entity kind × field), covering every `Value`
+        /// variant — including calendar edges, empty and non-ASCII text,
+        /// and extreme milliunits; org-scope entities (ADR 0021) ride org
+        /// ops. The wire suite round-trips this set through the choke
+        /// point; the E2EE suite round-trips it through the real cipher
+        /// (ADR 0022).
+        pub fn every_variant() -> Vec<Op> {
+            use crate::date::{Date, Month};
+            use crate::domain::{
+                AccountField, AccountKind, BudgetField, CategoryField, CategoryGroupField, Cleared,
+                Field, MembershipField, MembershipRole, MonthCategoryField, OrgField, PayeeField,
+                TransactionField, Value,
+            };
+            use crate::ids::{BudgetId, DeviceId, EntityId, OpId, OrgId, ScopeId, UserId};
+            use crate::money::Milliunits;
+            use uuid::Uuid;
+
+            const MS: u64 = 1 << 40;
+
+            fn op(
+                scope: ScopeId,
+                kind: crate::domain::EntityKind,
+                entity_rand: u64,
+                field: Field,
+                value: Value,
+            ) -> Op {
+                Op {
+                    op_id: OpId::new(super::v7(MS, entity_rand)).unwrap(),
+                    scope,
+                    device_id: DeviceId::new(Uuid::nil()).unwrap(),
+                    user_id: UserId::new(Uuid::max()).unwrap(),
+                    entity_kind: kind,
+                    entity_id: EntityId::new(super::v7(MS, entity_rand)).unwrap(),
+                    field,
+                    value,
+                    hlc: crate::hlc::Hlc {
+                        physical_ms: MS + entity_rand,
+                        logical: 0,
+                    },
+                }
+            }
+
+            fn budget_op(
+                kind: crate::domain::EntityKind,
+                entity_rand: u64,
+                field: Field,
+                value: Value,
+            ) -> Op {
+                op(
+                    ScopeId::Budget(BudgetId::new(super::v7(1, 1)).unwrap()),
+                    kind,
+                    entity_rand,
+                    field,
+                    value,
+                )
+            }
+
+            fn org_op(
+                kind: crate::domain::EntityKind,
+                entity_rand: u64,
+                field: Field,
+                value: Value,
+            ) -> Op {
+                op(
+                    ScopeId::Org(OrgId::new(super::v7(MS, 1)).unwrap()),
+                    kind,
+                    entity_rand,
+                    field,
+                    value,
+                )
+            }
+
+            let id = |rand: u64| Value::Id(EntityId::new(super::v7(MS, rand)).unwrap());
+
+            vec![
+                org_op(
+                    crate::domain::EntityKind::Organization,
+                    1,
+                    Field::Organization(OrgField::Name),
+                    Value::Text("Home ₱".into()),
+                ),
+                org_op(
+                    crate::domain::EntityKind::Organization,
+                    1,
+                    Field::Organization(OrgField::PersonalFor),
+                    Value::User(UserId::new(Uuid::max()).unwrap()),
+                ),
+                org_op(
+                    crate::domain::EntityKind::Membership,
+                    8,
+                    Field::Membership(MembershipField::UserId),
+                    Value::User(UserId::new(Uuid::nil()).unwrap()),
+                ),
+                org_op(
+                    crate::domain::EntityKind::Membership,
+                    8,
+                    Field::Membership(MembershipField::Role),
+                    Value::Role(MembershipRole::Viewer),
+                ),
+                org_op(
+                    crate::domain::EntityKind::Budget,
+                    9,
+                    Field::Budget(BudgetField::Name),
+                    Value::Text("Household".into()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Account,
+                    2,
+                    Field::Account(AccountField::Name),
+                    Value::Text(String::new()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Account,
+                    2,
+                    Field::Account(AccountField::Kind),
+                    Value::AccountKind(AccountKind::OtherLiability),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::CategoryGroup,
+                    3,
+                    Field::CategoryGroup(CategoryGroupField::Name),
+                    Value::Text("Bills".into()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Category,
+                    4,
+                    Field::Category(CategoryField::Name),
+                    Value::Text("Power".into()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Category,
+                    4,
+                    Field::Category(CategoryField::GroupId),
+                    id(3),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Category,
+                    4,
+                    Field::Category(CategoryField::Note),
+                    Value::Text("note — em dash".into()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Payee,
+                    5,
+                    Field::Payee(PayeeField::Name),
+                    Value::Text("Meralco".into()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Transaction(TransactionField::AccountId),
+                    id(2),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Transaction(TransactionField::Date),
+                    Value::Date(Date::new(2024, 2, 29).unwrap()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Transaction(TransactionField::Amount),
+                    Value::Milliunits(Milliunits::MIN),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Transaction(TransactionField::Amount),
+                    Value::Milliunits(Milliunits::MAX),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Transaction(TransactionField::PayeeId),
+                    id(5),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Transaction(TransactionField::CategoryId),
+                    id(4),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Transaction(TransactionField::Memo),
+                    Value::Text("groceries".into()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Transaction(TransactionField::Cleared),
+                    Value::Cleared(Cleared::Reconciled),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::MonthCategory,
+                    7,
+                    Field::MonthCategory(MonthCategoryField::Month),
+                    Value::Month(Month::new(2026, 1).unwrap()),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::MonthCategory,
+                    7,
+                    Field::MonthCategory(MonthCategoryField::CategoryId),
+                    id(4),
+                ),
+                budget_op(
+                    crate::domain::EntityKind::MonthCategory,
+                    7,
+                    Field::MonthCategory(MonthCategoryField::Budgeted),
+                    Value::Milliunits(Milliunits::from_major(-45)),
+                ),
+                // The tombstone field rides the same wire.
+                budget_op(
+                    crate::domain::EntityKind::Transaction,
+                    6,
+                    Field::Deleted,
+                    Value::Bool(true),
+                ),
+            ]
         }
     }
 }

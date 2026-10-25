@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{OpId, ScopeId};
 use crate::ops::Op;
 use crate::sync::{LogError, OpLog, SequencedOp};
-use crate::wire::{self, OpMeta};
+use crate::wire::{self, OpMeta, PayloadCipher, PlainCipher};
 
 /// File magic; a strict prefix of it is a torn create (ADR 0018).
 const MAGIC: [u8; 8] = *b"PCOPLOG\0";
@@ -109,8 +109,8 @@ fn parse_marker(bytes: &[u8]) -> Marker {
 /// One stored op: its canonical sequence (a repair can leave gaps, so
 /// sequences cannot be re-derived from position), the server-visible
 /// metadata verbatim, and the payload as the choke-point string (ADRs
-/// 0009, 0018) — the future at-rest encryption layer changes what that
-/// string holds, not this shape.
+/// 0009, 0018) — the envelope string under E2EE, plaintext otherwise
+/// (ADR 0022); the store is content-blind to the difference.
 #[derive(Serialize, Deserialize, Debug)]
 struct StoredOp {
     seq: u64,
@@ -118,10 +118,15 @@ struct StoredOp {
     payload: String,
 }
 
-/// Serialize one op into its frame under `seq` (ADR 0018).
-fn encode_frame(op: &Op, seq: u64) -> Result<Vec<u8>, StoreError> {
+/// Serialize one op into its frame under `seq` (ADR 0018). The payload
+/// rides the choke point sealed by `cipher` (ADR 0022) — the frame carries
+/// whatever the cipher emits.
+fn encode_frame<C: PayloadCipher>(cipher: &C, op: &Op, seq: u64) -> Result<Vec<u8>, StoreError> {
     let (meta, payload) = op.clone().into_parts();
-    encode_frame_parts(seq, &meta, &wire::encode_payload(&payload)?)
+    let sealed = cipher
+        .seal(&meta, wire::encode_payload(&payload)?)
+        .map_err(StoreError::Cipher)?;
+    encode_frame_parts(seq, &meta, &sealed)
 }
 
 /// Frame a stored record from its wire parts (ADR 0024): the shared body
@@ -157,22 +162,33 @@ enum Scan {
     /// Checksum-valid bytes that cannot be a stored op — the writer never
     /// frames such bytes; loud without resync.
     Corrupt(&'static str),
+    /// The frame is sound but the payload cipher refused it — missing or
+    /// stale keys, failed authentication, a foreign envelope (ADR 0022).
+    /// Never repaired over and never mislabeled corruption: the bytes are
+    /// intact, the reader just cannot open them.
+    Sealed(wire::CipherError),
 }
 
 /// Validate and decode the frame at `offset` (ADR 0018's framing rules),
-/// payload-decoding like the client store's boot requires.
-fn scan_frame(bytes: &[u8], offset: usize) -> Scan {
+/// opening the payload through `cipher` (ADR 0022).
+fn scan_frame<C: PayloadCipher>(cipher: &C, bytes: &[u8], offset: usize) -> Scan {
     match scan_frame_parts(bytes, offset) {
-        ScanParts::Op(stored, end) => match wire::decode_payload(&stored.payload) {
-            Ok(payload) => Scan::Op(
-                SequencedOp {
-                    seq: stored.seq,
-                    op: Op::from_parts(stored.meta, payload),
-                },
-                end,
-            ),
-            Err(_) => Scan::Corrupt("op payload does not decode"),
-        },
+        ScanParts::Op(stored, end) => {
+            let plaintext = match cipher.open(&stored.meta, &stored.payload) {
+                Ok(plaintext) => plaintext,
+                Err(e) => return Scan::Sealed(e),
+            };
+            match wire::decode_payload(&plaintext) {
+                Ok(payload) => Scan::Op(
+                    SequencedOp {
+                        seq: stored.seq,
+                        op: Op::from_parts(stored.meta, payload),
+                    },
+                    end,
+                ),
+                Err(_) => Scan::Corrupt("op payload does not decode for this store's cipher"),
+            }
+        }
         ScanParts::Invalid => Scan::Invalid,
         ScanParts::Corrupt(reason) => Scan::Corrupt(reason),
     }
@@ -191,8 +207,9 @@ enum ScanParts {
     Corrupt(&'static str),
 }
 
-/// The shared half of [`scan_frame`]: framing, checksum, and the record's
-/// JSON — the payload interior stays an unopened string (ADR 0024).
+/// The shared half of the client store's [`scan_frame`] (ADRs 0022,
+/// 0024): framing, checksum, and the record's JSON — the payload
+/// interior stays an unopened string, whatever it holds.
 fn scan_frame_parts(bytes: &[u8], offset: usize) -> ScanParts {
     let remaining = bytes.len() - offset;
     if remaining < FRAME_OVERHEAD {
@@ -275,6 +292,11 @@ pub enum StoreError {
     Poisoned {
         path: PathBuf,
     },
+    /// The payload cipher refused a record — missing/stale keys, failed
+    /// authentication, a foreign envelope (ADR 0022). Loud and distinct
+    /// from corruption: the bytes are intact, so the repair paths must
+    /// not touch them.
+    Cipher(wire::CipherError),
     /// A scoping violation from the underlying log ([ADR 0008]).
     Scope(LogError),
 }
@@ -302,6 +324,7 @@ impl fmt::Display for StoreError {
                 f,
                 "{path:?} was left unusable by a failed append; reopen it to recover"
             ),
+            Self::Cipher(e) => write!(f, "payload cipher refused a record: {e}"),
             Self::Scope(e) => write!(f, "op rejected by the log: {e}"),
         }
     }
@@ -313,6 +336,7 @@ impl std::error::Error for StoreError {
             Self::Io(e) => Some(e),
             Self::Encode(e) => Some(e),
             Self::Scope(e) => Some(e),
+            Self::Cipher(e) => Some(e.as_ref()),
             _ => None,
         }
     }
@@ -340,9 +364,11 @@ impl From<LogError> for StoreError {
 /// append-only framed file under it. File order is canonical order; ops
 /// dedupe by `op_id` exactly as in memory; the commit point of an append
 /// is its frame and the header's commit marker landing under one
-/// `sync_data`.
+/// `sync_data`. Payloads ride the choke point through `C` — [`PlainCipher`]
+/// stores plaintext; a sealing cipher stores envelopes, at rest and in
+/// flight, with no store change (ADR 0022).
 #[derive(Debug)]
-pub struct LocalStore {
+pub struct LocalStore<C: PayloadCipher = PlainCipher> {
     log: OpLog,
     path: PathBuf,
     file: File,
@@ -354,17 +380,31 @@ pub struct LocalStore {
     hwm: u64,
     /// Set when a failed append could not roll back (ADR 0018).
     poisoned: bool,
+    /// The payload cipher sealing every record (ADR 0022).
+    cipher: C,
 }
 
-impl LocalStore {
-    /// Open (creating if absent) the store at `path`, rebuilding the
-    /// in-memory log from disk. An uncommitted torn tail is repaired;
-    /// foreign, corrupt, and unsupported files fail loudly; committed
-    /// sequences are never reused (ADR 0018).
+impl LocalStore<PlainCipher> {
+    /// Open (creating if absent) the store at `path` with plaintext
+    /// payloads — the no-E2EE mode (ADR 0009). See [`LocalStore::open_with`]
+    /// for the ciphered store; everything else about the two is identical.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with(path, PlainCipher)
+    }
+}
+
+impl<C: PayloadCipher> LocalStore<C> {
+    /// Open (creating if absent) the store at `path`, sealing payloads
+    /// through `cipher`, rebuilding the in-memory log from disk. An
+    /// uncommitted torn tail is repaired; foreign, corrupt, and
+    /// unsupported files fail loudly; committed sequences are never
+    /// reused (ADR 0018). A record the cipher cannot open fails as
+    /// [`StoreError::Cipher`] — the repair paths never touch intact bytes
+    /// a key would open (ADR 0022).
+    pub fn open_with(path: &Path, cipher: C) -> Result<Self, StoreError> {
         let mut file = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Self::create(path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Self::create(path, cipher),
             Err(e) => return Err(e.into()),
         };
         let mut bytes = Vec::new();
@@ -372,12 +412,13 @@ impl LocalStore {
         let marker = match parse_header(&bytes, path)? {
             HeaderState::TornCreate => {
                 Self::recreate(&mut file)?;
-                return Ok(Self::empty(path, file));
+                return Ok(Self::empty(path, file, cipher));
             }
             HeaderState::Valid(marker) => marker,
         };
 
-        let (records, offset, file_max) = walk_frames(&mut file, &bytes, path, scan_op_frame)?;
+        let (records, offset, file_max) =
+            walk_frames(&mut file, &bytes, path, |b, o| scan_op_frame(&cipher, b, o))?;
 
         // Resume the sequence space above everything ever acknowledged or
         // ever claimed by a record on disk — the loaded tip, or the
@@ -399,6 +440,7 @@ impl LocalStore {
             durable_len: offset,
             hwm: acked,
             poisoned: false,
+            cipher,
         })
     }
 
@@ -439,7 +481,7 @@ impl LocalStore {
             return Ok(seq);
         }
         let seq = self.log.next_seq();
-        let frame = encode_frame(&op, seq)?;
+        let frame = encode_frame(&self.cipher, &op, seq)?;
         let committed_len = self.durable_len;
         let previous_marker = marker_bytes(Marker::Committed(self.hwm))?;
         // Phase one: the frame and its PENDING marker, durable together.
@@ -487,7 +529,7 @@ impl LocalStore {
         self.log.scope_id()
     }
 
-    fn empty(path: &Path, file: File) -> Self {
+    fn empty(path: &Path, file: File, cipher: C) -> Self {
         Self {
             log: OpLog::new(),
             path: path.to_owned(),
@@ -495,6 +537,7 @@ impl LocalStore {
             durable_len: HEADER_LEN as u64,
             hwm: 0,
             poisoned: false,
+            cipher,
         }
     }
 
@@ -502,9 +545,9 @@ impl LocalStore {
     /// durably first, then the directory entry (ADR 0018). The caller has
     /// just seen the path not exist (single writer per path is the
     /// caller's contract).
-    fn create(path: &Path) -> Result<Self, StoreError> {
+    fn create(path: &Path, cipher: C) -> Result<Self, StoreError> {
         let file = create_log_file(path)?;
-        Ok(Self::empty(path, file))
+        Ok(Self::empty(path, file, cipher))
     }
 
     /// Rewrite the header over a torn create (no committed data exists).
@@ -637,11 +680,18 @@ enum Step<T> {
     /// Checksum-valid bytes that cannot be a stored record — loud without
     /// resync.
     Corrupt(&'static str),
+    /// The frame is sound but the payload cipher refused it — intact
+    /// bytes the reader cannot open (ADR 0022). Never repaired over,
+    /// never mislabeled corruption. Only the ciphered client path
+    /// produces this; the relay store's payload strings are never
+    /// opened at all (ADR 0024).
+    Sealed(wire::CipherError),
 }
 
-/// The client store's step: payload-decoded ops for replay (ADR 0018).
-fn scan_op_frame(bytes: &[u8], offset: usize) -> Step<SequencedOp> {
-    match scan_frame(bytes, offset) {
+/// The client store's step: payload-decoded ops for replay, opened
+/// through `cipher` (ADRs 0018, 0022).
+fn scan_op_frame<C: PayloadCipher>(cipher: &C, bytes: &[u8], offset: usize) -> Step<SequencedOp> {
+    match scan_frame(cipher, bytes, offset) {
         Scan::Op(record, end) => Step::Op {
             seq: record.seq,
             record,
@@ -649,6 +699,7 @@ fn scan_op_frame(bytes: &[u8], offset: usize) -> Step<SequencedOp> {
         },
         Scan::Invalid => Step::Invalid,
         Scan::Corrupt(reason) => Step::Corrupt(reason),
+        Scan::Sealed(e) => Step::Sealed(e),
     }
 }
 
@@ -671,11 +722,11 @@ fn scan_parts_frame(bytes: &[u8], offset: usize) -> Step<StoredOp> {
 /// reach, the torn tail cut and the cut made durable, mid-file damage loud
 /// by resync proof. Returns the lifted records, the offset committed data
 /// ends at, and the highest sequence ever framed.
-fn walk_frames<T>(
+fn walk_frames<T, F: Fn(&[u8], usize) -> Step<T>>(
     file: &mut File,
     bytes: &[u8],
     path: &Path,
-    step: fn(&[u8], usize) -> Step<T>,
+    step: F,
 ) -> Result<(Vec<T>, u64, u64), StoreError> {
     let mut records = Vec::new();
     let mut offset = HEADER_LEN;
@@ -712,6 +763,12 @@ fn walk_frames<T>(
                 file.set_len(offset as u64)?;
                 file.sync_all()?;
                 break;
+            }
+            Step::Sealed(e) => {
+                // Intact bytes the reader cannot open — a key problem,
+                // not file damage (ADR 0022): refuse without touching
+                // the file.
+                return Err(StoreError::Cipher(e));
             }
             Step::Corrupt(reason) => {
                 return Err(StoreError::Corrupt {
