@@ -1,10 +1,14 @@
 //! Op wire format: the metadata/payload split and the single serialization
-//! choke point (ADRs 0009, 0017, 0020).
+//! choke point (ADRs 0009, 0017, 0020, 0022).
 //!
 //! The server may only ever see [`OpMeta`]; [`OpPayload`] is opaque data it
-//! stores but never interprets, encrypted in a later slice. All payload
-//! serialization routes through [`encode_payload`] / [`decode_payload`] —
-//! the one pair the E2EE layer will wrap.
+//! stores but never interprets, encrypted under the E2EE layer (ADR 0022).
+//! All payload serialization routes through [`encode_payload`] /
+//! [`decode_payload`] — the one pair the E2EE layer wraps — and that layer
+//! plugs in through [`PayloadCipher`], implemented in `pursecraft-crypto`
+//! (this crate stays crypto-free; the dependency points the other way).
+
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -118,18 +122,54 @@ pub fn decode_payload(wire: &str) -> Result<OpPayload, serde_json::Error> {
     serde_json::from_str::<PayloadWire>(wire).map(OpPayload::from)
 }
 
+/// A cipher failure surfaced through a seam ([ADR 0022]). Boxed: the
+/// crypto crate owns the causes (authentication, stale epochs, envelope
+/// shape); core only carries it loudly — never repairs over it, never
+/// mislabels it file corruption.
+pub type CipherError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// The E2EE seam (ADR 0022): wraps the payload choke point. `seal`
+/// receives the plaintext payload string [`encode_payload`] produced plus
+/// the op's metadata (binding material); `open` receives the sealed
+/// envelope string plus the metadata it claims to belong to. Both are
+/// fallible — a refusal is loud. [`PlainCipher`] is the identity
+/// implementation for the no-E2EE self-host mode (ADR 0009); envelope
+/// shapes are disjoint from plaintext by construction, so mode confusion
+/// fails loudly in both directions.
+pub trait PayloadCipher: fmt::Debug {
+    /// Wrap the plaintext payload string into an envelope string.
+    fn seal(&self, meta: &OpMeta, plaintext: String) -> Result<String, CipherError>;
+    /// Unwrap an envelope string back to the plaintext payload string.
+    fn open(&self, meta: &OpMeta, sealed: &str) -> Result<String, CipherError>;
+}
+
+/// The identity [`PayloadCipher`] — payloads travel as the plaintext
+/// choke-point string (ADR 0009's optional-for-self-host mode). Not a
+/// downgrade hole: handed an envelope string, `open` passes it through
+/// unchanged and [`decode_payload`] rejects it (the shapes are disjoint,
+/// ADR 0022).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlainCipher;
+
+impl PayloadCipher for PlainCipher {
+    fn seal(&self, _meta: &OpMeta, plaintext: String) -> Result<String, CipherError> {
+        Ok(plaintext)
+    }
+
+    fn open(&self, _meta: &OpMeta, sealed: &str) -> Result<String, CipherError> {
+        Ok(sealed.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::date::{Date, Month};
-    use crate::domain::{
-        AccountField, AccountKind, BudgetField, CategoryField, CategoryGroupField, Cleared,
-        EntityKind, MembershipField, MembershipRole, MonthCategoryField, OrgField, PayeeField,
-        TransactionField,
-    };
+    use crate::domain::{EntityKind, Field, MonthCategoryField, TransactionField, Value};
     use crate::hlc::Hlc;
     use crate::ids::{ScopeId, TransactionId};
     use crate::money::Milliunits;
+    use crate::testkit::conv::every_variant;
     use crate::testkit::v7;
     use uuid::Uuid;
 
@@ -160,173 +200,6 @@ mod tests {
             field,
             value,
         )
-    }
-
-    fn org_op(kind: EntityKind, entity_rand: u64, field: Field, value: Value) -> Op {
-        op(
-            ScopeId::Org(crate::ids::OrgId::new(v7(MS, 1)).unwrap()),
-            kind,
-            entity_rand,
-            field,
-            value,
-        )
-    }
-
-    fn id(rand: u64) -> Value {
-        Value::Id(EntityId::new(v7(MS, rand)).unwrap())
-    }
-
-    /// One op per (entity kind × field), covering every `Value` variant —
-    /// including calendar edges, empty and non-ASCII text, and extreme
-    /// milliunits. Org-scope entities (ADR 0021) ride org ops.
-    fn every_variant() -> Vec<Op> {
-        vec![
-            org_op(
-                EntityKind::Organization,
-                1,
-                Field::Organization(OrgField::Name),
-                Value::Text("Home ₱".into()),
-            ),
-            org_op(
-                EntityKind::Organization,
-                1,
-                Field::Organization(OrgField::PersonalFor),
-                Value::User(UserId::new(Uuid::max()).unwrap()),
-            ),
-            org_op(
-                EntityKind::Membership,
-                8,
-                Field::Membership(MembershipField::UserId),
-                Value::User(UserId::new(Uuid::nil()).unwrap()),
-            ),
-            org_op(
-                EntityKind::Membership,
-                8,
-                Field::Membership(MembershipField::Role),
-                Value::Role(MembershipRole::Viewer),
-            ),
-            org_op(
-                EntityKind::Budget,
-                9,
-                Field::Budget(BudgetField::Name),
-                Value::Text("Household".into()),
-            ),
-            budget_op(
-                EntityKind::Account,
-                2,
-                Field::Account(AccountField::Name),
-                Value::Text(String::new()),
-            ),
-            budget_op(
-                EntityKind::Account,
-                2,
-                Field::Account(AccountField::Kind),
-                Value::AccountKind(AccountKind::OtherLiability),
-            ),
-            budget_op(
-                EntityKind::CategoryGroup,
-                3,
-                Field::CategoryGroup(CategoryGroupField::Name),
-                Value::Text("Bills".into()),
-            ),
-            budget_op(
-                EntityKind::Category,
-                4,
-                Field::Category(CategoryField::Name),
-                Value::Text("Power".into()),
-            ),
-            budget_op(
-                EntityKind::Category,
-                4,
-                Field::Category(CategoryField::GroupId),
-                id(3),
-            ),
-            budget_op(
-                EntityKind::Category,
-                4,
-                Field::Category(CategoryField::Note),
-                Value::Text("note — em dash".into()),
-            ),
-            budget_op(
-                EntityKind::Payee,
-                5,
-                Field::Payee(PayeeField::Name),
-                Value::Text("Meralco".into()),
-            ),
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Transaction(TransactionField::AccountId),
-                id(2),
-            ),
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Transaction(TransactionField::Date),
-                Value::Date(Date::new(2024, 2, 29).unwrap()),
-            ),
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Transaction(TransactionField::Amount),
-                Value::Milliunits(Milliunits::MIN),
-            ),
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Transaction(TransactionField::Amount),
-                Value::Milliunits(Milliunits::MAX),
-            ),
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Transaction(TransactionField::PayeeId),
-                id(5),
-            ),
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Transaction(TransactionField::CategoryId),
-                id(4),
-            ),
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Transaction(TransactionField::Memo),
-                Value::Text("groceries".into()),
-            ),
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Transaction(TransactionField::Cleared),
-                Value::Cleared(Cleared::Reconciled),
-            ),
-            budget_op(
-                EntityKind::MonthCategory,
-                7,
-                Field::MonthCategory(MonthCategoryField::Month),
-                Value::Month(Month::new(2026, 1).unwrap()),
-            ),
-            budget_op(
-                EntityKind::MonthCategory,
-                7,
-                Field::MonthCategory(MonthCategoryField::CategoryId),
-                id(4),
-            ),
-            budget_op(
-                EntityKind::MonthCategory,
-                7,
-                Field::MonthCategory(MonthCategoryField::Budgeted),
-                Value::Milliunits(Milliunits::from_major(-45)),
-            ),
-            // The tombstone field rides the same wire.
-            budget_op(
-                EntityKind::Transaction,
-                6,
-                Field::Deleted,
-                Value::Bool(true),
-            ),
-        ]
     }
 
     #[test]

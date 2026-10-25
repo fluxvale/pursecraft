@@ -19,15 +19,17 @@ ignore = [
 # defaults; "Unicode-3.0" rides along with unicode-ident ("(MIT OR Apache-2.0)
 # AND Unicode-3.0"); "FSL-1.1-ALv2" is this workspace's own license
 # (ADR 0019), declared via workspace.package.license so our crates are checked
-# exactly like dependencies. "BSD-3-Clause" enters with matchit (ADR 0024) —
-# axum's route matcher, MIT AND BSD-3-Clause; a permissive OSI license,
-# unavoidable given ADR 0013's axum decision. Adding anything else to this
-# list is a deliberate decision (memchr's "Unlicense OR MIT" is satisfied by
-# MIT; Unlicense itself stays un-allowed).
+# exactly like dependencies. Adding anything else to this list is a deliberate
+# decision (memchr's "Unlicense OR MIT" is satisfied by MIT; Unlicense itself
+# stays un-allowed).
 allow = [
     "MIT",
     "Apache-2.0",
     "Unicode-3.0",
     "FSL-1.1-ALv2",
+    # The dalek family (x25519-dalek → curve25519-dalek → subtle) is
+    # triple-licensed "MIT OR Apache-2.0 OR BSD-3-Clause"; the crypto
+    # lane's device-key wrapping pulled it in (ADR 0022). Deliberate
+    # addition, OSI/FSF-free, restricted to those deps' third option.
     "BSD-3-Clause",
 ]
