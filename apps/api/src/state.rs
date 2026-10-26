@@ -11,12 +11,19 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pursecraft_core::ids::ScopeId;
 use pursecraft_core::store::{OpaqueStore, StoreError};
 
 use crate::auth::AuthDb;
+
+/// How long one readiness probe result stays fresh (ADR 0026): the
+/// probe is an honest durable write, so the route must not let a client
+/// command unbounded fsyncs. One probe per second bounds abuse while
+/// staying far inside the fleet's 5s probe cadence — a failing store is
+/// still reported within a single probe period.
+pub const READINESS_PROBE_TTL: Duration = Duration::from_secs(1);
 
 /// The relay's whole state: the auth database and the open scope logs.
 #[derive(Debug)]
@@ -24,6 +31,9 @@ pub struct AppState {
     data_dir: PathBuf,
     pub auth: Mutex<AuthDb>,
     logs: Mutex<HashMap<ScopeId, Arc<Mutex<OpaqueStore>>>>,
+    /// The last readiness outcome and when it was taken (ADR 0026) —
+    /// `None`/`Some(err)` per outcome; the TTL bounds fsync cost.
+    readiness_cache: Mutex<Option<(Instant, Option<String>)>>,
 }
 
 /// A state failure — anything but an auth refusal: damaged stores fail
@@ -63,6 +73,7 @@ impl AppState {
             data_dir: data_dir.to_owned(),
             auth: Mutex::new(auth),
             logs: Mutex::new(HashMap::new()),
+            readiness_cache: Mutex::new(None),
         })
     }
 
@@ -101,18 +112,47 @@ impl AppState {
 
     /// Whether the relay can durably persist right now (ADR 0026): a
     /// write-then-fsync probe into each on-disk home — the data directory
-    /// (the auth db) and `logs/` (the scope logs). This is readiness,
-    /// not liveness: a failing probe means the pod leaves rotation, never
-    /// restarts — a read-only volume cannot be restarted into health.
+    /// (the auth db) and `logs/` (the scope logs) — a directory-level
+    /// canary: it fails exactly when no write to those directories could
+    /// succeed; per-file damage inside a writable directory stays loud
+    /// at request time (ADR 0024). This is readiness, not liveness: a
+    /// failing probe means the pod leaves rotation, never restarts — a
+    /// read-only volume cannot be restarted into health. Results are
+    /// cached for [`READINESS_PROBE_TTL`] so the route cannot be used as
+    /// an fsync firehose.
     pub fn readiness(&self) -> std::io::Result<()> {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("the system clock is after the epoch")
-            .as_nanos()
-            .to_string();
-        probe_dir(&self.data_dir, &stamp)?;
-        probe_dir(&self.data_dir.join("logs"), &stamp)?;
-        Ok(())
+        let mut cached = self.readiness_cache.lock().expect("readiness cache lock");
+        if let Some((at, outcome)) = cached.as_ref()
+            && at.elapsed() < READINESS_PROBE_TTL
+        {
+            return probe_outcome(outcome.clone());
+        }
+        let outcome = probe_readiness(&self.data_dir);
+        *cached = Some((Instant::now(), outcome.clone()));
+        probe_outcome(outcome)
+    }
+}
+
+/// Run both probe writes; the first failure wins, as a real write would.
+fn probe_readiness(data_dir: &Path) -> Option<String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the system clock is after the epoch")
+        .as_nanos()
+        .to_string();
+    if let Err(e) = probe_dir(data_dir, &stamp) {
+        return Some(e.to_string());
+    }
+    probe_dir(&data_dir.join("logs"), &stamp)
+        .err()
+        .map(|e| e.to_string())
+}
+
+/// A cached outcome back into a Result — `None` is health.
+fn probe_outcome(outcome: Option<String>) -> std::io::Result<()> {
+    match outcome {
+        None => Ok(()),
+        Some(err) => Err(std::io::Error::other(err)),
     }
 }
 

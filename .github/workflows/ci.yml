@@ -67,6 +67,7 @@ jobs:
               - "apps/api/**"
               - "apps/core/**" # core is shared: a core change re-runs every consumer
               - "Dockerfile" # the api image bakes this crate; its CI surface includes it
+              - ".dockerignore" # shapes the image's build context — same surface
               - "scripts/ci/api.sh"
               - "scripts/ci/rust.sh"
               - "scripts/ci/mise-version.sh"
@@ -430,8 +431,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # pinned to commit — mutable tags execute unreviewed code; this
-      # job holds packages:write
-      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.10.0
+      # job holds packages:write. (e468171a… is v3.11.1's tag object —
+      # verified against the upstream repo; labels drift, SHAs don't.)
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Build and push
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0

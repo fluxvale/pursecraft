@@ -1,6 +1,9 @@
 # Build-context hygiene (ADR 0026): the image needs only the workspace
 # manifests and apps/. Everything else — notably target/ (gigabytes after
-# a local build) and any local dev data — stays out of the context.
+# a local build) and any local dev data (the dev relay's default `data`
+# dir, wherever it was run from) — stays out of the context.
 target
-.git
+**/target
 data
+**/data
+.git

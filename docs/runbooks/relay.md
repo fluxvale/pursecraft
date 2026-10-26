@@ -34,7 +34,10 @@ Product-side only — cluster manifests live in the fleet repo
 - **Manual dispatch** with the `push-image` input — pushes `sha-<sha>`
   *only*, from any branch whose image inputs differ from `main`. This is
   the bootstrap/candidate path (e.g. the fleet lane deploying a
-  pre-merge candidate). `latest` never moves on a dispatch.
+  pre-merge candidate). `latest` never moves on a dispatch. Footgun:
+  dispatching *from main itself* compares main's last commit against its
+  parent — if that commit didn't touch the image inputs, the job
+  silently skips; dispatch from the branch whose changes you want built.
 
 ### One-time setup (owner)
 
@@ -68,15 +71,25 @@ read it once, keep it off the network ([ADR 0024]).
 | `GET /health` | Liveness | `200 {"status":"ok"}` unconditionally; touches nothing |
 | `GET /health/ready` | Readiness | `200 {"status":"ready"}` when a write+fsync probe into both on-disk homes (data dir, `logs/`) succeeds; `503 {"status":"unavailable"}` otherwise (detail only in server logs) |
 
+Probe results are cached for one second (an honest durable write must not
+be an fsync firehose on a public listener); a failing store is still
+reported well inside the fleet's 5s probe cadence.
+
 Suggested probes (mirroring the fleet's other apps): startup
 `/health` 5s × 30; readiness `/health/ready` 5s period, 3s timeout,
 failureThreshold 2; liveness `/health` 10s.
 
 Semantics when the data dir is unwritable (read-only volume, full disk,
-wrong ownership): readiness fails, liveness stays green — the pod leaves
-the Service endpoints but is **not** restarted, because a restart cannot
-fix a volume ([ADR 0026]). The probe writes `health.probe` files in both
-directories; their mtimes are the last successful probe.
+wrong directory ownership): readiness fails, liveness stays green — the
+pod leaves the Service endpoints but is **not** restarted, because a
+restart cannot fix a volume ([ADR 0026]). The canary is directory-level:
+per-file damage inside a writable directory (a root-owned log file, a
+partial restore) still fails loudly as a 500 at request time, per
+[ADR 0024]'s contract. One deliberate asymmetry: with `logs/` deleted at
+runtime, already-open stores keep serving until their next write while
+readiness reports 503 — readiness errs unavailable, never available. The
+probe writes `health.probe` files in both directories; their mtimes are
+the last successful probe.
 
 ## Shutdown contract
 
@@ -96,7 +109,9 @@ docker run -d --name pursecraft \
   -p 8080:8080 \
   -v pursecraft-data:/var/lib/pursecraft \
   ghcr.io/fluxvale/pursecraft:latest
-# the runtime image has no shell — copy the secret out to read it once
+# the secret is written at boot — wait for liveness before reading it
+# (the runtime image has no shell, so copy the secret out to read it once)
+until curl -sf http://localhost:8080/health >/dev/null; do sleep 1; done
 docker cp pursecraft:/var/lib/pursecraft/enrollment.secret ./enrollment.secret
 ```
 

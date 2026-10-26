@@ -60,12 +60,22 @@ probe): `GET /health` is liveness and touches nothing — a store blip must
 pull the pod from rotation, never restart-storm it. `GET /health/ready` is
 readiness and reflects the store's *actual* health: a write-then-fsync
 probe into each on-disk home (the data directory for `auth.json`, `logs/`
-for the scope logs — [ADR 0024]'s whole durable state). An unwritable data
-dir (read-only volume, full disk, lost ownership) answers 503 and keeps
-answering 503 until the filesystem recovers: the pod leaves the Service
-endpoints but is not restarted, because a restart cannot fix a volume. A
-process-internal flag cannot lie this honestly — the probe writes the same
-media the relay writes, so readiness fails exactly when serving would.
+for the scope logs — [ADR 0024]'s whole durable state). It is a
+**directory-level canary**: it fails exactly when no write to those
+directories could succeed — an unwritable data dir (read-only volume, full
+disk, lost directory ownership) answers 503 and keeps answering 503 until
+the filesystem recovers. Per-file damage inside a still-writable
+directory (a root-owned or mode-0444 log file, an operator's partial
+restore) does not fail the canary — it stays loud at request time as a
+500, the [ADR 0024] contract; probing a real log file would mean writing
+into it, which no probe may do. One deliberate asymmetry: with `logs/`
+deleted at runtime, already-open stores keep serving until their next
+write while readiness reports 503 — readiness errs unavailable, never
+available. Because the probe is an honest durable write, its result is
+cached for one second: the route cannot be used as an fsync firehose,
+while a failing store is still reported well inside the fleet's 5 s probe
+cadence. The pod leaves the Service endpoints but is not restarted — a
+restart cannot fix a volume.
 
 ### Graceful shutdown: drain bounded inside the fleet's termination grace
 
@@ -106,6 +116,9 @@ The env contract and operational details live in
 - **Readiness as an internal health flag** — rejected: a flag reports what
   the process believes, not what the filesystem does; only a write probe
   exercises the failure mode readiness exists to catch.
+- **Per-file probing of the real store paths** — rejected: proving a log
+  file is appendable requires writing to it, which no probe may do; the
+  directory canary plus request-time loud failure is the honest pair.
 - **Liveness reflecting the store** — rejected: a read-only volume would
   crash-loop the pod out of rotation *and* out of sight; 503 readiness on a
   live process keeps the failure observable.
@@ -120,7 +133,10 @@ The env contract and operational details live in
 - The fleet lane can point manifests at a `sha-<sha>` image the moment
   this branch's dispatch pushes one, before the PR merges.
 - The owner flips the package public once, after first push (runbook step).
-- Image rebuilds ride GitHub's layer cache; a cold build costs a normal
-  Rust release build (~minutes), acceptable on main merges.
-- Health probes write two tiny files per readiness check — fsync-bound and
+- Image rebuilds happen only in CI: any source change busts the (single)
+  expensive build layer, so most publishes are a full release build
+  (minutes, accepted on main merges); dependency pre-build layering was
+  rejected as complexity the publish cadence does not need yet.
+- Health probes write two tiny files per probe — fsync-bound and
   deliberate: the probe must cost what a real append costs or it lies.
+  The one-second result cache bounds that cost against hostile clients.

@@ -26,6 +26,11 @@ async fn readiness_tracks_the_store_and_recovers() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "ready");
 
+    // Results are cached for READINESS_PROBE_TTL — cross the TTL so
+    // each transition below observes the live probe, not the cache.
+    let ttl = pursecraft_api::READINESS_PROBE_TTL;
+    std::thread::sleep(ttl + std::time::Duration::from_millis(50));
+
     // The oplog home gone: the probe must report what a real append
     // would hit, not what the process believes (ADR 0026).
     std::fs::remove_dir_all(relay.dir.join("logs")).unwrap();
@@ -42,9 +47,33 @@ async fn readiness_tracks_the_store_and_recovers() {
     // Recovery is live, not cached: the moment the home is writable
     // again the probe says so.
     std::fs::create_dir_all(relay.dir.join("logs")).unwrap();
+    std::thread::sleep(ttl + std::time::Duration::from_millis(50));
     let (status, body) = relay.request("GET", "/health/ready", None, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "ready");
+}
+
+#[tokio::test]
+async fn readiness_results_are_ttl_cached_not_rewritten_per_request() {
+    // The cache exists so the route cannot be an fsync firehose (ADR
+    // 0026): inside the TTL window no new probe write happens —
+    // observed through the probe file's mtime staying put.
+    let mut relay = TestRelay::new("ttl");
+    let probe = relay.dir.join("logs").join("health.probe");
+    let (status, _) = relay.request("GET", "/health/ready", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let first = std::fs::metadata(&probe).unwrap().modified().unwrap();
+    for _ in 0..3 {
+        // far inside the TTL — a live probe per request would bump the
+        // mtime each time (the stamp differs per write)
+        let (status, _) = relay.request("GET", "/health/ready", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let last = std::fs::metadata(&probe).unwrap().modified().unwrap();
+    assert_eq!(
+        first, last,
+        "requests inside the TTL must not trigger new probe writes"
+    );
 }
 
 #[tokio::test]
