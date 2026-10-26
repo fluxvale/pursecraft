@@ -468,8 +468,9 @@ fn two_devices_converge_with_category_ops() {
         "5000 inflow − 1400 assigned\n{view}"
     );
     assert!(
-        !view.contains("Inbox (uncategorized)"),
-        "the bucket emptied on both sides\n{view}"
+        view.contains("Inbox (1 to review)"),
+        "salary deliberately stays in the inbox as inflow — the nag names \
+         it, its amount lives in to-be-budgeted\n{view}"
     );
 
     // And the recap's category column agrees on both devices.

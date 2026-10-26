@@ -155,7 +155,8 @@ pursecraft assign <category> <amount> [--month YYYY-MM]
   `assigned` = the sum of visible `MonthCategory.budgeted` cells for
   (month, category) — summed, so deterministically-converging twin cells
   (two devices assigning offline) overstate rather than understate, and
-  the next `assign` re-targets the earliest cell and corrects the total.
+  the next `assign` corrects the total: it writes the earliest cell and
+  zeroes every twin.
   `activity` = the sum of visible transactions dated in the month and
   resolving to the category. **Single-month window: no cross-month
   carry** (deferred with goals and move-money; a carried balance would
@@ -273,6 +274,19 @@ the sink and carry ADR 0011's pending badge; exit codes stay `0`/`2`/`1`.
   assignments, and re-filing in the mix.
 - Month cells stay client-unique by convention ([ADR 0016]'s deferral
   stands): twins from true concurrent offline assigns sum in the roll-up
-  (deterministic, over-stating) and self-correct on the next assign.
+  (deterministic, over-stating) and the next `assign` folds them — it
+  targets the earliest cell and zeroes the rest, correcting the total.
+- Twin **Inboxes** are possible exactly where twin cells are (two
+  devices ensuring offline on a pre-0026 world): every replica
+  deterministically treats the earliest as *the* Inbox (name resolution
+  is min-id), and the later twin renders as an inert envelope until a
+  delete/merge surface exists — the same accepted class.
+- The dead-category re-parent into the Inbox leans on the Inbox being
+  the earliest-created category, which every CLI write path ensures; a
+  future client minting categories without the ensure weakens it
+  ([ADR 0016]'s fallback still applies — deterministically, just onto a
+  user category). Torn captures (an amount or date op that never
+  landed) stay file-able in `categorize` forever — faithful to
+  [ADR 0023]'s torn rendering; a discard path is a later slice.
 - `list`'s column layout shifts (a category column lands between payee
   and amount) — scripts parsing fixed columns must adjust once, here.

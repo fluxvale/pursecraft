@@ -44,6 +44,9 @@ pub enum CategoryError {
         name: String,
         known: Vec<String>,
     },
+    /// The name is the Inbox's — reserved by adoption (ADR 0026); a
+    /// distinct teaching instead of the generic duplicate.
+    Reserved,
     /// No live category of this exact name; `known` lists what does —
     /// the resolution error for `--category`, `assign`, and
     /// `categorize` (exact names, never find-or-create).
@@ -70,6 +73,11 @@ impl fmt::Display for CategoryError {
                 "category {name:?} already exists (known: {}; use a distinct name — \
                  categories are matched by exact name)",
                 join_known(known)
+            ),
+            Self::Reserved => write!(
+                f,
+                "{INBOX_NAME:?} is reserved — it is the review queue; uncategorized \
+                 captures land there (review: pursecraft categorize)"
             ),
             Self::Unknown { wanted, known } => write!(
                 f,
@@ -284,17 +292,31 @@ pub fn new_category(
     std::fs::create_dir_all(path.parent().expect("store parent"))?;
     let mut store = LocalStore::open(&path)?;
     let mut out = String::new();
-    if ensure_inbox(&mut minter, &mut store, &identity)? {
-        out.push_str(&inbox_line());
-    }
+
+    // The duplicate check precedes the Inbox ensure so that naming a
+    // world's Inbox into existence is an adoption, never a confusing
+    // "already exists" for the thing this command just created.
     let boot = crate::capture::boot(&store)?;
     minter.absorb(boot.clock());
     let state = boot.state();
+    let reserved = name == INBOX_NAME;
     if find_category(state, name).is_some() {
-        return Err(CategoryError::Duplicate {
-            name: name.to_owned(),
-            known: known_names(state),
+        return Err(if reserved {
+            CategoryError::Reserved
+        } else {
+            CategoryError::Duplicate {
+                name: name.to_owned(),
+                known: known_names(state),
+            }
         });
+    }
+    if reserved {
+        out.push_str(&format!(
+            "created category {name:?} — this is the review queue; uncategorized \
+             captures land here (review: pursecraft categorize)\n"
+        ));
+    } else if ensure_inbox(&mut minter, &mut store, &identity)? {
+        out.push_str(&inbox_line());
     }
     let scope = ScopeId::Budget(identity.budget_id);
     let id = EntityId::new(mint_uuid()).expect("minted v7");
@@ -454,4 +476,138 @@ pub(crate) fn grouped(state: &ScopeState) -> Vec<CategoryBlock> {
         ));
     }
     blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::idmint::mint_uuid;
+    use crate::testsupport::TempDir;
+    use pursecraft_core::date::Date;
+    use pursecraft_core::ids::DeviceId;
+
+    fn session() -> crate::session::Session {
+        crate::session::Session {
+            version: 1,
+            server: "http://127.0.0.1:9".into(),
+            device_id: DeviceId::new(mint_uuid()).unwrap(),
+            token: "test-only".into(),
+        }
+    }
+
+    fn capture(home: &Path) {
+        crate::capture::add(
+            home,
+            &session(),
+            &crate::capture::RawAdd {
+                payee: "coffee",
+                amount: "-4.50",
+                date: None,
+                account: None,
+                category: None,
+            },
+            Date::new(2026, 10, 25).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn boot_state(home: &Path) -> ScopeState {
+        let identity = load_identity(home).unwrap().expect("world");
+        let store = LocalStore::open(&budget_log(home, identity.budget_id)).unwrap();
+        let mut replay = SyncSession::new();
+        replay.apply_delta(store.delta_since(0)).unwrap();
+        replay.state().clone()
+    }
+
+    /// Duplicates are refused with the known list; the reserved name
+    /// gets its own teaching (hostile-review P3-3), and on a world
+    /// without an Inbox, naming one into existence is an adoption.
+    #[test]
+    fn duplicates_refuse_and_the_reserved_name_adopts_or_teaches() {
+        let tmp = TempDir::new("category-new");
+        let home = tmp.path();
+        capture(home);
+        new_category(home, &session(), "Food", None).unwrap();
+        let err = new_category(home, &session(), "Food", None).unwrap_err();
+        assert!(err.to_string().contains("\"Food\" already exists"), "{err}");
+        let err = new_category(home, &session(), "Inbox", None).unwrap_err();
+        assert!(
+            err.to_string().contains("reserved"),
+            "the existing inbox teaches distinctly\n{err}"
+        );
+        assert!(!err.to_string().contains("already exists"), "{err}");
+
+        // A world with no Inbox (identity + capture ops seeded, inbox
+        // entity stripped the way a pre-0026 world would look): naming
+        // it adopts — the mint IS the ensure, never a self-defeating
+        // "already exists".
+        let tmp2 = TempDir::new("category-adopt");
+        let home2 = tmp2.path();
+        // A pre-0026 shape: identity and a seeded payee op, no Inbox in
+        // the log (`capture` itself now always ensures, so this is
+        // seeded by hand).
+        let (identity, _) =
+            crate::home::load_or_create_identity(home2, session().device_id).unwrap();
+        let log = budget_log(home2, identity.budget_id);
+        std::fs::create_dir_all(log.parent().expect("store parent")).unwrap();
+        let mut store = LocalStore::open(&log).unwrap();
+        let mut minter = Minter::new(&session(), &identity);
+        sink::sink(
+            &mut store,
+            minter.op_now(
+                ScopeId::Budget(identity.budget_id),
+                pursecraft_core::domain::EntityKind::Payee,
+                pursecraft_core::ids::EntityId::new(mint_uuid()).unwrap(),
+                pursecraft_core::domain::Field::Payee(pursecraft_core::domain::PayeeField::Name),
+                pursecraft_core::domain::Value::Text("coffee".into()),
+            ),
+        )
+        .unwrap();
+        drop(store);
+        let made = new_category(home2, &session(), "Inbox", None).unwrap();
+        assert!(
+            made.contains("created category \"Inbox\" — this is the review queue"),
+            "{made}"
+        );
+        let state = boot_state(home2);
+        assert_eq!(
+            find_category(&state, "Inbox").map(|id| CategoryId::new(id.as_uuid()).unwrap()),
+            inbox_of(&state),
+            "the adopted category is THE inbox"
+        );
+    }
+
+    /// `category list` renders grouped, ungrouped last, the Inbox
+    /// marked; a `--group` label is find-or-create (the second use
+    /// reuses the first group).
+    #[test]
+    fn list_renders_grouped_with_the_inbox_marked() {
+        let tmp = TempDir::new("category-list");
+        let home = tmp.path();
+        capture(home);
+        new_category(home, &session(), "Power", Some("Bills")).unwrap();
+        new_category(home, &session(), "Water", Some("Bills")).unwrap();
+        new_category(home, &session(), "Food", None).unwrap();
+        let list = list(home, &session()).unwrap();
+        let lines: Vec<&str> = list.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "Bills",
+                "  Power",
+                "  Water",
+                "(ungrouped)",
+                "  Food",
+                "  Inbox (inbox)",
+            ],
+            "{list}"
+        );
+
+        let state = boot_state(home);
+        let groups: Vec<_> = state
+            .entities()
+            .filter(|e| matches!(e, Entity::CategoryGroup(_)))
+            .collect();
+        assert_eq!(groups.len(), 1, "the group label is find-or-create");
+    }
 }

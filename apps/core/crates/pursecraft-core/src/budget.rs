@@ -38,15 +38,21 @@ pub struct CategoryRow {
 /// The inbox bucket's row (ADR 0026): activity counts only the bucket's
 /// non-positive transactions — positives are inflow (to-be-budgeted),
 /// and a positive filed into a category is a refund of that category's
-/// activity instead. `category` is `None` when no Inbox entity exists;
-/// the bucket of uncategorized transactions still renders (the review
-/// surface never depends on an entity being minted).
+/// activity instead. `count` is the bucket's in-month membership
+/// (positives included): the review surface's visibility signal, so a
+/// nag row renders even when the bucket holds only income (whose
+/// amounts live in `inflow`, not `activity`). `category` is `None` when
+/// no Inbox entity exists; the bucket of uncategorized transactions
+/// still renders (the review surface never depends on an entity being
+/// minted).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct InboxRow {
     pub category: Option<CategoryId>,
     pub assigned: Milliunits,
     pub activity: Milliunits,
     pub available: Milliunits,
+    /// How many in-month visible transactions resolve to the bucket.
+    pub count: usize,
 }
 
 /// One month's budget, derived (ADR 0026).
@@ -116,6 +122,7 @@ pub fn project(state: &ScopeState, month: Month, inbox: Option<CategoryId>) -> B
     }
 
     let mut inbox_activity = Milliunits::ZERO;
+    let mut inbox_count: usize = 0;
     let mut inflow = Milliunits::ZERO;
     for entity in state.entities() {
         let Entity::Transaction(txn) = entity else {
@@ -133,21 +140,23 @@ pub fn project(state: &ScopeState, month: Month, inbox: Option<CategoryId>) -> B
         let bucket = match transaction_category(state, txn) {
             CategoryResolution::Uncategorized => true,
             CategoryResolution::Category(category) => {
-                // Resolution guarantees the category is live, so the
-                // envelope exists.
-                if let Some(entry) = envelopes.get_mut(&category) {
-                    if Some(category) == inbox {
-                        true
-                    } else {
-                        entry.1 = add(entry.1, amount);
-                        false
-                    }
+                // Resolution only ever resolves to a live category, and
+                // `envelopes` holds exactly the live categories — a miss
+                // is unreachable corruption, loud rather than a silent
+                // drop that would break the conservation identity.
+                let entry = envelopes
+                    .get_mut(&category)
+                    .expect("resolution resolves to a live category");
+                if Some(category) == inbox {
+                    true
                 } else {
+                    entry.1 = add(entry.1, amount);
                     false
                 }
             }
         };
         if bucket {
+            inbox_count += 1;
             if amount > Milliunits::ZERO {
                 inflow = add(inflow, amount);
             } else {
@@ -179,6 +188,7 @@ pub fn project(state: &ScopeState, month: Month, inbox: Option<CategoryId>) -> B
             assigned: inbox_assigned,
             activity: inbox_activity,
             available: add(inbox_assigned, inbox_activity),
+            count: inbox_count,
         },
         inflow,
         to_be_budgeted: inflow
@@ -385,6 +395,8 @@ mod tests {
         );
 
         // The inbox: income diverted to inflow, spend nagging as activity.
+        // Both count toward the bucket — the nag row's visibility signal.
+        assert_eq!(budget.inbox.count, 2);
         assert_eq!(milli(budget.inflow), 800_000);
         assert_eq!(milli(budget.inbox.activity), -900);
         assert_eq!(
@@ -513,6 +525,7 @@ mod tests {
 
         let budget = project(&fx.state, month(OCT), None);
         assert_eq!(budget.inbox.category, None);
+        assert_eq!(budget.inbox.count, 2, "membership does not need the entity");
         assert_eq!(milli(budget.inflow), 500_000);
         assert_eq!(milli(budget.inbox.activity), -100);
         assert_eq!(milli(budget.to_be_budgeted), 500_000);

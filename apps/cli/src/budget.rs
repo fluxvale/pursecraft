@@ -34,8 +34,9 @@ pub enum BudgetError {
     Month {
         input: String,
     },
-    /// The amount is negative — assignment is a magnitude (ADR 0026).
-    Negative {
+    /// The amount carries a sign — assignment is a bare magnitude
+    /// (ADR 0026: "no sign").
+    Signed {
         input: String,
     },
     /// The amount is not a strict Milliunits magnitude.
@@ -61,10 +62,10 @@ impl fmt::Display for BudgetError {
                     "invalid month {input:?} (expected YYYY-MM, e.g. 2026-10)"
                 )
             }
-            Self::Negative { input } => write!(
+            Self::Signed { input } => write!(
                 f,
-                "amount {input:?} is negative — assign holds a magnitude; pass a smaller \
-                 amount to reduce, never a minus"
+                "amount {input:?} carries a sign — assign holds a bare magnitude; write 500, \
+                 not +500 or -500 (pass a smaller amount to reduce, never a minus)"
             ),
             Self::Invalid { input } => write!(
                 f,
@@ -153,19 +154,17 @@ fn resolve_month(raw: Option<&str>, today: Date) -> Result<Month, BudgetError> {
 }
 
 /// Parse an assignment magnitude: the core's exact Milliunits grammar,
-/// signless (ADR 0026).
+/// bare digits — no sign in either direction (ADR 0026).
 fn parse_magnitude(input: &str) -> Result<Milliunits, BudgetError> {
     let trimmed = input.trim();
-    let parsed: Result<Milliunits, _> = trimmed.parse();
-    match parsed {
-        Ok(amount) if amount < Milliunits::ZERO => Err(BudgetError::Negative {
+    if trimmed.starts_with('-') || trimmed.starts_with('+') {
+        return Err(BudgetError::Signed {
             input: trimmed.to_owned(),
-        }),
-        Ok(amount) => Ok(amount),
-        Err(_) => Err(BudgetError::Invalid {
-            input: trimmed.to_owned(),
-        }),
+        });
     }
+    trimmed.parse().map_err(|_| BudgetError::Invalid {
+        input: trimmed.to_owned(),
+    })
 }
 
 /// `pursecraft assign <category> <amount> [--month YYYY-MM]` (ADR 0026):
@@ -216,8 +215,11 @@ pub fn assign(
         })
         .unwrap_or_else(|| "?".to_owned());
 
-    // The earliest live cell for (month, category): the write target.
-    let mut existing: Option<(EntityId, Option<Milliunits>)> = None;
+    // Every live cell for (month, category), earliest id first: the
+    // earliest gets the write (this is the household race LWW exists
+    // for); any twin (two devices minting offline) is zeroed so the
+    // next assign corrects the total, exactly as ADR 0026 promises.
+    let mut cells: Vec<(EntityId, Option<Milliunits>)> = Vec::new();
     for entity in state.entities() {
         let Entity::MonthCategory(cell) = entity else {
             continue;
@@ -227,28 +229,48 @@ pub fn assign(
         }
         let id = EntityId::new(cell.id.as_uuid()).expect("stored v7");
         let budgeted = cell.budgeted;
-        if existing.is_none_or(|(earliest, _)| id < earliest) {
-            existing = Some((id, budgeted));
+        match cells.binary_search_by_key(&id, |(id, _)| *id) {
+            Ok(at) => cells[at].1 = budgeted,
+            Err(at) => cells.insert(at, (id, budgeted)),
         }
     }
 
     let scope = ScopeId::Budget(identity.budget_id);
     let mut ops = Vec::new();
-    match existing {
+    match cells.first() {
         Some((cell, was)) => {
             ops.push(minter.op_now(
                 scope,
                 EntityKind::MonthCategory,
-                cell,
+                *cell,
                 Field::MonthCategory(MonthCategoryField::Budgeted),
                 Value::Milliunits(amount),
             ));
-            if let Some(was) = was.filter(|was| *was != amount) {
-                out.push_str(&format!(
-                    "assigned {amount} to {name} for {month}, was {was}\n"
+            let stale = cells.len() - 1;
+            for (twin, _) in &cells[1..] {
+                ops.push(minter.op_now(
+                    scope,
+                    EntityKind::MonthCategory,
+                    *twin,
+                    Field::MonthCategory(MonthCategoryField::Budgeted),
+                    Value::Milliunits(Milliunits::ZERO),
                 ));
+            }
+            let folded = if stale > 0 {
+                format!(
+                    " (folded {stale} stale duplicate cell{})",
+                    if stale == 1 { "" } else { "s" }
+                )
             } else {
-                out.push_str(&format!("assigned {amount} to {name} for {month}\n"));
+                String::new()
+            };
+            match was.filter(|was| *was != amount) {
+                Some(was) => out.push_str(&format!(
+                    "assigned {amount} to {name} for {month}, was {was}{folded}\n"
+                )),
+                None => out.push_str(&format!(
+                    "assigned {amount} to {name} for {month}{folded}\n"
+                )),
             }
         }
         None => {
@@ -328,12 +350,19 @@ pub fn show(
     if !any_rows {
         out.push_str("\nno categories yet — try: pursecraft category new Food\n");
     }
-    if projected.inbox.activity != Milliunits::ZERO || projected.inbox.assigned != Milliunits::ZERO
-    {
+    if projected.inbox.count > 0 || projected.inbox.assigned != Milliunits::ZERO {
+        // The nag renders on bucket membership (ADR 0026: "non-empty
+        // that month"), not on activity — an income-only bucket still
+        // awaits review, its amounts sitting in inflow.
+        let label = if projected.inbox.count > 0 {
+            format!("Inbox ({} to review)", projected.inbox.count)
+        } else {
+            "Inbox".to_owned()
+        };
         out.push_str(&format!(
             "\n{}\n",
             row_line(
-                "Inbox (uncategorized)",
+                &label,
                 projected.inbox.assigned,
                 projected.inbox.activity,
                 projected.inbox.available,
@@ -419,13 +448,14 @@ mod tests {
             parse_magnitude(" 1250.50 ").unwrap(),
             Milliunits::from_milli(1_250_500)
         );
-        assert_eq!(
-            parse_magnitude("+500").unwrap(),
-            Milliunits::from_major(500)
-        );
         assert_eq!(parse_magnitude("0").unwrap(), Milliunits::ZERO);
-        let err = parse_magnitude("-500").unwrap_err();
-        assert!(err.to_string().contains("never a minus"), "{err}");
+        for signed in ["-500", "+500"] {
+            let err = parse_magnitude(signed).unwrap_err();
+            assert!(
+                err.to_string().contains("bare magnitude"),
+                "{signed}: {err}"
+            );
+        }
         let err = parse_magnitude("1,000").unwrap_err();
         assert!(err.to_string().contains("invalid amount"), "{err}");
     }
@@ -506,6 +536,80 @@ mod tests {
             err.to_string().contains("review queue"),
             "assign refuses the inbox\n{err}"
         );
+    }
+
+    /// Twin cells fold (hostile-review P2-2, ADR 0026's correction
+    /// promise): a later assign targets the earliest cell AND zeroes the
+    /// twin — the total becomes exactly the new amount, never floored by
+    /// a stale duplicate.
+    #[test]
+    fn twin_cells_are_folded_by_the_next_assign() {
+        let tmp = TempDir::new("twin-fold");
+        let home = tmp.path();
+        capture(home, "coffee", "-4.50", None);
+        crate::category::new_category(home, &session(), "Food", None).unwrap();
+        // Seed the twin state: two devices each minted a cell offline.
+        let (identity, mut store, state) = boot_state(home);
+        let food = find_category(&state, "Food").unwrap();
+        let month = Month::new(2026, 10).unwrap();
+        let mut minter = Minter::new(&session(), &identity);
+        minter.absorb(boot(&store).unwrap().clock());
+        for budgeted in [500, 700] {
+            let cell = EntityId::new(mint_uuid()).unwrap();
+            for (field, value) in [
+                (
+                    Field::MonthCategory(MonthCategoryField::Month),
+                    Value::Month(month),
+                ),
+                (
+                    Field::MonthCategory(MonthCategoryField::CategoryId),
+                    Value::Id(food),
+                ),
+                (
+                    Field::MonthCategory(MonthCategoryField::Budgeted),
+                    Value::Milliunits(Milliunits::from_major(budgeted)),
+                ),
+            ] {
+                sink::sink(
+                    &mut store,
+                    minter.op_now(
+                        ScopeId::Budget(identity.budget_id),
+                        EntityKind::MonthCategory,
+                        cell,
+                        field,
+                        value,
+                    ),
+                )
+                .unwrap();
+            }
+        }
+        drop(store);
+
+        // The over-stated view before correction…
+        let view = show(home, &session(), None, today()).unwrap();
+        assert!(view.contains("1200.000"), "twins sum: {view}");
+
+        // …and the assign that folds them.
+        let assigned = assign(home, &session(), "Food", "800", None, today()).unwrap();
+        assert!(
+            assigned.contains("folded 1 stale duplicate cell"),
+            "{assigned}"
+        );
+        let view = show(home, &session(), None, today()).unwrap();
+        let line = view.lines().find(|l| l.contains("Food")).unwrap();
+        assert!(
+            line.contains("800.000") && !view.contains("1200.000"),
+            "the total is the new amount exactly\n{view}"
+        );
+        let (_, _, state) = boot_state(home);
+        let totals: Vec<i64> = state
+            .entities()
+            .filter_map(|e| match e {
+                Entity::MonthCategory(c) => c.budgeted.map(|b| b.milli()),
+                _ => None,
+            })
+            .collect();
+        assert!(totals.contains(&800_000) && totals.contains(&0));
     }
 
     /// A torn cell (month+category landed, budgeted not) is completed by
@@ -605,8 +709,9 @@ mod tests {
             "{view}"
         );
         assert!(
-            view.contains("Inbox (uncategorized)"),
-            "the nag row renders\n{view}"
+            view.contains("Inbox (2 to review)"),
+            "the nag row renders on bucket membership — negatives show as \
+             activity, and the count names what waits (salary + mystery)\n{view}"
         );
         assert!(
             view.contains("to be budgeted 4600.000"),
@@ -618,7 +723,7 @@ mod tests {
         assert!(empty.contains("2027-01"), "{empty}");
         assert!(empty.contains("to be budgeted 0.000"), "{empty}");
         assert!(
-            !empty.contains("Inbox (uncategorized)"),
+            !empty.contains("to review"),
             "an empty bucket hides the nag\n{empty}"
         );
 
