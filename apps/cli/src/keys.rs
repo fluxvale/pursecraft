@@ -488,28 +488,21 @@ fn load_mode(home: &Path, e2ee: bool) -> Result<Mode, KeysError> {
         return Ok(Mode::Absent { joining: false });
     }
     let (founded, stored) = read_keyring(&keyring_path)?;
-    if device.is_none() && !stored.is_empty() {
+    let device = match device {
+        Some(device) => device,
         // Records bound to a key that is gone: every wrap is sealed to that
         // key, so a fresh one would make the world unreadable to every device
         // including this one. Refuse, and say which file to restore (ADR 0028:
         // `device.key` is never re-minted over a populated keyring).
-        return Err(KeysError::MissingDeviceKey { path: device_path });
-    }
-    if device.is_none() {
+        None if !stored.is_empty() => {
+            return Err(KeysError::MissingDeviceKey { path: device_path });
+        }
         // The crash window inside `Keys::init` (keyring published, device key
         // not) — nothing is bound yet, so minting the key is safe. A founding
         // home completes it with the next capture; a joiner with the next
         // `sync` (ADR 0028), so the gate must treat the two differently or a
         // founding home is locked out of the very command that heals it.
-        return Ok(Mode::Absent { joining: !founded });
-    }
-    let Some(device) = device else {
-        if stored.is_empty() {
-            // A joining device waiting for its wraps (or the crash window
-            // inside `Keys::init`). Either way nothing is bound yet.
-            return Ok(Mode::Absent { joining: true });
-        }
-        return Err(KeysError::MissingDeviceKey { path: device_path });
+        None => return Ok(Mode::Absent { joining: !founded }),
     };
     let mut chain = KeyChain::new(device);
     for (index, entry) in stored.iter().enumerate() {

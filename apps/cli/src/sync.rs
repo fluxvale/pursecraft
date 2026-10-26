@@ -635,38 +635,26 @@ pub fn join(
     }
 
     // The joiner's own key material (ADR 0028): a device key and an empty
-    // joining keyring. It mints nothing; it publishes its public key so a
-    // key-holding device can wrap the world's keys to it.
+    // joining keyring. It mints nothing; it publishes its public key and takes
+    // whatever it is addressed, through the same install path as every other
+    // command — a record that will not install is reported, never a wedge.
     world.join()?;
-    let mut conflicts = Vec::new();
-    if world.is_sealed() {
-        if let Some(record) = world.device_record(session.device_id) {
-            relay.publish_keys(org_id, &[record])?;
-        }
-        // Org wraps first, then log wraps (ADR 0022's hierarchy); a record
-        // that will not install is reported after the join, never a wedge.
-        let pulled = relay.pull_keys(org_id)?;
-        for org_pass in [true, false] {
-            for wire in &pulled {
-                let is_org_wrap = matches!(
-                    pursecraft_crypto::KeyRecord::parse(&wire.record).ok(),
-                    Some(pursecraft_crypto::KeyRecord::Org { .. })
-                );
-                if is_org_wrap != org_pass {
-                    continue;
-                }
-                match world.install(&wire.record, org_id) {
-                    Ok(_) => {}
-                    Err(e) => conflicts.push(e.to_string()),
-                }
-            }
-        }
-    }
+    let conflicts = if world.is_sealed() {
+        publish_and_install(world, &relay, session, org_id)?.conflicts
+    } else {
+        Vec::new()
+    };
+
     if world.is_sealed() && !world.holds_log_key(ScopeId::Org(org_id)) {
         // Keyless: the join is granted and registered, and the marker makes it
         // resumable. Nothing is written into the world yet — an identity whose
         // account could not be adopted from the log would be a dead root
         // (ADR 0025). The remaining steps run on the next `sync`.
+        if !conflicts.is_empty() {
+            return Err(SyncError::KeyConflict {
+                detail: conflicts.join("; "),
+            });
+        }
         return Ok(format!(
             "registered this device with org {} — the world's keys are not here yet\n\
              \nnext:\n  \
@@ -674,22 +662,6 @@ pub fn join(
              pursecraft sync        # here, to install the keys and finish joining\n",
             org_id.as_uuid()
         ));
-    }
-    if world.is_sealed() && !world.holds_log_key(ScopeId::Org(org_id)) {
-        // Keyless: the join is granted and registered, and the marker makes it
-        // resumable (ADR 0028). Conflicts still report.
-        return match conflicts.is_empty() {
-            true => Ok(format!(
-                "registered this device with org {} — the world's keys are not here yet\n\
-                 \nnext:\n  \
-                 pursecraft sync        # on a device that already holds this world\n  \
-                 pursecraft sync        # here, to install the keys and finish joining\n",
-                org_id.as_uuid()
-            )),
-            false => Err(SyncError::KeyConflict {
-                detail: conflicts.join("; "),
-            }),
-        };
     }
     let joined = complete_join(world, session, org_id, budget_id)?;
     if conflicts.is_empty() {

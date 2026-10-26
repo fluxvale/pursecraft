@@ -747,3 +747,44 @@ fn an_empty_keyring_without_a_device_key_heals_on_the_next_capture() {
     assert_eq!(list.code, 0, "{}", list.stderr);
     assert!(list.stdout.contains("bread"), "{}", list.stdout);
 }
+
+/// A joiner landing on a poisoned record set reports the conflict instead of
+/// silently registering — the same contract the sync path keeps.
+#[test]
+fn a_join_onto_a_poisoned_record_set_reports_the_conflict() {
+    use pursecraft_cli::relay::Relay;
+    use pursecraft_cli::session;
+    use pursecraft_core::ids::OrgId;
+
+    let relay = LiveRelay::start("e2ee-join-poison");
+    let a = Home::new("e2ee-join-poison-a");
+    let b = Home::new("e2ee-join-poison-b");
+    assert_eq!(a.login(&relay).code, 0);
+    assert_eq!(a.run("", &["add", "coffee", "-4.50"]).code, 0);
+    let sync = a.run("", &["sync"]);
+    assert_eq!(sync.code, 0, "{}{}", sync.stdout, sync.stderr);
+    let [org_id, org_code, budget_id, budget_code] = parse_join_line(&sync.stdout);
+
+    // A member plants garbage before B arrives.
+    assert_eq!(a.run("", &["pair"]).code, 0);
+    let token = session::load(a.path()).unwrap().expect("enrolled").token;
+    let org = OrgId::new(uuid::Uuid::parse_str(&org_id).unwrap()).unwrap();
+    Relay::new(&relay.url, &token)
+        .publish_keys(org, &["not-a-key-record".to_owned()])
+        .expect("a granted member can publish");
+
+    assert_eq!(b.login(&relay).code, 0);
+    let join = b.run("", &["join", &org_id, &org_code, &budget_id, &budget_code]);
+    assert_eq!(
+        join.code, 1,
+        "a conflicted record set is reported on join too\n{}{}",
+        join.stdout, join.stderr
+    );
+    assert!(
+        join.stderr.contains("did not install"),
+        "the join names the conflict\n{}",
+        join.stderr
+    );
+    // And the marker survives, so the home is still resumable.
+    assert!(b.path().join("join.json").exists());
+}
