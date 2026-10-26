@@ -619,7 +619,7 @@ fn open_store(path: &std::path::Path) -> Result<LocalStore, SyncError> {
 /// The earliest live account in a budget state (ADR 0016's deterministic
 /// earliest-created convention) — the joiner's default.
 fn earliest_live_account(state: &pursecraft_core::ops::ScopeState) -> Option<(EntityId, String)> {
-    crate::capture::live_accounts(state).into_iter().min()
+    crate::capture::live_accounts(state).first().cloned()
 }
 
 /// Parse one join-bundle scope id with a teaching failure — the ids come

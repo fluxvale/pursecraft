@@ -597,6 +597,44 @@ fn add_with_corrupt_sync_state_stores_loudly() {
         "coffee and tea both stored"
     );
 }
+/// An ungranted device meeting an existing scope (delta-review finding:
+/// the one teaching branch no test pinned). A home restored WITHOUT its
+/// session (identity copied, fresh enrollment) syncs into scopes it no
+/// longer holds — the relay's grant refusal must surface the pairing and
+/// restore hints, end-to-end through the real relay's prose.
+#[test]
+fn an_ungranted_scope_refusal_teaches_pair_or_restore() {
+    let relay = LiveRelay::start("ungranted");
+    let a = Home::new("ungranted-a");
+    let c = Home::new("ungranted-c");
+
+    assert_eq!(a.login(&relay).code, 0);
+    assert_eq!(a.run("", &["add", "coffee", "-4.50"]).code, 0);
+    assert_eq!(a.run("", &["sync"]).code, 0);
+
+    // The restored home: A's world (identity), a FRESH enrollment — a
+    // device the relay has never granted anything.
+    assert_eq!(c.login(&relay).code, 0);
+    std::fs::copy(
+        a.path().join("identity.json"),
+        c.path().join("identity.json"),
+    )
+    .unwrap();
+
+    let sync = c.run("", &["sync"]);
+    assert_eq!(sync.code, 1, "{}{}", sync.stdout, sync.stderr);
+    assert!(
+        sync.stderr.contains("not granted"),
+        "the relay's refusal surfaces\n{}",
+        sync.stderr
+    );
+    assert!(
+        sync.stderr.contains("pursecraft pair") && sync.stderr.contains("copy the whole data home"),
+        "the teaching hints ride along\n{}",
+        sync.stderr
+    );
+}
+
 /// Session files carry the server's device mint (enrollment), not a local
 /// one — the relay's caller-identity check depends on it (ADR 0025).
 #[test]
