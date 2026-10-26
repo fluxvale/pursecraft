@@ -10,9 +10,9 @@
 use std::fmt;
 
 use minreq::{Error as HttpError, Response};
-use pursecraft_core::ids::{DeviceId, OpId, ScopeId};
+use pursecraft_core::ids::{DeviceId, OpId, OrgId, ScopeId};
 use pursecraft_core::ops::Op;
-use pursecraft_core::wire::OpMeta;
+use pursecraft_core::wire::{OpMeta, PayloadCipher};
 
 /// Request/response timeout, seconds (a household relay is fast; a hung
 /// socket must not hang a one-shot command).
@@ -128,16 +128,27 @@ impl<'a> Relay<'a> {
     /// `POST /v1/{kind}/{id}/ops` — push one batch (already chunked to the
     /// relay's cap by the caller). Every op must come back acked under its
     /// own id, in order — a short or lying ack batch is loud (ADR 0024).
-    pub fn push(&self, scope: ScopeId, ops: &[Op]) -> Result<(), RelayError> {
+    /// The payload is sealed through `cipher` here (ADR 0028): the relay
+    /// never sees the plaintext in E2EE mode, and the self-host mode passes
+    /// it through unchanged.
+    pub fn push(
+        &self,
+        scope: ScopeId,
+        ops: &[Op],
+        cipher: &impl PayloadCipher,
+    ) -> Result<(), RelayError> {
         let mut wire_ops = Vec::with_capacity(ops.len());
         for op in ops {
             let (meta, payload) = op.clone().into_parts();
-            let meta = serde_json::to_value(&meta)
+            let meta_value = serde_json::to_value(&meta)
                 .map_err(|e| RelayError::BadAnswer(format!("an op does not encode: {e}")))?;
-            let payload = pursecraft_core::wire::encode_payload(&payload).map_err(|e| {
+            let plaintext = pursecraft_core::wire::encode_payload(&payload).map_err(|e| {
                 RelayError::BadAnswer(format!("an op payload does not encode: {e}"))
             })?;
-            wire_ops.push(serde_json::json!({ "meta": meta, "payload": payload }));
+            let payload = cipher
+                .seal(&meta, plaintext)
+                .map_err(|e| RelayError::BadAnswer(format!("an op payload does not seal: {e}")))?;
+            wire_ops.push(serde_json::json!({ "meta": meta_value, "payload": payload }));
         }
         let body = serde_json::json!({ "v": 1, "ops": wire_ops });
         let resp = self.send(minreq::post(self.ops_url(scope)), Some(&body))?;
@@ -218,6 +229,53 @@ impl<'a> Relay<'a> {
         }
         let response = map_transport(self.server, request.send())?;
         decode_body(self.server, response)
+    }
+
+    /// `POST /v1/orgs/{id}/keys` — publish key records the relay stores and
+    /// forwards verbatim (ADR 0028). The caller has already sealed them; the
+    /// relay never parses one.
+    pub fn publish_keys(&self, org: OrgId, records: &[String]) -> Result<(), RelayError> {
+        let body = serde_json::json!({ "v": 1, "keys": records });
+        let resp = self.send(minreq::post(self.keys_url(org)), Some(&body))?;
+        let stored = resp
+            .get("stored")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| RelayError::BadAnswer("key push missing stored".into()))?;
+        if stored != records.len() as u64 {
+            // A short store is loud (ADR 0024's ack rule, applied here): the
+            // client would otherwise believe a wrap it never delivered.
+            return Err(RelayError::BadAnswer(format!(
+                "the relay stored {stored} of {} key records",
+                records.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `GET /v1/orgs/{id}/keys` — every key record the org holds, each with
+    /// the authenticated device that pushed it (ADR 0028's provenance).
+    pub fn pull_keys(&self, org: OrgId) -> Result<Vec<KeyRecordWire>, RelayError> {
+        let resp = self.send(minreq::get(self.keys_url(org)), None)?;
+        let keys = resp
+            .get("keys")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| RelayError::BadAnswer("key pull missing keys".into()))?;
+        keys.iter()
+            .map(|entry| {
+                Ok(KeyRecordWire {
+                    record: entry["key"]
+                        .as_str()
+                        .ok_or_else(|| RelayError::BadAnswer("key pull entry missing key".into()))?
+                        .to_owned(),
+                    pushed_by: serde_json::from_value(entry["pushed_by"].clone())
+                        .map_err(|e| RelayError::BadAnswer(format!("key pushed_by: {e}")))?,
+                })
+            })
+            .collect()
+    }
+
+    fn keys_url(&self, org: OrgId) -> String {
+        format!("{}/v1/orgs/{}/keys", self.server, org.as_uuid())
     }
 
     fn ops_url(&self, scope: ScopeId) -> String {
@@ -304,6 +362,15 @@ fn decode_body(server: &str, response: Response) -> Result<serde_json::Value, Re
     response
         .json()
         .map_err(|e| RelayError::BadAnswer(format!("a 2xx body does not decode: {e}")))
+}
+
+/// One pulled key record: the opaque string, and the authenticated device
+/// that pushed it (ADR 0028). The relay never parses the record; the client
+/// requires a device record's claimed id to equal this stamp.
+#[derive(Clone, Debug)]
+pub struct KeyRecordWire {
+    pub record: String,
+    pub pushed_by: DeviceId,
 }
 
 /// One pulled op, wire-shaped: the relay's sequence, the server-visible

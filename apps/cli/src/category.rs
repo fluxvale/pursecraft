@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
 
 use pursecraft_core::domain::{
     CategoryField, CategoryGroupField, Entity, EntityKind, Field, Value,
@@ -14,10 +13,12 @@ use pursecraft_core::ops::{ApplyError, ScopeState};
 use pursecraft_core::resolve::category_group;
 use pursecraft_core::store::{LocalStore, StoreError};
 use pursecraft_core::sync::SyncSession;
+use pursecraft_core::wire::PayloadCipher;
 
 use crate::capture::Minter;
 use crate::home::{Identity, IdentityError, budget_log, load_identity};
 use crate::idmint::mint_uuid;
+use crate::keys::{KeysError, World};
 use crate::session::Session;
 use crate::sink;
 
@@ -29,6 +30,7 @@ pub const INBOX_NAME: &str = "Inbox";
 #[derive(Debug)]
 pub enum CategoryError {
     Identity(IdentityError),
+    Keys(KeysError),
     Store(StoreError),
     Apply(ApplyError),
     /// The pending-sync count failed (ADR 0011's badge must not lie).
@@ -60,6 +62,7 @@ impl fmt::Display for CategoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Identity(e) => write!(f, "{e}"),
+            Self::Keys(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Apply(e) => write!(f, "stored op rejected by the engine: {e}"),
             Self::Sync(e) => write!(f, "{e}"),
@@ -103,6 +106,12 @@ impl std::error::Error for CategoryError {
 impl From<IdentityError> for CategoryError {
     fn from(e: IdentityError) -> Self {
         Self::Identity(e)
+    }
+}
+
+impl From<KeysError> for CategoryError {
+    fn from(e: KeysError) -> Self {
+        Self::Keys(e)
     }
 }
 
@@ -237,9 +246,9 @@ pub(crate) fn inbox_of(state: &ScopeState) -> Option<CategoryId> {
 /// with an anchored name op (the account ensure pattern: a stale retry
 /// loses contested fields, a torn one self-heals). Returns whether this
 /// call minted it.
-pub(crate) fn ensure_inbox(
+pub(crate) fn ensure_inbox<C: PayloadCipher>(
     minter: &mut Minter,
-    store: &mut LocalStore,
+    store: &mut LocalStore<C>,
     identity: &Identity,
 ) -> Result<bool, EnsureError> {
     let session = crate::capture::boot(store)?;
@@ -274,11 +283,12 @@ pub(crate) fn inbox_line() -> String {
 /// resolution must stay unambiguous), the optional group is
 /// find-or-create (a label, not money).
 pub fn new_category(
-    home: &Path,
+    world: &World,
     session: &Session,
     name: &str,
     group: Option<&str>,
 ) -> Result<String, CategoryError> {
+    let home = world.home.as_path();
     let name = name.trim();
     if name.is_empty() {
         return Err(CategoryError::EmptyName);
@@ -288,9 +298,7 @@ pub fn new_category(
     };
     let mut minter = Minter::new(session, &identity);
 
-    let path = budget_log(home, identity.budget_id);
-    std::fs::create_dir_all(path.parent().expect("store parent"))?;
-    let mut store = LocalStore::open(&path)?;
+    let mut store = world.open_log(ScopeId::Budget(identity.budget_id))?;
     let mut out = String::new();
 
     // The duplicate check precedes the Inbox ensure so that naming a
@@ -378,15 +386,15 @@ pub fn new_category(
 
 /// `pursecraft category list` (ADR 0027): live categories grouped, the
 /// Inbox marked. Read-only — no world shows the getting-started hint.
-pub fn list(home: &Path, session: &Session) -> Result<String, CategoryError> {
+pub fn list(world: &World, session: &Session) -> Result<String, CategoryError> {
+    let home = world.home.as_path();
     let Some(identity) = load_identity(home)? else {
         return Ok("no categories yet\n\ntry: pursecraft add coffee -4.50\n".to_owned());
     };
-    let path = budget_log(home, identity.budget_id);
-    if !path.exists() {
+    if !budget_log(home, identity.budget_id).exists() {
         return Ok("no categories yet\n\ntry: pursecraft add coffee -4.50\n".to_owned());
     }
-    let store = LocalStore::open(&path)?;
+    let store = world.open_log(ScopeId::Budget(identity.budget_id))?;
     let mut replay = SyncSession::new();
     replay.apply_delta(store.delta_since(0))?;
     let state = replay.state();
@@ -412,7 +420,7 @@ pub fn list(home: &Path, session: &Session) -> Result<String, CategoryError> {
     }
     Ok(crate::list::with_pending_sync(
         out,
-        crate::sync::pending_count(home, session, &identity)?,
+        crate::sync::pending_count(world, session, &identity)?,
     ))
 }
 
@@ -481,10 +489,13 @@ pub(crate) fn grouped(state: &ScopeState) -> Vec<CategoryBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::home::budget_log;
     use crate::idmint::mint_uuid;
     use crate::testsupport::TempDir;
     use pursecraft_core::date::Date;
     use pursecraft_core::ids::DeviceId;
+    use pursecraft_core::store::LocalStore;
+    use std::path::Path;
 
     fn session() -> crate::session::Session {
         crate::session::Session {
@@ -497,7 +508,7 @@ mod tests {
 
     fn capture(home: &Path) {
         crate::capture::add(
-            home,
+            &mut World::plain(home),
             &session(),
             &crate::capture::RawAdd {
                 payee: "coffee",
@@ -527,10 +538,10 @@ mod tests {
         let tmp = TempDir::new("category-new");
         let home = tmp.path();
         capture(home);
-        new_category(home, &session(), "Food", None).unwrap();
-        let err = new_category(home, &session(), "Food", None).unwrap_err();
+        new_category(&World::plain(home), &session(), "Food", None).unwrap();
+        let err = new_category(&World::plain(home), &session(), "Food", None).unwrap_err();
         assert!(err.to_string().contains("\"Food\" already exists"), "{err}");
-        let err = new_category(home, &session(), "Inbox", None).unwrap_err();
+        let err = new_category(&World::plain(home), &session(), "Inbox", None).unwrap_err();
         assert!(
             err.to_string().contains("reserved"),
             "the existing inbox teaches distinctly\n{err}"
@@ -564,7 +575,7 @@ mod tests {
         )
         .unwrap();
         drop(store);
-        let made = new_category(home2, &session(), "Inbox", None).unwrap();
+        let made = new_category(&World::plain(home2), &session(), "Inbox", None).unwrap();
         assert!(
             made.contains("created category \"Inbox\" — this is the review queue"),
             "{made}"
@@ -585,10 +596,10 @@ mod tests {
         let tmp = TempDir::new("category-list");
         let home = tmp.path();
         capture(home);
-        new_category(home, &session(), "Power", Some("Bills")).unwrap();
-        new_category(home, &session(), "Water", Some("Bills")).unwrap();
-        new_category(home, &session(), "Food", None).unwrap();
-        let list = list(home, &session()).unwrap();
+        new_category(&World::plain(home), &session(), "Power", Some("Bills")).unwrap();
+        new_category(&World::plain(home), &session(), "Water", Some("Bills")).unwrap();
+        new_category(&World::plain(home), &session(), "Food", None).unwrap();
+        let list = list(&World::plain(home), &session()).unwrap();
         let lines: Vec<&str> = list.lines().collect();
         assert_eq!(
             lines,

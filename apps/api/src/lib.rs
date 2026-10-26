@@ -8,7 +8,9 @@
 
 pub mod auth;
 pub mod http;
+pub mod keys;
 pub mod state;
 
 pub use http::router;
+pub use keys::{MAX_KEY_RECORD_BYTES, MAX_KEY_RECORDS};
 pub use state::{AppState, READINESS_PROBE_TTL};

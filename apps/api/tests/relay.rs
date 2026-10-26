@@ -8,7 +8,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{
     Device, Rng, SimDevice, SyncError, TestRelay, budget_scope, org_scope, parse_frames,
-    rewrite_frames,
+    rewrite_frames, scope_path,
 };
 use pursecraft_core::ids::ScopeId;
 use pursecraft_core::ops::ApplyError;
@@ -823,5 +823,157 @@ fn a_mint(device: &Device, scope: ScopeId, rng: &mut Rng) -> pursecraft_core::op
             physical_ms: 1 << 50,
             logical: 0,
         },
+    }
+}
+
+// ---------------------------------------------------------------------
+// Key records (ADR 0028): opaque strings on the org's scope, grant-gated,
+// deduped by exact string, provenance-stamped by the relay.
+// ---------------------------------------------------------------------
+
+mod keys {
+    use super::*;
+
+    /// A record string shaped like a v1 key record but with contents the
+    /// relay must never look at. The relay cannot tell a real one from this,
+    /// which is the point: it parses nothing.
+    const RECORD: &str = r#"{"v":1,"kind":"device","device":"x","public":"not-a-key"}"#;
+
+    #[tokio::test]
+    async fn key_records_round_trip_opaque_with_provenance() {
+        let mut relay = TestRelay::new("keys-roundtrip");
+        let a = Device::enroll(&mut relay).await;
+        let b = Device::enroll(&mut relay).await;
+        let code = a.create_scope(&mut relay, org_scope()).await;
+        b.pair(&mut relay, org_scope(), &code).await;
+
+        let (status, body) = relay
+            .request(
+                "POST",
+                &format!("/v1/{}/keys", scope_path(org_scope())),
+                Some(&a.token),
+                Some(serde_json::json!({ "v": 1, "keys": [RECORD] }).to_string()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stored"], 1, "{body}");
+
+        // Pushing the exact same string again is an idempotent no-op.
+        let (status, body) = relay
+            .request(
+                "POST",
+                &format!("/v1/{}/keys", scope_path(org_scope())),
+                Some(&b.token),
+                Some(serde_json::json!({ "v": 1, "keys": [RECORD] }).to_string()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["stored"], 1,
+            "a duplicate is still stored exactly once"
+        );
+
+        let (status, body) = relay
+            .request(
+                "GET",
+                &format!("/v1/{}/keys", scope_path(org_scope())),
+                Some(&b.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let keys = body["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1, "one record, one entry\n{body}");
+        assert_eq!(keys[0]["key"], RECORD, "the record is byte-identical");
+        let pushed_by: pursecraft_core::ids::DeviceId =
+            serde_json::from_value(keys[0]["pushed_by"].clone()).unwrap();
+        assert_eq!(pushed_by, a.id, "the first pusher keeps the provenance");
+        // The relay's own file holds the string verbatim, unparsed.
+        let file = std::fs::read_to_string(relay.dir.join("keys").join(format!(
+            "org-{}.json",
+            org_scope().org().unwrap().as_uuid().simple()
+        )))
+        .unwrap();
+        assert!(file.contains("not-a-key"), "{file}");
+        assert!(!file.contains("kind\":\n"), "no reformatting: {file}");
+    }
+
+    #[tokio::test]
+    async fn an_ungranted_device_cannot_read_or_write_key_records() {
+        let mut relay = TestRelay::new("keys-acl");
+        let a = Device::enroll(&mut relay).await;
+        let outsider = Device::enroll(&mut relay).await;
+        a.create_scope(&mut relay, org_scope()).await;
+
+        let (status, body) = relay
+            .request(
+                "GET",
+                &format!("/v1/{}/keys", scope_path(org_scope())),
+                Some(&outsider.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let (status, body) = relay
+            .request(
+                "POST",
+                &format!("/v1/{}/keys", scope_path(org_scope())),
+                Some(&outsider.token),
+                Some(serde_json::json!({ "v": 1, "keys": [RECORD] }).to_string()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        // And the org's set is untouched.
+        let (status, body) = relay
+            .request(
+                "GET",
+                &format!("/v1/{}/keys", scope_path(org_scope())),
+                Some(&a.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["keys"].as_array().unwrap().len(), 0, "{body}");
+    }
+
+    /// Key records are org-scoped: a budget's route is a 400 that says so
+    /// (ADR 0021: the org is the single revocation point).
+    #[tokio::test]
+    async fn a_budget_scope_has_no_key_route() {
+        let mut relay = TestRelay::new("keys-budget");
+        let a = Device::enroll(&mut relay).await;
+        a.create_scope(&mut relay, budget_scope()).await;
+        let (status, body) = relay
+            .request(
+                "GET",
+                &format!("/v1/{}/keys", scope_path(budget_scope())),
+                Some(&a.token),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["message"].as_str().unwrap().contains("org-scoped"),
+            "{body}"
+        );
+    }
+
+    /// A record past the byte cap is refused; the relay bounds what a granted
+    /// device can add rather than buffering without limit.
+    #[tokio::test]
+    async fn an_oversized_record_is_refused() {
+        let mut relay = TestRelay::new("keys-cap");
+        let a = Device::enroll(&mut relay).await;
+        a.create_scope(&mut relay, org_scope()).await;
+        let huge = "x".repeat(pursecraft_api::MAX_KEY_RECORD_BYTES + 1);
+        let (status, body) = relay
+            .request(
+                "POST",
+                &format!("/v1/{}/keys", scope_path(org_scope())),
+                Some(&a.token),
+                Some(serde_json::json!({ "v": 1, "keys": [huge] }).to_string()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     }
 }

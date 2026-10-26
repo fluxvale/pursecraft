@@ -3,21 +3,20 @@
 //! projection — assigned, activity, available per category, plus
 //! to-be-budgeted. All derived, never stored.
 
-use std::fmt;
-use std::path::Path;
-
 use pursecraft_core::budget::CategoryRow;
 use pursecraft_core::date::{Date, Month};
 use pursecraft_core::domain::{Entity, EntityKind, Field, MonthCategoryField, Value};
 use pursecraft_core::ids::{CategoryId, EntityId, ScopeId};
 use pursecraft_core::money::Milliunits;
 use pursecraft_core::ops::ApplyError;
-use pursecraft_core::store::{LocalStore, StoreError};
+use pursecraft_core::store::StoreError;
+use std::fmt;
 
 use crate::capture::{Minter, boot};
 use crate::category::{CategoryError, ensure_inbox, find_category, grouped, inbox_line, inbox_of};
 use crate::home::{IdentityError, budget_log, load_identity};
 use crate::idmint::mint_uuid;
+use crate::keys::{KeysError, World};
 use crate::session::Session;
 use crate::sink;
 
@@ -25,6 +24,7 @@ use crate::sink;
 #[derive(Debug)]
 pub enum BudgetError {
     Identity(IdentityError),
+    Keys(KeysError),
     Store(StoreError),
     Apply(ApplyError),
     Category(CategoryError),
@@ -52,6 +52,7 @@ impl fmt::Display for BudgetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Identity(e) => write!(f, "{e}"),
+            Self::Keys(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Apply(e) => write!(f, "stored op rejected by the engine: {e}"),
             Self::Category(e) => write!(f, "{e}"),
@@ -97,6 +98,12 @@ impl std::error::Error for BudgetError {
 impl From<IdentityError> for BudgetError {
     fn from(e: IdentityError) -> Self {
         Self::Identity(e)
+    }
+}
+
+impl From<KeysError> for BudgetError {
+    fn from(e: KeysError) -> Self {
+        Self::Keys(e)
     }
 }
 
@@ -173,13 +180,14 @@ fn parse_magnitude(input: &str) -> Result<Milliunits, BudgetError> {
 /// exists for), a cell is minted only when none exists, and a torn cell
 /// (entity landed, `budgeted` not) is completed, never twinned.
 pub fn assign(
-    home: &Path,
+    world: &World,
     session: &Session,
     raw_category: &str,
     raw_amount: &str,
     raw_month: Option<&str>,
     today: Date,
 ) -> Result<String, BudgetError> {
+    let home = world.home.as_path();
     let amount = parse_magnitude(raw_amount)?;
     let month = resolve_month(raw_month, today)?;
     let Some(identity) = load_identity(home)? else {
@@ -187,9 +195,7 @@ pub fn assign(
     };
     let mut minter = Minter::new(session, &identity);
 
-    let path = budget_log(home, identity.budget_id);
-    std::fs::create_dir_all(path.parent().expect("store parent"))?;
-    let mut store = LocalStore::open(&path)?;
+    let mut store = world.open_log(ScopeId::Budget(identity.budget_id))?;
     let mut out = String::new();
     if ensure_inbox(&mut minter, &mut store, &identity)? {
         out.push_str(&inbox_line());
@@ -304,20 +310,20 @@ pub fn assign(
 /// the Inbox row shown only when the bucket is non-empty that month.
 /// Read-only; an absent world shows the getting-started hint.
 pub fn show(
-    home: &Path,
+    world: &World,
     session: &Session,
     raw_month: Option<&str>,
     today: Date,
 ) -> Result<String, BudgetError> {
+    let home = world.home.as_path();
     let month = resolve_month(raw_month, today)?;
     let Some(identity) = load_identity(home)? else {
         return Ok("no budget yet\n\ntry: pursecraft add coffee -4.50\n".to_owned());
     };
-    let path = budget_log(home, identity.budget_id);
-    if !path.exists() {
+    if !budget_log(home, identity.budget_id).exists() {
         return Ok("no budget yet\n\ntry: pursecraft add coffee -4.50\n".to_owned());
     }
-    let store = LocalStore::open(&path)?;
+    let store = world.open_log(ScopeId::Budget(identity.budget_id))?;
     let replay = boot(&store)?;
     let state = replay.state();
     let projected = pursecraft_core::budget::project(state, month, inbox_of(state));
@@ -371,7 +377,7 @@ pub fn show(
     out.push_str(&format!("\nto be budgeted {}\n", projected.to_be_budgeted));
     Ok(crate::list::with_pending_sync(
         out,
-        crate::sync::pending_count(home, session, &identity)?,
+        crate::sync::pending_count(world, session, &identity)?,
     ))
 }
 
@@ -397,10 +403,13 @@ fn row_line(
 mod tests {
     use super::*;
     use crate::home::Identity;
+    use crate::home::budget_log;
     use crate::testsupport::TempDir;
     use pursecraft_core::ids::DeviceId;
     use pursecraft_core::ops::{Op, ScopeState};
+    use pursecraft_core::store::LocalStore;
     use pursecraft_core::sync::SyncSession;
+    use std::path::Path;
 
     fn today() -> Date {
         Date::new(2026, 10, 25).unwrap()
@@ -417,7 +426,7 @@ mod tests {
 
     fn capture(home: &Path, payee: &str, amount: &str, category: Option<&str>) {
         crate::capture::add(
-            home,
+            &mut World::plain(home),
             &session(),
             &crate::capture::RawAdd {
                 payee,
@@ -467,9 +476,17 @@ mod tests {
         let tmp = TempDir::new("assign-roundtrip");
         let home = tmp.path();
         capture(home, "coffee", "-4.50", None);
-        crate::category::new_category(home, &session(), "Food", None).unwrap();
+        crate::category::new_category(&World::plain(home), &session(), "Food", None).unwrap();
 
-        let first = assign(home, &session(), "Food", "500", None, today()).unwrap();
+        let first = assign(
+            &World::plain(home),
+            &session(),
+            "Food",
+            "500",
+            None,
+            today(),
+        )
+        .unwrap();
         assert!(
             first.contains("assigned 500.000 to Food for 2026-10"),
             "{first}"
@@ -497,7 +514,15 @@ mod tests {
 
         // Re-assign targets the same cell: three ops never re-land, only
         // the budgeted write.
-        let re = assign(home, &session(), "Food", "300.25", None, today()).unwrap();
+        let re = assign(
+            &World::plain(home),
+            &session(),
+            "Food",
+            "300.25",
+            None,
+            today(),
+        )
+        .unwrap();
         assert!(
             re.contains("assigned 300.250 to Food for 2026-10, was 500.000"),
             "{re}"
@@ -521,7 +546,15 @@ mod tests {
         assert_eq!(still[0].budgeted, Some(Milliunits::from_milli(300_250)));
 
         // A different month mints its own cell; the inbox is refused.
-        assign(home, &session(), "Food", "100", Some("2026-11"), today()).unwrap();
+        assign(
+            &World::plain(home),
+            &session(),
+            "Food",
+            "100",
+            Some("2026-11"),
+            today(),
+        )
+        .unwrap();
         let (_, _, state) = boot_state(home);
         assert_eq!(
             state
@@ -530,7 +563,15 @@ mod tests {
                 .count(),
             2
         );
-        let err = assign(home, &session(), "Inbox", "100", None, today()).unwrap_err();
+        let err = assign(
+            &World::plain(home),
+            &session(),
+            "Inbox",
+            "100",
+            None,
+            today(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("review queue"),
             "assign refuses the inbox\n{err}"
@@ -546,7 +587,7 @@ mod tests {
         let tmp = TempDir::new("twin-fold");
         let home = tmp.path();
         capture(home, "coffee", "-4.50", None);
-        crate::category::new_category(home, &session(), "Food", None).unwrap();
+        crate::category::new_category(&World::plain(home), &session(), "Food", None).unwrap();
         // Seed the twin state: two devices each minted a cell offline.
         let (identity, mut store, state) = boot_state(home);
         let food = find_category(&state, "Food").unwrap();
@@ -585,16 +626,24 @@ mod tests {
         drop(store);
 
         // The over-stated view before correction…
-        let view = show(home, &session(), None, today()).unwrap();
+        let view = show(&World::plain(home), &session(), None, today()).unwrap();
         assert!(view.contains("1200.000"), "twins sum: {view}");
 
         // …and the assign that folds them.
-        let assigned = assign(home, &session(), "Food", "800", None, today()).unwrap();
+        let assigned = assign(
+            &World::plain(home),
+            &session(),
+            "Food",
+            "800",
+            None,
+            today(),
+        )
+        .unwrap();
         assert!(
             assigned.contains("folded 1 stale duplicate cell"),
             "{assigned}"
         );
-        let view = show(home, &session(), None, today()).unwrap();
+        let view = show(&World::plain(home), &session(), None, today()).unwrap();
         let line = view.lines().find(|l| l.contains("Food")).unwrap();
         assert!(
             line.contains("800.000") && !view.contains("1200.000"),
@@ -618,7 +667,7 @@ mod tests {
         let tmp = TempDir::new("torn-cell");
         let home = tmp.path();
         capture(home, "coffee", "-4.50", None);
-        crate::category::new_category(home, &session(), "Food", None).unwrap();
+        crate::category::new_category(&World::plain(home), &session(), "Food", None).unwrap();
         let (identity, mut store, state) = boot_state(home);
         let food = find_category(&state, "Food").unwrap();
         let month = Month::new(2026, 10).unwrap();
@@ -650,7 +699,7 @@ mod tests {
         }
         drop(store);
 
-        assign(home, &session(), "Food", "50", None, today()).unwrap();
+        assign(&World::plain(home), &session(), "Food", "50", None, today()).unwrap();
         let (_, _, state) = boot_state(home);
         let cells: Vec<_> = state
             .entities()
@@ -677,11 +726,19 @@ mod tests {
         let home = tmp.path();
         capture(home, "salary", "+5000", None);
         capture(home, "groceries", "-120.50", None);
-        crate::category::new_category(home, &session(), "Food", None).unwrap();
-        assign(home, &session(), "Food", "400", None, today()).unwrap();
+        crate::category::new_category(&World::plain(home), &session(), "Food", None).unwrap();
+        assign(
+            &World::plain(home),
+            &session(),
+            "Food",
+            "400",
+            None,
+            today(),
+        )
+        .unwrap();
 
         // File groceries into Food; a second spend stays in the inbox.
-        let review = crate::categorize::review(home, &session()).unwrap();
+        let review = crate::categorize::review(&World::plain(home), &session()).unwrap();
         let short = review
             .lines()
             .nth(1)
@@ -690,10 +747,10 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        crate::categorize::file(home, &session(), &short, "Food").unwrap();
+        crate::categorize::file(&World::plain(home), &session(), &short, "Food").unwrap();
         capture(home, "mystery", "-30", None);
 
-        let view = show(home, &session(), None, today()).unwrap();
+        let view = show(&World::plain(home), &session(), None, today()).unwrap();
         assert!(view.contains("2026-10"), "{view}");
         let food_line = view
             .lines()
@@ -718,7 +775,7 @@ mod tests {
         );
 
         // A month with nothing shows zero envelopes, nothing to budget.
-        let empty = show(home, &session(), Some("2027-01"), today()).unwrap();
+        let empty = show(&World::plain(home), &session(), Some("2027-01"), today()).unwrap();
         assert!(empty.contains("2027-01"), "{empty}");
         assert!(empty.contains("to be budgeted 0.000"), "{empty}");
         assert!(
@@ -727,11 +784,27 @@ mod tests {
         );
 
         // Bad months and unknown categories teach.
-        let err = show(home, &session(), Some("2026-13"), today()).unwrap_err();
+        let err = show(&World::plain(home), &session(), Some("2026-13"), today()).unwrap_err();
         assert!(err.to_string().contains("invalid month"), "{err}");
-        let err = assign(home, &session(), "Nope", "100", None, today()).unwrap_err();
+        let err = assign(
+            &World::plain(home),
+            &session(),
+            "Nope",
+            "100",
+            None,
+            today(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("unknown category"), "{err}");
-        let err = assign(home, &session(), "Food", "100", Some("oct-26"), today()).unwrap_err();
+        let err = assign(
+            &World::plain(home),
+            &session(),
+            "Food",
+            "100",
+            Some("oct-26"),
+            today(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("invalid month"), "{err}");
     }
 

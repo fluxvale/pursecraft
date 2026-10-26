@@ -9,9 +9,12 @@
 
 use pursecraft_core::ops::Op;
 use pursecraft_core::store::{LocalStore, StoreError};
+use pursecraft_core::wire::PayloadCipher;
 
-/// Commit one minted op to its store, durably, through the seam.
-pub fn sink(store: &mut LocalStore, op: Op) -> Result<u64, StoreError> {
+/// Commit one minted op to its store, durably, through the seam. The store's
+/// cipher seals the payload on the way down (ADR 0022), so under E2EE what
+/// lands is an envelope; the sink itself is mode-blind.
+pub fn sink<C: PayloadCipher>(store: &mut LocalStore<C>, op: Op) -> Result<u64, StoreError> {
     // ADR 0009 / ADR 0023: the E2EE wrap lands here — the op's payload is
     // opaque ciphertext material from this point down.
     store.append(op)

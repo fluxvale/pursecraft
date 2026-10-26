@@ -6,17 +6,17 @@
 //! not a selector.
 
 use std::fmt;
-use std::path::Path;
 
 use pursecraft_core::domain::{Entity, Field, TransactionField, Value};
 use pursecraft_core::ids::{EntityId, ScopeId};
 use pursecraft_core::ops::{ApplyError, ScopeState};
 use pursecraft_core::resolve::{CategoryResolution, transaction_category, transaction_visible};
-use pursecraft_core::store::{LocalStore, StoreError};
+use pursecraft_core::store::StoreError;
 
 use crate::capture::{Minter, boot};
 use crate::category::{CategoryError, ensure_inbox, find_category, inbox_line, inbox_of};
 use crate::home::{IdentityError, budget_log, load_identity};
+use crate::keys::{KeysError, World};
 use crate::session::Session;
 use crate::sink;
 
@@ -29,6 +29,7 @@ const SHORT_ID: usize = 8;
 #[derive(Debug)]
 pub enum CategorizeError {
     Identity(IdentityError),
+    Keys(KeysError),
     Store(StoreError),
     Apply(ApplyError),
     Category(CategoryError),
@@ -49,6 +50,7 @@ impl fmt::Display for CategorizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Identity(e) => write!(f, "{e}"),
+            Self::Keys(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Apply(e) => write!(f, "stored op rejected by the engine: {e}"),
             Self::Category(e) => write!(f, "{e}"),
@@ -82,6 +84,12 @@ impl std::error::Error for CategorizeError {
 impl From<IdentityError> for CategorizeError {
     fn from(e: IdentityError) -> Self {
         Self::Identity(e)
+    }
+}
+
+impl From<KeysError> for CategorizeError {
+    fn from(e: KeysError) -> Self {
+        Self::Keys(e)
     }
 }
 
@@ -155,15 +163,15 @@ fn short_id(txn: &pursecraft_core::domain::Transaction) -> String {
 
 /// `pursecraft categorize` — the review listing (ADR 0027). Read-only;
 /// an absent world shows the getting-started hint.
-pub fn review(home: &Path, session: &Session) -> Result<String, CategorizeError> {
+pub fn review(world: &World, session: &Session) -> Result<String, CategorizeError> {
+    let home = world.home.as_path();
     let Some(identity) = load_identity(home)? else {
         return Ok("nothing captured yet\n\ntry: pursecraft add coffee -4.50\n".to_owned());
     };
-    let path = budget_log(home, identity.budget_id);
-    if !path.exists() {
+    if !budget_log(home, identity.budget_id).exists() {
         return Ok("the inbox is empty\n".to_owned());
     }
-    let store = LocalStore::open(&path)?;
+    let store = world.open_log(ScopeId::Budget(identity.budget_id))?;
     let replay = boot(&store)?;
     let state = replay.state();
     let txns = bucket(state);
@@ -195,7 +203,7 @@ pub fn review(home: &Path, session: &Session) -> Result<String, CategorizeError>
     ));
     Ok(crate::list::with_pending_sync(
         out,
-        crate::sync::pending_count(home, session, &identity)?,
+        crate::sync::pending_count(world, session, &identity)?,
     ))
 }
 
@@ -204,19 +212,18 @@ pub fn review(home: &Path, session: &Session) -> Result<String, CategorizeError>
 /// into the Inbox un-files. Id-exact: the printed short form or the
 /// full UUID, nothing looser.
 pub fn file(
-    home: &Path,
+    world: &World,
     session: &Session,
     selector: &str,
     category: &str,
 ) -> Result<String, CategorizeError> {
+    let home = world.home.as_path();
     let Some(identity) = load_identity(home)? else {
         return Err(CategoryError::NotBootstrapped.into());
     };
     let mut minter = Minter::new(session, &identity);
 
-    let path = budget_log(home, identity.budget_id);
-    std::fs::create_dir_all(path.parent().expect("store parent"))?;
-    let mut store = LocalStore::open(&path)?;
+    let mut store = world.open_log(ScopeId::Budget(identity.budget_id))?;
     let mut out = String::new();
     if ensure_inbox(&mut minter, &mut store, &identity)? {
         out.push_str(&inbox_line());
@@ -327,13 +334,16 @@ pub fn file(
 mod tests {
     use super::*;
     use crate::home::Identity;
+    use crate::home::budget_log;
     use crate::idmint::mint_uuid;
     use crate::testsupport::TempDir;
     use pursecraft_core::date::Date;
     use pursecraft_core::ids::{DeviceId, TransactionId};
     use pursecraft_core::money::Milliunits;
     use pursecraft_core::ops::{Op, ScopeState};
+    use pursecraft_core::store::LocalStore;
     use pursecraft_core::sync::SyncSession;
+    use std::path::Path;
 
     fn session() -> crate::session::Session {
         crate::session::Session {
@@ -344,9 +354,9 @@ mod tests {
         }
     }
 
-    fn add(home: &Path, payee: &str, amount: &str, category: Option<&str>) {
+    fn add(world: &World, payee: &str, amount: &str, category: Option<&str>) {
         crate::capture::add(
-            home,
+            &mut world.clone(),
             &session(),
             &crate::capture::RawAdd {
                 payee,
@@ -375,12 +385,12 @@ mod tests {
     fn the_inbox_flow_lists_files_and_empties() {
         let tmp = TempDir::new("inbox-flow");
         let home = tmp.path();
-        add(home, "coffee", "-4.50", None);
+        add(&World::plain(home), "coffee", "-4.50", None);
         let (_, store, _) = state_of(home);
         let tip = store.tip();
         drop(store);
 
-        let listing = review(home, &session()).unwrap();
+        let listing = review(&World::plain(home), &session()).unwrap();
         assert!(listing.contains("coffee"), "{listing}");
         let short = listing
             .lines()
@@ -394,8 +404,8 @@ mod tests {
         assert!(listing.contains("1 in the inbox"), "{listing}");
 
         // File it into a category minted for the purpose.
-        crate::category::new_category(home, &session(), "Food", None).unwrap();
-        let filed = file(home, &session(), &short, "Food").unwrap();
+        crate::category::new_category(&World::plain(home), &session(), "Food", None).unwrap();
+        let filed = file(&World::plain(home), &session(), &short, "Food").unwrap();
         assert!(
             filed.contains("filed coffee -4.500 on 2026-10-25 into Food (was the inbox)"),
             "{filed}"
@@ -427,7 +437,7 @@ mod tests {
         );
         assert_eq!(txn.amount, Some(Milliunits::from_milli(-4_500)));
 
-        let again = review(home, &session()).unwrap();
+        let again = review(&World::plain(home), &session()).unwrap();
         assert!(again.contains("the inbox is empty"), "{again}");
     }
 
@@ -438,8 +448,8 @@ mod tests {
     fn selectors_are_exact_and_refiling_is_free() {
         let tmp = TempDir::new("selectors");
         let home = tmp.path();
-        add(home, "coffee", "-4.50", None);
-        crate::category::new_category(home, &session(), "Food", None).unwrap();
+        add(&World::plain(home), "coffee", "-4.50", None);
+        crate::category::new_category(&World::plain(home), &session(), "Food", None).unwrap();
         let (_, store, state) = state_of(home);
         let txn_id = state
             .entities()
@@ -450,15 +460,15 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let err = file(home, &session(), "0192", "Food").unwrap_err();
+        let err = file(&World::plain(home), &session(), "0192", "Food").unwrap_err();
         assert!(
             err.to_string().contains("no visible transaction matches"),
             "{err}"
         );
-        let err = file(home, &session(), "ffffffff", "Food").unwrap_err();
+        let err = file(&World::plain(home), &session(), "ffffffff", "Food").unwrap_err();
         assert!(err.to_string().contains("no visible transaction"), "{err}");
         let err = file(
-            home,
+            &World::plain(home),
             &session(),
             &txn_id.as_uuid().simple().to_string(),
             "Nope",
@@ -469,14 +479,14 @@ mod tests {
         // The full hyphenated id files; then the same file is a no-op.
         let full = txn_id.as_uuid().hyphenated().to_string();
         assert!(
-            file(home, &session(), &full, "Food")
+            file(&World::plain(home), &session(), &full, "Food")
                 .unwrap()
                 .contains("into Food")
         );
         let (_, store, _) = state_of(home);
         let tip = store.tip();
         drop(store);
-        let again = file(home, &session(), &full, "Food").unwrap();
+        let again = file(&World::plain(home), &session(), &full, "Food").unwrap();
         assert!(again.contains("is already in Food"), "{again}");
         let (_, store, _) = state_of(home);
         assert_eq!(store.tip(), tip, "no op for a no-op re-file");

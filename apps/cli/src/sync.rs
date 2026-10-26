@@ -11,21 +11,22 @@
 //! session stays in one sequence space; a failing page aborts loudly with
 //! cursors unmoved, and every retry is an idempotent re-delivery.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use pursecraft_core::domain::{AccountField, AccountKind, Field, MembershipField, MembershipRole};
-use pursecraft_core::ids::{BudgetId, EntityId, OrgId, ScopeId, UserId};
+use pursecraft_core::ids::{BudgetId, DeviceId, EntityId, OrgId, ScopeId, UserId};
 use pursecraft_core::ops::{ApplyError, Op};
 use pursecraft_core::org::org_alive;
 use pursecraft_core::store::{LocalStore, StoreError};
 use pursecraft_core::sync::{SequencedOp, SyncSession};
-use pursecraft_core::wire::decode_payload;
+use pursecraft_core::wire::{PayloadCipher, decode_payload};
 
 use crate::capture::{ACCOUNT_NAME, Minter, anchored_at, boot};
-use crate::home::{Identity, IdentityError, budget_log, create_identity, load_identity, org_log};
+use crate::home::{Identity, IdentityError, create_identity, load_identity};
 use crate::idmint::mint_uuid;
+use crate::keys::{KeysError, World};
 use crate::relay::{Relay, RelayError};
 use crate::session::{Session, SessionError};
 use crate::sink;
@@ -48,6 +49,7 @@ pub enum SyncError {
     Relay(RelayError),
     Store(StoreError),
     Identity(IdentityError),
+    Keys(KeysError),
     Session(SessionError),
     /// A pulled op was rejected by the engine — the cursor stays put and
     /// the same page re-serves (ADR 0017).
@@ -58,6 +60,14 @@ pub enum SyncError {
         scope: String,
         seq: u64,
         source: serde_json::Error,
+    },
+    /// A pulled payload could not be opened — missing or stale key material,
+    /// or bytes the cipher refused (ADR 0028). Distinct from [`Self::Decode`]:
+    /// a key problem is not damage, and the two teach different fixes.
+    Cipher {
+        scope: String,
+        seq: u64,
+        detail: String,
     },
     Io(std::io::Error),
     /// `sync.json` does not decode or speaks an unknown version — loud,
@@ -83,11 +93,16 @@ impl fmt::Display for SyncError {
             Self::Relay(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Identity(e) => write!(f, "{e}"),
+            Self::Keys(e) => write!(f, "{e}"),
             Self::Session(e) => write!(f, "{e}"),
             Self::Apply(e) => write!(f, "a pulled op was rejected by the engine: {e}"),
             Self::Decode { scope, seq, source } => write!(
                 f,
                 "a pulled op ({scope} seq {seq}) does not decode: {source} — nothing was applied past it"
+            ),
+            Self::Cipher { scope, seq, detail } => write!(
+                f,
+                "a pulled op ({scope} seq {seq}) does not open: {detail} — nothing was applied past it"
             ),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::BadState { path, detail } => {
@@ -132,6 +147,12 @@ impl From<IdentityError> for SyncError {
     }
 }
 
+impl From<KeysError> for SyncError {
+    fn from(e: KeysError) -> Self {
+        Self::Keys(e)
+    }
+}
+
 impl From<SessionError> for SyncError {
     fn from(e: SessionError) -> Self {
         Self::Session(e)
@@ -161,6 +182,8 @@ pub struct SyncReceipt {
     pub notes: Vec<String>,
     /// Set when this run created relay scopes (first sync).
     pub created: Option<PairingBundle>,
+    /// This run finished an interrupted join (ADR 0028).
+    resumed_join: bool,
 }
 
 impl SyncReceipt {
@@ -170,11 +193,39 @@ impl SyncReceipt {
             scopes: Vec::new(),
             notes: Vec::new(),
             created: None,
+            resumed_join: false,
         }
+    }
+
+    /// A join still waiting for its keys (ADR 0028): one teaching line, and
+    /// the marker keeps the home resumable.
+    fn waiting_for_keys(server: &str, org: OrgId) -> Self {
+        let mut receipt = Self::new(server);
+        receipt.notes.push(format!(
+            "this device is registered with org {} — the world's keys are not here yet\n\
+             \nnext:\n  \
+             pursecraft sync        # on a device that already holds this world\n  \
+             pursecraft sync        # here, to install the keys and finish joining\n",
+            org.as_uuid()
+        ));
+        receipt.resumed_join = true;
+        receipt
+    }
+
+    /// A resumed join's outcome, rendered verbatim (ADR 0028).
+    fn joined(text: String) -> Self {
+        let mut receipt = Self::new("");
+        receipt.scopes.clear();
+        receipt.notes.push(text);
+        receipt.resumed_join = true;
+        receipt
     }
 
     /// The command's stdout (ADR 0025's quiet-by-default shape).
     pub fn render(&self) -> String {
+        if self.resumed_join {
+            return self.notes.join("");
+        }
         let mut out = format!("synced with {}\n", self.server);
         for scope in &self.scopes {
             out.push_str(scope);
@@ -221,7 +272,13 @@ impl PairingBundle {
 
 /// One sync: per scope, ensure the relay scope exists, push the derived
 /// outbox, pull paged deltas through the sink (ADR 0025).
-pub fn sync(home: &Path, session: &Session, identity: &Identity) -> Result<SyncReceipt, SyncError> {
+pub fn sync(
+    world: &mut World,
+    session: &Session,
+    identity: &Identity,
+) -> Result<SyncReceipt, SyncError> {
+    let home = world.home.clone();
+    let home = home.as_path();
     let relay = Relay::new(&session.server, &session.token);
     let mut file = load_sync_file(home)?;
     let mut receipt = SyncReceipt::new(&session.server);
@@ -258,8 +315,14 @@ pub fn sync(home: &Path, session: &Session, identity: &Identity) -> Result<SyncR
             }
         }
 
-        let path = scope_log_path(home, identity, scope);
-        let mut store = open_store(&path)?;
+        // The key channel runs once the org's grant exists and before its log
+        // is opened (ADR 0028): a device that arrives with no keys yet must
+        // install them before its store can be read at all.
+        if matches!(scope, ScopeId::Org(_)) && world.is_sealed() {
+            sync_keys(world, &relay, session, identity, &mut receipt)?;
+        }
+
+        let mut store = world.open_log(scope)?;
 
         // The derived outbox (ADR 0025): this session's ops beyond the
         // pushed watermark. Ops of the founding device (a previous
@@ -276,7 +339,10 @@ pub fn sync(home: &Path, session: &Session, identity: &Identity) -> Result<SyncR
         let mut pushed: u64 = 0;
         for chunk in outbox.chunks(PUSH_CHUNK) {
             let ops: Vec<Op> = chunk.iter().map(|(_, op)| op.clone()).collect();
-            relay.push(scope, &ops)?;
+            // Seal for the wire (ADR 0028): a fresh envelope, so the relay
+            // never sees the plaintext and `op_id`-only dedupe still holds
+            // (ADR 0017). In the self-host mode this is the identity.
+            relay.push(scope, &ops, &world.cipher()?)?;
             pushed += chunk.len() as u64;
         }
         let pushed_through = outbox
@@ -294,6 +360,7 @@ pub fn sync(home: &Path, session: &Session, identity: &Identity) -> Result<SyncR
             &mut store,
             &mut sync_session,
             cursors.remote_seen,
+            &world.cipher()?,
         )?;
 
         cursors.pushed_through = pushed_through;
@@ -314,10 +381,132 @@ pub fn sync(home: &Path, session: &Session, identity: &Identity) -> Result<SyncR
     Ok(receipt)
 }
 
+/// Whether a join is unfinished (ADR 0028) — the one case `sync` may run
+/// without an identity.
+pub fn has_pending_join(home: &Path) -> Result<bool, SyncError> {
+    Ok(load_join(home)?.is_some())
+}
+
+/// Finish an interrupted join (ADR 0028): the keys have landed, so the world
+/// can be read, the identity written, and the joiner's slice minted. The
+/// key channel runs first — it is what brings the keys.
+pub fn resume_join(world: &mut World, session: &Session) -> Result<SyncReceipt, SyncError> {
+    let Some(mark) = load_join(&world.home)? else {
+        return Err(SyncError::NotBootstrapped);
+    };
+    if world.is_sealed() {
+        let relay = Relay::new(&session.server, &session.token);
+        publish_and_install(world, &relay, session, mark.org_id)?;
+        if !world.holds_log_key(ScopeId::Org(mark.org_id)) {
+            // Still keyless: nothing to finish with, and the marker keeps the
+            // home resumable.
+            return Ok(SyncReceipt::waiting_for_keys(&session.server, mark.org_id));
+        }
+        let joined = complete_join(world, session, mark.org_id, mark.budget_id)?;
+        return Ok(SyncReceipt::joined(joined));
+    }
+    let joined = complete_join(world, session, mark.org_id, mark.budget_id)?;
+    Ok(SyncReceipt::joined(joined))
+}
+
+/// Publish this device's public key and install every record addressed to it
+/// (ADR 0028). The key channel's pull half, shared by `join`, `sync`, and a
+/// resumed join.
+fn publish_and_install(
+    world: &World,
+    relay: &Relay<'_>,
+    session: &Session,
+    org: OrgId,
+) -> Result<usize, SyncError> {
+    if let Some(record) = world.device_record(session.device_id) {
+        relay.publish_keys(org, &[record])?;
+    }
+    let pulled = relay.pull_keys(org)?;
+    // Org wraps first, then log wraps: a log key is wrapped under its org's
+    // same-epoch epoch key (ADR 0022), so the relay's record order — which is
+    // push order, not dependency order — cannot be trusted for installs.
+    let mut installed = 0usize;
+    for org_pass in [true, false] {
+        for wire in &pulled {
+            let is_org_wrap = wire.record.contains(r#""kind":"org""#);
+            if is_org_wrap == org_pass && world.install(&wire.record, org)? {
+                installed += 1;
+            }
+        }
+    }
+    Ok(installed)
+}
+
+/// One pass over the org's key records (ADR 0028): publish this device's own
+/// record and any wrap it holds that the relay lacks; install every record
+/// addressed to this device; and wrap the org's epoch keys to any device
+/// registered in the org's records that this device has not wrapped for yet.
+/// Runs before any log is opened — a keyless device's store cannot be read
+/// until its wraps land.
+fn sync_keys(
+    world: &World,
+    relay: &Relay<'_>,
+    session: &Session,
+    identity: &Identity,
+    receipt: &mut SyncReceipt,
+) -> Result<(), SyncError> {
+    let org = identity.org_id;
+    // A device that holds no keys yet (a fresh joiner) still registers its
+    // public key and takes whatever it is addressed; a key-holding device
+    // does everything.
+    let installed = publish_and_install(world, relay, session, org)?;
+    let pulled = relay.pull_keys(org)?;
+    let published: BTreeSet<String> = pulled.iter().map(|wire| wire.record.clone()).collect();
+
+    // Each registered device's public key, and — for a device a grant let in
+    // but whose record is on the relay — the wrap it is owed. A `device`
+    // record is only trusted when the relay's authenticated stamp matches its
+    // claimed id (ADR 0028): a member cannot register a key for someone else.
+    let mut known: Vec<(DeviceId, pursecraft_crypto::DevicePublicKey)> = Vec::new();
+    let mut covered: BTreeMap<DeviceId, BTreeSet<u64>> = BTreeMap::new();
+    for wire in &pulled {
+        let record =
+            pursecraft_crypto::KeyRecord::parse(&wire.record).map_err(KeysError::Crypto)?;
+        match record {
+            pursecraft_crypto::KeyRecord::Device { device, public } => {
+                if device == wire.pushed_by {
+                    known.push((device, public));
+                }
+            }
+            pursecraft_crypto::KeyRecord::Org { to, wrap } => {
+                covered.entry(to).or_default().insert(wrap.epoch);
+            }
+            pursecraft_crypto::KeyRecord::Log { .. } => {}
+        }
+    }
+    let mut owed = Vec::new();
+    for (device, public) in known {
+        if device == session.device_id {
+            continue;
+        }
+        let already: BTreeSet<u64> = covered.remove(&device).unwrap_or_default();
+        owed.extend(world.wraps_for(org, device, public, &already)?);
+    }
+    // Our own held records the relay does not serve yet (the founder's org
+    // wrap and log wraps, or a rotation's output).
+    let unpublished = world.unpublished(&published);
+    owed.extend(unpublished);
+    if !owed.is_empty() {
+        relay.publish_keys(org, &owed)?;
+    }
+    if installed > 0 {
+        receipt
+            .notes
+            .push(format!("installed {installed} key records"));
+    }
+    Ok(())
+}
+
 /// Mint fresh pairing codes for both scopes and render the join command
 /// (ADR 0025's `pair`). Requires a first sync (the relay must know the
 /// scopes and hold this device's grants).
-pub fn pair(home: &Path, session: &Session, identity: &Identity) -> Result<String, SyncError> {
+pub fn pair(world: &World, session: &Session, identity: &Identity) -> Result<String, SyncError> {
+    let home = world.home.as_path();
     let file = load_sync_file(home)?;
     for (scope, _) in scopes_of(identity) {
         if !file.scopes.contains_key(&scope_key(scope)) {
@@ -351,30 +540,97 @@ pub struct JoinArgs<'a> {
 /// joiner's membership (and, if needed, an account), then sync. The
 /// identity file lands alone before any op — a torn join resumes as an
 /// ordinary sync, never a second world.
-pub fn join(home: &Path, session: &Session, args: &JoinArgs<'_>) -> Result<String, SyncError> {
+pub fn join(
+    world: &mut World,
+    session: &Session,
+    args: &JoinArgs<'_>,
+) -> Result<String, SyncError> {
+    let home = world.home.clone();
+    let home = home.as_path();
     if load_identity(home)?.is_some() {
         return Err(SyncError::AlreadyHasWorld);
     }
     let org_id = parse_v7_id(args.org_id, "org id", OrgId::new)?;
     let budget_id = parse_v7_id(args.budget_id, "budget id", BudgetId::new)?;
+    let relay = Relay::new(&session.server, &session.token);
+    let pending = load_join(home)?;
+
+    // A resumed join does not redeem again: the codes are single-use and were
+    // burned by the attempt that left the marker (ADR 0025's single-use
+    // contract; the relay already granted this device).
+    if pending.is_none() {
+        relay.redeem(ScopeId::Org(org_id), args.org_code)?;
+        relay.redeem(ScopeId::Budget(budget_id), args.budget_code)?;
+        save_join(home, JoinMark { org_id, budget_id })?;
+    } else if pending != Some(JoinMark { org_id, budget_id }) {
+        return Err(SyncError::BadBundle(
+            "this home has an unfinished join for a different world — finish it first".into(),
+        ));
+    }
+
+    // The joiner's own key material (ADR 0028): a device key and an empty
+    // joining keyring. It mints nothing; it publishes its public key so a
+    // key-holding device can wrap the world's keys to it.
+    world.join()?;
+    if world.is_sealed() {
+        if let Some(record) = world.device_record(session.device_id) {
+            relay.publish_keys(org_id, &[record])?;
+        }
+        for wire in relay.pull_keys(org_id)? {
+            world.install(&wire.record, org_id)?;
+        }
+    }
+    if world.is_sealed() && !world.holds_log_key(ScopeId::Org(org_id)) {
+        // Keyless: the join is granted and registered, and the marker makes it
+        // resumable. Nothing is written into the world yet — an identity whose
+        // account could not be adopted from the log would be a dead root
+        // (ADR 0025). The remaining steps run on the next `sync`.
+        return Ok(format!(
+            "registered this device with org {} — the world's keys are not here yet\n\
+             \nnext:\n  \
+             pursecraft sync        # on a device that already holds this world\n  \
+             pursecraft sync        # here, to install the keys and finish joining\n",
+            org_id.as_uuid()
+        ));
+    }
+    complete_join(world, session, org_id, budget_id)
+}
+
+/// The resumable half of a join (ADR 0025's torn-join rule, extended by ADR
+/// 0028 to a keyless joiner): pull both logs, write the identity root, mint
+/// the joiner's membership and account, then sync. Safe to re-run — the
+/// identity is written once and the ops are read-then-mint.
+fn complete_join(
+    world: &mut World,
+    session: &Session,
+    org_id: OrgId,
+    budget_id: BudgetId,
+) -> Result<String, SyncError> {
+    let home = world.home.clone();
+    let home = home.as_path();
+    let relay = Relay::new(&session.server, &session.token);
     let org_scope = ScopeId::Org(org_id);
     let budget_scope = ScopeId::Budget(budget_id);
-    let relay = Relay::new(&session.server, &session.token);
-    relay.redeem(org_scope, args.org_code)?;
-    relay.redeem(budget_scope, args.budget_code)?;
+    let cipher = world.cipher()?;
 
-    // Read-then-mint's read half: pull both logs completely first.
-    let mut org_store = open_store(&org_log(home, org_id))?;
+    // Read-then-mint's read half: pull both logs.
+    let mut org_store = world.open_log(org_scope)?;
     let mut org_session = boot(&org_store)?;
-    let (org_seen, org_pulled) =
-        drain_pull(&relay, org_scope, &mut org_store, &mut org_session, 0)?;
+    let (org_seen, org_pulled) = drain_pull(
+        &relay,
+        org_scope,
+        &mut org_store,
+        &mut org_session,
+        0,
+        &cipher,
+    )?;
     if !org_alive(org_session.state()) {
         return Err(SyncError::BadBundle(
             "the joined org log does not show a live organization — check the join arguments"
                 .into(),
         ));
     }
-    let mut budget_store = open_store(&budget_log(home, budget_id))?;
+    let mut budget_store = world.open_log(budget_scope)?;
     let mut budget_session = boot(&budget_store)?;
     let (budget_seen, budget_pulled) = drain_pull(
         &relay,
@@ -382,13 +638,14 @@ pub fn join(home: &Path, session: &Session, args: &JoinArgs<'_>) -> Result<Strin
         &mut budget_store,
         &mut budget_session,
         0,
+        &cipher,
     )?;
 
     // The joiner's slice, minted locally (ADR 0025): a fresh user and
-    // membership (Editor — the pairing code is the authorization; roles
-    // are data until an enforcement slice, ADR 0021), and the joined
-    // budget's earliest live account ADOPTED as the capture default —
-    // a Wallet is minted only when none exists.
+    // membership (Editor — the pairing code is the authorization; roles are
+    // data until an enforcement slice, ADR 0021), and the joined budget's
+    // earliest live account ADOPTED as the capture default — a Wallet is
+    // minted only when none exists.
     let adopted = earliest_live_account(budget_session.state());
     let account_id = match adopted {
         Some((id, _)) => id,
@@ -464,8 +721,8 @@ pub fn join(home: &Path, session: &Session, args: &JoinArgs<'_>) -> Result<Strin
     }
 
     // Record the pulls' cursors, then sync — the ordinary path pushes the
-    // joiner's ops (the identity is already the root, so a torn join
-    // resumes as a plain sync, never a re-join).
+    // joiner's ops (the identity is already the root, so a torn join resumes
+    // as a plain sync, never a re-join).
     let mut file = SyncFile {
         version: SYNC_VERSION,
         scopes: BTreeMap::new(),
@@ -485,8 +742,9 @@ pub fn join(home: &Path, session: &Session, args: &JoinArgs<'_>) -> Result<Strin
         },
     );
     save_sync_file(home, &file)?;
+    clear_join(home)?;
 
-    let receipt = sync(home, session, &identity)?;
+    let receipt = sync(world, session, &identity)?;
     Ok(format!(
         "joined org {} budget {} (pulled {} + {} ops, default account {account_name})\n{}",
         org_id.as_uuid(),
@@ -500,18 +758,18 @@ pub fn join(home: &Path, session: &Session, args: &JoinArgs<'_>) -> Result<Strin
 /// The pending-sync count (ADR 0011's visible badge): this session's
 /// unpushed ops across both scopes. Derived, never stored (ADR 0025).
 pub fn pending_count(
-    home: &Path,
+    world: &World,
     session: &Session,
     identity: &Identity,
 ) -> Result<u64, SyncError> {
+    let home = world.home.as_path();
     let file = load_sync_file(home)?;
     let mut count: u64 = 0;
     for (scope, _) in scopes_of(identity) {
-        let path = scope_log_path(home, identity, scope);
-        if !path.exists() {
+        if !crate::home::scope_log(home, scope).exists() {
             continue;
         }
-        let store = LocalStore::open(&path)?;
+        let store = world.open_log(scope)?;
         let pushed_through = file
             .scopes
             .get(&scope_key(scope))
@@ -534,12 +792,13 @@ pub fn pending_count(
 /// this device's own pushes). Sequences here are the RELAY's — the
 /// session watermark they move is deliberately unread (the store-booted
 /// watermark counts local sequences; `sync.json` owns both cursors).
-fn drain_pull(
+fn drain_pull<C: PayloadCipher>(
     relay: &Relay<'_>,
     scope: ScopeId,
-    store: &mut LocalStore,
+    store: &mut LocalStore<C>,
     sync_session: &mut SyncSession,
     since: u64,
+    cipher: &C,
 ) -> Result<(u64, u64), SyncError> {
     let mut remote_seen = since;
     let mut pulled: u64 = 0;
@@ -558,12 +817,22 @@ fn drain_pull(
             .ops
             .iter()
             .map(|wire| {
-                let payload =
-                    decode_payload(&wire.payload).map_err(|source| SyncError::Decode {
-                        scope: scope_key(scope),
-                        seq: wire.seq,
-                        source,
-                    })?;
+                // Open the envelope first (ADR 0028): a key problem is a
+                // distinct teaching failure, never a decode error that
+                // would read as damaged bytes.
+                let plaintext =
+                    cipher
+                        .open(&wire.meta, &wire.payload)
+                        .map_err(|source| SyncError::Cipher {
+                            scope: scope_key(scope),
+                            seq: wire.seq,
+                            detail: source.to_string(),
+                        })?;
+                let payload = decode_payload(&plaintext).map_err(|source| SyncError::Decode {
+                    scope: scope_key(scope),
+                    seq: wire.seq,
+                    source,
+                })?;
                 Ok(SequencedOp {
                     seq: wire.seq,
                     op: Op::from_parts(wire.meta.clone(), payload),
@@ -599,21 +868,6 @@ fn scope_key(scope: ScopeId) -> String {
         ScopeId::Org(id) => format!("org:{}", id.as_uuid()),
         ScopeId::Budget(id) => format!("budget:{}", id.as_uuid()),
     }
-}
-
-fn scope_log_path(home: &Path, identity: &Identity, scope: ScopeId) -> std::path::PathBuf {
-    match scope {
-        ScopeId::Org(_) => org_log(home, identity.org_id),
-        ScopeId::Budget(_) => budget_log(home, identity.budget_id),
-    }
-}
-
-/// Open (creating dirs and file as needed) a scope's local store.
-fn open_store(path: &std::path::Path) -> Result<LocalStore, SyncError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(LocalStore::open(path)?)
 }
 
 /// The earliest live account in a budget state (ADR 0016's deterministic
@@ -665,6 +919,51 @@ impl Default for SyncFile {
             version: SYNC_VERSION,
             scopes: BTreeMap::new(),
         }
+    }
+}
+
+/// The unfinished-join marker (ADR 0028): a join whose data step has not run
+/// yet. It exists so a keyless joiner can resume, and so a resumed join never
+/// redeems a single-use pairing code twice (ADR 0025).
+const JOIN_FILE: &str = "join.json";
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct JoinMark {
+    org_id: OrgId,
+    budget_id: BudgetId,
+}
+
+fn load_join(home: &Path) -> Result<Option<JoinMark>, SyncError> {
+    let path = home.join(JOIN_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| SyncError::BadState {
+            path,
+            detail: format!("does not decode: {e}"),
+        })
+}
+
+fn save_join(home: &Path, mark: JoinMark) -> Result<(), SyncError> {
+    let path = home.join(JOIN_FILE);
+    let tmp = home.join(format!("{JOIN_FILE}.{}.tmp", std::process::id()));
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(&mark).map_err(|e| SyncError::Io(std::io::Error::other(e)))?,
+    )?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn clear_join(home: &Path) -> Result<(), SyncError> {
+    match std::fs::remove_file(home.join(JOIN_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 

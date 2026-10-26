@@ -9,7 +9,6 @@
 //! crash-retries complete partial states instead of duplicating them.
 
 use std::fmt;
-use std::path::Path;
 
 use pursecraft_core::date::Date;
 use pursecraft_core::domain::{
@@ -23,11 +22,13 @@ use pursecraft_core::ops::{ApplyError, Op, ScopeState};
 use pursecraft_core::org::{PersonalOrgIds, provision_personal_org};
 use pursecraft_core::store::{LocalStore, StoreError};
 use pursecraft_core::sync::SyncSession;
+use pursecraft_core::wire::PayloadCipher;
 
 use crate::amount;
 use crate::category::{ensure_inbox, find_category, inbox_line, join_known};
-use crate::home::{Identity, IdentityError, budget_log, load_or_create_identity, org_log};
+use crate::home::{Identity, IdentityError, load_or_create_identity};
 use crate::idmint::mint_uuid;
+use crate::keys::{KeysError, World};
 use crate::session::Session;
 use crate::sink;
 
@@ -103,6 +104,7 @@ pub enum CaptureError {
         input: String,
     },
     Identity(IdentityError),
+    Keys(KeysError),
     Store(StoreError),
     /// A stored op was rejected during replay — the log is inconsistent
     /// with the engine; loud, never merged (ADR 0016).
@@ -137,6 +139,7 @@ impl fmt::Display for CaptureError {
                 write!(f, "invalid date {input:?} (expected YYYY-MM-DD)")
             }
             Self::Identity(e) => write!(f, "{e}"),
+            Self::Keys(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Apply(e) => write!(f, "stored op rejected by the engine: {e}"),
             Self::UnknownAccount { wanted, known } => {
@@ -179,6 +182,7 @@ impl std::error::Error for CaptureError {
         match self {
             Self::Amount(e) => Some(e),
             Self::Identity(e) => Some(e),
+            Self::Keys(e) => Some(e),
             Self::Store(e) => Some(e),
             Self::Apply(e) => Some(e),
             _ => None,
@@ -195,6 +199,12 @@ impl From<amount::AmountError> for CaptureError {
 impl From<IdentityError> for CaptureError {
     fn from(e: IdentityError) -> Self {
         Self::Identity(e)
+    }
+}
+
+impl From<KeysError> for CaptureError {
+    fn from(e: KeysError) -> Self {
+        Self::Keys(e)
     }
 }
 
@@ -231,11 +241,14 @@ impl From<crate::category::EnsureError> for CaptureError {
 /// amount or date never creates files. The enrollment's device mints the
 /// ops (ADR 0025) — the relay refuses another device's.
 pub fn add(
-    home: &Path,
+    world: &mut World,
     session: &Session,
     raw: &RawAdd<'_>,
     today: Date,
 ) -> Result<Receipt, CaptureError> {
+    let home = world.home.clone();
+    let home = home.as_path();
+
     let payee = raw.payee.trim();
     if payee.is_empty() {
         return Err(CaptureError::EmptyPayee);
@@ -249,26 +262,32 @@ pub fn add(
     };
 
     let (identity, bootstrapped) = load_or_create_identity(home, session.device_id)?;
+    if bootstrapped {
+        // A world this device creates mints its keys before its first op
+        // (ADR 0028): every payload below is sealed, so the key material must
+        // be durable first.
+        world.found(&identity, session.device_id)?;
+    }
+    let (org_scope, budget_scope) = (
+        ScopeId::Org(identity.org_id),
+        ScopeId::Budget(identity.budget_id),
+    );
     let mut minter = Minter::new(session, &identity);
 
     // Org side (ADR 0021): provisioning + the budget registry entry.
-    let org_path = org_log(home, identity.org_id);
-    std::fs::create_dir_all(org_path.parent().expect("store parent"))?;
-    let mut org_store = LocalStore::open(&org_path)?;
+    let mut org_store = world.open_log(org_scope)?;
     ensure_org(&mut minter, &mut org_store, &identity)?;
     drop(org_store);
 
     // Budget side: ensure the account and the Inbox (ADR 0027), then
     // boot fresh for the capture.
-    let budget_path = budget_log(home, identity.budget_id);
-    std::fs::create_dir_all(budget_path.parent().expect("store parent"))?;
-    let mut budget_store = LocalStore::open(&budget_path)?;
+    let mut budget_store = world.open_log(budget_scope)?;
     if ensure_account(&mut minter, &mut budget_store, &identity)? {
-        budget_store = LocalStore::open(&budget_path)?; // re-read post-writes
+        budget_store = world.open_log(budget_scope)?; // re-read post-writes
     }
     let created_inbox = ensure_inbox(&mut minter, &mut budget_store, &identity)?;
     if created_inbox {
-        budget_store = LocalStore::open(&budget_path)?; // re-read post-writes
+        budget_store = world.open_log(budget_scope)?; // re-read post-writes
     }
     let session = boot(&budget_store)?;
     minter.absorb(session.clock());
@@ -435,7 +454,7 @@ pub(crate) fn anchored_at(id: EntityId) -> Hlc {
 
 /// Boot a session from a store — read-then-mint's read half, the ordinary
 /// replay path (ADR 0018).
-pub(crate) fn boot(store: &LocalStore) -> Result<SyncSession, ApplyError> {
+pub(crate) fn boot<C: PayloadCipher>(store: &LocalStore<C>) -> Result<SyncSession, ApplyError> {
     let mut session = SyncSession::new();
     session.apply_delta(store.delta_since(0))?;
     Ok(session)
@@ -445,9 +464,9 @@ pub(crate) fn boot(store: &LocalStore) -> Result<SyncSession, ApplyError> {
 /// the core's read-then-mint reference, plus the budget's `name` op in the
 /// org log — both probed against the booted state, stamped at their
 /// entity's own mint ms. Returns whether anything was emitted.
-fn ensure_org(
+fn ensure_org<C: PayloadCipher>(
     minter: &mut Minter,
-    store: &mut LocalStore,
+    store: &mut LocalStore<C>,
     identity: &Identity,
 ) -> Result<bool, CaptureError> {
     let session = boot(store)?;
@@ -489,9 +508,9 @@ fn ensure_org(
 /// `name` + `kind`, each probed per-field so a partial write is completed,
 /// never redone. Stamped at the account's own mint ms. Returns whether
 /// anything was emitted.
-fn ensure_account(
+fn ensure_account<C: PayloadCipher>(
     minter: &mut Minter,
-    store: &mut LocalStore,
+    store: &mut LocalStore<C>,
     identity: &Identity,
 ) -> Result<bool, CaptureError> {
     let session = boot(store)?;
@@ -599,10 +618,14 @@ fn find_payee(state: &ScopeState, name: &str) -> Option<EntityId> {
 mod tests {
     use super::*;
     use crate::home::load_identity;
+    use crate::home::{budget_log, org_log};
+    use crate::keys::{World, WorldCipher};
     use crate::testsupport::TempDir;
     use pursecraft_core::domain::{MembershipRole, Payee, Transaction};
     use pursecraft_core::ids::{AccountId, BudgetId, PayeeId};
     use pursecraft_core::org::{membership_role, organization};
+    use pursecraft_core::store::LocalStore;
+    use std::path::Path;
 
     /// A stamp far beyond any real wall clock (same trick as the core's
     /// convergence tests).
@@ -624,7 +647,7 @@ mod tests {
     }
 
     fn add_cmd(home: &Path, raw: &RawAdd<'_>) -> Result<Receipt, CaptureError> {
-        add(home, &session(), raw, today())
+        add(&mut World::plain(home), &session(), raw, today())
     }
 
     fn raw<'a>(payee: &'a str, amount: &'a str) -> RawAdd<'a> {
@@ -638,14 +661,17 @@ mod tests {
     }
 
     /// Read the identity back and reopen the budget store from disk.
-    fn reopened(home: &Path) -> (Identity, LocalStore) {
+    fn reopened(home: &Path) -> (Identity, LocalStore<WorldCipher>) {
         let identity = load_identity(home).unwrap().expect("identity exists");
-        let store = LocalStore::open(&budget_log(home, identity.budget_id)).unwrap();
+        let store = World::plain(home)
+            .open_log(ScopeId::Budget(identity.budget_id))
+            .unwrap();
         (identity, store)
     }
 
     fn org_tip(home: &Path, identity: &Identity) -> u64 {
-        LocalStore::open(&org_log(home, identity.org_id))
+        World::plain(home)
+            .open_log(ScopeId::Org(identity.org_id))
             .unwrap()
             .tip()
     }
@@ -675,7 +701,9 @@ mod tests {
         let (identity, _) = reopened(home);
         assert_eq!(org_tip(home, &identity), 5);
         let mut org_session = SyncSession::new();
-        let org_store = LocalStore::open(&org_log(home, identity.org_id)).unwrap();
+        let org_store = World::plain(home)
+            .open_log(ScopeId::Org(identity.org_id))
+            .unwrap();
         org_session.apply_delta(org_store.delta_since(0)).unwrap();
         let org = organization(org_session.state()).expect("org entity");
         assert_eq!(org.name.as_deref(), Some(ORG_NAME));
@@ -1006,7 +1034,9 @@ mod tests {
             "2 seeded + 2 completed + budget name"
         );
         let mut org_session = SyncSession::new();
-        let org_store = LocalStore::open(&org_log(home, identity.org_id)).unwrap();
+        let org_store = World::plain(home)
+            .open_log(ScopeId::Org(identity.org_id))
+            .unwrap();
         org_session.apply_delta(org_store.delta_since(0)).unwrap();
         assert_eq!(
             membership_role(org_session.state(), identity.user_id),
@@ -1048,7 +1078,7 @@ mod tests {
             },
         );
 
-        let list = crate::list::list(home, &session()).unwrap();
+        let list = crate::list::list(&World::plain(home), &session()).unwrap();
         let torn_row = list
             .lines()
             .find(|l| l.contains('?'))
@@ -1157,7 +1187,7 @@ mod tests {
         }
 
         // Mint Food, then file into it; the receipt names the category.
-        crate::category::new_category(home, &session(), "Food", None).unwrap();
+        crate::category::new_category(&World::plain(home), &session(), "Food", None).unwrap();
         let receipt = add_cmd(
             home,
             &RawAdd {

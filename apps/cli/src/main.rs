@@ -22,6 +22,7 @@ fn main() -> ExitCode {
             } else {
                 String::new()
             },
+            e2ee: e2ee_enabled(),
         })
     });
     // A closed pipe (e.g. `pursecraft list | head`) is a truncation, not a
@@ -44,6 +45,14 @@ fn read_stdin() -> String {
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
     buf
+}
+
+/// The self-host E2EE switch (ADR 0028): `PURSECRAFT_E2EE=off` selects the
+/// plaintext mode ADR 0009 allows; anything else — unset included — is E2EE.
+/// Read here, with the rest of the environment, so the library stays fully
+/// injectable.
+fn e2ee_enabled() -> bool {
+    std::env::var_os("PURSECRAFT_E2EE").is_none_or(|v| v != "off")
 }
 
 /// Today's local civil date (ADR 0023): jiff resolves the system timezone —

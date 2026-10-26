@@ -17,6 +17,7 @@ use pursecraft_core::ids::ScopeId;
 use pursecraft_core::store::{OpaqueStore, StoreError};
 
 use crate::auth::AuthDb;
+use crate::keys::KeyStore;
 
 /// How long one readiness probe result stays fresh (ADR 0026): the
 /// probe is an honest durable write, so the route must not let a client
@@ -30,6 +31,9 @@ pub const READINESS_PROBE_TTL: Duration = Duration::from_secs(1);
 pub struct AppState {
     data_dir: PathBuf,
     pub auth: Mutex<AuthDb>,
+    /// The org-scoped key records (ADR 0028) — opaque strings the relay
+    /// stores, dedupes, and forwards without ever parsing one.
+    pub keys: KeyStore,
     logs: Mutex<HashMap<ScopeId, Arc<Mutex<OpaqueStore>>>>,
     /// The last readiness outcome and when it was taken (ADR 0026) —
     /// `None`/`Some(err)` per outcome; the TTL bounds fsync cost.
@@ -69,9 +73,12 @@ impl AppState {
             .map_err(|e| StateError::Setup(format!("cannot create {}: {e}", data_dir.display())))?;
         let auth = AuthDb::open(data_dir)
             .map_err(|e| StateError::Setup(format!("cannot open the auth database: {e}")))?;
+        let keys = KeyStore::open(data_dir)
+            .map_err(|e| StateError::Setup(format!("cannot open the key store: {e}")))?;
         Ok(Self {
             data_dir: data_dir.to_owned(),
             auth: Mutex::new(auth),
+            keys,
             logs: Mutex::new(HashMap::new()),
             readiness_cache: Mutex::new(None),
         })

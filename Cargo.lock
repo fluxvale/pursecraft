@@ -657,6 +657,7 @@ dependencies = [
  "minreq",
  "pursecraft-api",
  "pursecraft-core",
+ "pursecraft-crypto",
  "serde",
  "serde_json",
  "tokio",

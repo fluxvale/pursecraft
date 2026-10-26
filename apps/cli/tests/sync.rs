@@ -127,12 +127,16 @@ fn scratch_dir(label: &str) -> PathBuf {
 /// A CLI home: a scratch directory, run through the real dispatch.
 struct Home {
     dir: PathBuf,
+    /// The self-host E2EE switch (ADR 0028): the plaintext suite runs with it
+    /// off; the E2EE suite turns it on.
+    e2ee: bool,
 }
 
 impl Home {
     fn new(label: &str) -> Self {
         Self {
             dir: scratch_dir(label),
+            e2ee: false,
         }
     }
 
@@ -148,6 +152,7 @@ impl Home {
                 home: self.dir.clone(),
                 today: Date::new(2026, 10, 25).unwrap(),
                 stdin: stdin.to_owned(),
+                e2ee: self.e2ee,
             })
         })
     }

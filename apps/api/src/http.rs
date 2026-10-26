@@ -23,6 +23,7 @@ use pursecraft_core::sync::LogError;
 use pursecraft_core::wire::OpMeta;
 
 use crate::auth::AuthError;
+use crate::keys::{KeyStoreError, MAX_KEY_RECORDS};
 use crate::state::{AppState, StateError};
 
 /// The envelope version every body carries (ADR 0024); unknown versions
@@ -38,6 +39,8 @@ pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Pull page size: default and ceiling.
 pub const DEFAULT_PULL_LIMIT: usize = 1000;
 pub const MAX_PULL_LIMIT: usize = 10_000;
+/// Key records per publish request (ADR 0028).
+pub const MAX_KEY_BATCH: usize = 512;
 
 /// The relay's error shape: `{"error": code, "message": …}` with the
 /// status that matches. Internal failures never leak their details.
@@ -100,6 +103,17 @@ impl IntoResponse for ApiError {
 impl From<StateError> for ApiError {
     fn from(e: StateError) -> Self {
         Self::internal(e)
+    }
+}
+
+impl From<KeyStoreError> for ApiError {
+    fn from(e: KeyStoreError) -> Self {
+        match e {
+            // A cap refusal is the client's to fix; a damaged file or an io
+            // failure is ours and never leaks.
+            KeyStoreError::Full | KeyStoreError::TooLarge => ApiError::too_large(e.to_string()),
+            KeyStoreError::Io(_) | KeyStoreError::BadFile { .. } => ApiError::internal(e),
+        }
     }
 }
 
@@ -539,6 +553,106 @@ async fn pull_ops(
 }
 
 // ---------------------------------------------------------------------
+// Key records (ADR 0028): opaque strings on the org's scope, org-only.
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct KeyPublishRequest {
+    v: u16,
+    /// The record strings verbatim — the relay never parses one.
+    keys: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct KeyPublishResponse {
+    v: u16,
+    /// How many of the pushed records the org holds (the client's ack check).
+    stored: usize,
+}
+
+#[derive(Serialize)]
+struct KeyPullEntry {
+    key: String,
+    pushed_by: DeviceId,
+}
+
+#[derive(Serialize)]
+struct KeyPullResponse {
+    v: u16,
+    keys: Vec<KeyPullEntry>,
+}
+
+/// The org id a key route names, refusing budget scopes: the org is the
+/// single revocation point for both log kinds (ADR 0021), so key records are
+/// org-scoped and nowhere else (ADR 0028).
+fn key_org(kind: &str, id: &str) -> Result<OrgId, ApiError> {
+    match parse_scope(kind, id)? {
+        ScopeId::Org(org) => Ok(org),
+        ScopeId::Budget(_) => Err(ApiError::bad_request(
+            "key records are org-scoped; budget keys are wrapped under their org's epoch key",
+        )),
+    }
+}
+
+async fn publish_keys(
+    State(state): State<Arc<AppState>>,
+    Path((kind, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<KeyPublishRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let device = authenticate(&state, &headers)?;
+    let org = key_org(&kind, &id)?;
+    // Publishing needs a grant on the org; reading does too — the same ACL
+    // the ops routes use, so revocation has one point (ADR 0021, ADR 0028).
+    require_grant(&state, ScopeId::Org(org), device)?;
+    let req = json_body(body)?;
+    check_version(req.v)?;
+    if req.keys.len() > MAX_KEY_BATCH {
+        return Err(ApiError::too_large(format!(
+            "key batch of {} exceeds {MAX_KEY_BATCH} records",
+            req.keys.len()
+        )));
+    }
+    if req.keys.len() > MAX_KEY_RECORDS {
+        return Err(ApiError::too_large("too many key records"));
+    }
+    let stored = state.keys.publish(org, device, &req.keys)?;
+    Ok((
+        StatusCode::OK,
+        Json(KeyPublishResponse {
+            v: ENVELOPE_VERSION,
+            stored,
+        }),
+    ))
+}
+
+async fn pull_keys(
+    State(state): State<Arc<AppState>>,
+    Path((kind, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let device = authenticate(&state, &headers)?;
+    let org = key_org(&kind, &id)?;
+    require_grant(&state, ScopeId::Org(org), device)?;
+    let keys = state
+        .keys
+        .records(org)?
+        .into_iter()
+        .map(|row| KeyPullEntry {
+            key: row.key,
+            pushed_by: row.pushed_by,
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        Json(KeyPullResponse {
+            v: ENVELOPE_VERSION,
+            keys,
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------
 // Health (ADR 0026): the fleet's two-route contract — liveness touches
 // nothing (a store blip pulls the pod, never restart-storms it);
 // readiness reflects the store's actual health.
@@ -583,6 +697,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/{kind}/{id}/pairing-codes", post(mint_pairing_code))
         .route("/v1/{kind}/{id}/devices", post(pair_device))
         .route("/v1/{kind}/{id}/ops", post(push_ops).get(pull_ops))
+        .route("/v1/{kind}/{id}/keys", post(publish_keys).get(pull_keys))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
