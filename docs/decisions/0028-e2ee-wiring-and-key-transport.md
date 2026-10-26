@@ -343,10 +343,16 @@ shared with whoever is admitted; rotation protects the future only.
   authentication on a device that is not its addressee is the ordinary
   misroute/mislabel case and is skipped; the loud path is reserved for a wrap
   that actually opened for this device and conflicted.
+  An **unparseable** record is treated the same way: it is collected as a
+  conflict and skipped, never a parse failure that stops the data phase — the
+  relay stores whatever bytes it is given, so garbage is a member's to plant
+  and the client's to report, not an org-wide wedge.
   The remaining window that is *not* recoverable is a wrap sealed to a key
-  this device no longer has: losing `device.key` loses the world, and the
-  honest answer is a `DeviceKeyMismatch` naming the file to restore — never a
-  fresh key minted beside the dead wraps. Torn **keyrings** (a key present,
+  this device no longer has: losing `device.key` while the keyring still holds
+  records loses the world. That is a `MissingDeviceKey` naming the file to
+  restore, on every command, and the key is **never** re-minted over a
+  populated keyring; an *empty* keyring with no key is the crash window and is
+  completed (the key binds nothing yet). Torn **keyrings** (a key present,
   some records not yet written) *are* recovered: a founder's mint re-runs on
   every capture and a joiner's on the next `sync`, because both are idempotent.
   All of this is pinned by tests.

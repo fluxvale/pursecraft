@@ -615,9 +615,10 @@ fn idle_syncs_do_not_re_wrap_peers() {
     let _ = session::load(a.path());
 }
 
-/// One member's poisoned record must not wedge everyone's sync (ADR 0028):
-/// the data still syncs, and the conflict is reported loudly rather than
-/// silently swallowed or made permanent.
+/// One member's poisoned records — both a tampered-but-parseable wrap and
+/// outright garbage — must not wedge anyone's sync (ADR 0028): the data still
+/// syncs, and the conflict is reported loudly rather than silently swallowed
+/// or made permanent.
 #[test]
 fn a_poisoned_key_record_reports_but_does_not_wedge_the_data_sync() {
     use pursecraft_cli::relay::Relay;
@@ -649,8 +650,10 @@ fn a_poisoned_key_record_reports_but_does_not_wedge_the_data_sync() {
     let tampered = r#"{"v":1,"kind":"log","wrap":{"v":1,"scope":{"Org":""#.to_owned()
         + &org_id
         + r#""},"epoch":0,"n":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","c":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#;
+    // And an unparseable string: the relay stores bytes verbatim by design, so
+    // this must not stop a sync either.
     client
-        .publish_keys(org, &[tampered])
+        .publish_keys(org, &[tampered, "not-a-key-record at all".to_owned()])
         .expect("a granted member can publish");
 
     // B captures and syncs: the op still reaches the relay, and the poison is
@@ -677,40 +680,70 @@ fn a_poisoned_key_record_reports_but_does_not_wedge_the_data_sync() {
         "the data sync ran despite the poison\n{}",
         list_a.stdout
     );
+    // A's list showing `lunch` IS the round-trip proof: B minted that op, so
+    // A can only hold it by pulling it from the relay.
 }
 
-/// A founder torn inside the very first key init — keyring published, device
-/// key not — heals on the next capture. The gate must let `add` through for a
-/// founding home, or the only command that can heal it is blocked (ADR 0028).
+/// A founder whose `device.key` is gone while its keyring still holds records
+/// keeps the teaching error on every command and mints nothing (ADR 0028:
+/// never re-mint over a populated keyring). The message names the file.
 #[test]
-fn a_founder_torn_before_its_device_key_heals_on_the_next_capture() {
+fn a_lost_device_key_beside_a_populated_keyring_is_refused_not_reminted() {
+    let home = Home::new("e2ee-founder-lost-key");
+    let relay = LiveRelay::start("e2ee-founder-lost-key-relay");
+    assert_eq!(home.login(&relay).code, 0);
+    assert_eq!(home.run("", &["add", "coffee", "-4.50"]).code, 0);
+    let original = std::fs::read(home.path().join("device.key")).unwrap();
+
+    std::fs::remove_file(home.path().join("device.key")).unwrap();
+    for args in [&["list"][..], &["add", "bread", "-2"][..], &["sync"][..]] {
+        let out = home.run("", args);
+        assert_eq!(out.code, 1, "{args:?}\n{}{}", out.stdout, out.stderr);
+        assert!(
+            out.stderr.contains("device.key"),
+            "{args:?} names the file to restore\n{}",
+            out.stderr
+        );
+    }
+    assert!(
+        !home.path().join("device.key").exists(),
+        "no key was re-minted over the dead wraps"
+    );
+    // Restoring the key restores everything.
+    std::fs::write(home.path().join("device.key"), original).unwrap();
+    let list = home.run("", &["list"]);
+    assert_eq!(list.code, 0, "{}", list.stderr);
+    assert!(list.stdout.contains("coffee"), "{}", list.stdout);
+}
+
+/// A founder torn inside the very first key init — an *empty* keyring
+/// published, device key not — heals on the next capture. This is the real
+/// crash window; the gate must let `add` through for a founding home.
+#[test]
+fn an_empty_keyring_without_a_device_key_heals_on_the_next_capture() {
     let home = Home::new("e2ee-founder-early-tear");
     let relay = LiveRelay::start("e2ee-founder-early-tear-relay");
     assert_eq!(home.login(&relay).code, 0);
     assert_eq!(home.run("", &["add", "coffee", "-4.50"]).code, 0);
 
-    // Remove the device key but keep the founding keyring and its records:
-    // the crash window between `Keys::init`'s two publishes.
+    // The crash state: identity written, empty founding keyring, no key, no
+    // stores. Nothing is bound yet, so re-minting is safe.
+    std::fs::remove_dir_all(home.path().join("orgs")).unwrap();
+    std::fs::remove_dir_all(home.path().join("budgets")).unwrap();
     std::fs::remove_file(home.path().join("device.key")).unwrap();
-    let list = home.run("", &["list"]);
-    assert_eq!(list.code, 1, "no key, no read\n{}", list.stdout);
+    std::fs::write(
+        home.path().join("keyring.json"),
+        serde_json::json!({ "v": 1, "founded": true, "records": [] }).to_string(),
+    )
+    .unwrap();
 
-    // The gate lets `add` through for a founding home (that is the fix), and
-    // the mint then refuses loudly: the world's org wrap is sealed to a device
-    // key that no longer exists, so the honest answer is "restore the key",
-    // never a silent second world.
     let add = home.run("", &["add", "bread", "-2"]);
-    assert_eq!(add.code, 1, "{}{}", add.stdout, add.stderr);
-    assert!(
-        add.stderr.contains("does not open this home's keyring"),
-        "a founding home reaches its healing command and is told the real cause\n{}",
-        add.stderr
+    assert_eq!(
+        add.code, 0,
+        "the founding home heals\n{}{}",
+        add.stdout, add.stderr
     );
-    // The blocked-before-fix symptom was the joiner message, which is wrong
-    // here: this home founded the world.
-    assert!(
-        !add.stderr.contains("run pursecraft sync on a device"),
-        "a founding home is not told to find another device\n{}",
-        add.stderr
-    );
+    let list = home.run("", &["list"]);
+    assert_eq!(list.code, 0, "{}", list.stderr);
+    assert!(list.stdout.contains("bread"), "{}", list.stdout);
 }
