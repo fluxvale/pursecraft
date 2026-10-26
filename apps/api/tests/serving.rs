@@ -56,24 +56,33 @@ async fn readiness_tracks_the_store_and_recovers() {
 #[tokio::test]
 async fn readiness_results_are_ttl_cached_not_rewritten_per_request() {
     // The cache exists so the route cannot be an fsync firehose (ADR
-    // 0026): inside the TTL window no new probe write happens —
-    // observed through the probe file's mtime staying put.
+    // 0026). Observed deterministically through the probe FILE: a live
+    // probe recreates it on every request; a cached answer never
+    // touches the disk — no clock or mtime granularity in the loop.
     let mut relay = TestRelay::new("ttl");
     let probe = relay.dir.join("logs").join("health.probe");
     let (status, _) = relay.request("GET", "/health/ready", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    let first = std::fs::metadata(&probe).unwrap().modified().unwrap();
+    assert!(probe.exists(), "a live probe writes its file");
+
+    // Inside the TTL the cached result answers without re-probing: the
+    // deleted file stays deleted however many requests land.
+    std::fs::remove_file(&probe).unwrap();
     for _ in 0..3 {
-        // far inside the TTL — a live probe per request would bump the
-        // mtime each time (the stamp differs per write)
         let (status, _) = relay.request("GET", "/health/ready", None, None).await;
         assert_eq!(status, StatusCode::OK);
     }
-    let last = std::fs::metadata(&probe).unwrap().modified().unwrap();
-    assert_eq!(
-        first, last,
+    assert!(
+        !probe.exists(),
         "requests inside the TTL must not trigger new probe writes"
     );
+
+    // Past the TTL the live probe runs again and recreates the file.
+    let ttl = pursecraft_api::READINESS_PROBE_TTL;
+    std::thread::sleep(ttl + std::time::Duration::from_millis(50));
+    let (status, _) = relay.request("GET", "/health/ready", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(probe.exists(), "a probe past the TTL writes its file again");
 }
 
 #[tokio::test]

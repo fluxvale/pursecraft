@@ -85,11 +85,15 @@ pod leaves the Service endpoints but is **not** restarted, because a
 restart cannot fix a volume ([ADR 0026]). The canary is directory-level:
 per-file damage inside a writable directory (a root-owned log file, a
 partial restore) still fails loudly as a 500 at request time, per
-[ADR 0024]'s contract. One deliberate asymmetry: with `logs/` deleted at
-runtime, already-open stores keep serving until their next write while
-readiness reports 503 — readiness errs unavailable, never available. The
-probe writes `health.probe` files in both directories; their mtimes are
-the last successful probe.
+[ADR 0024]'s contract. One deliberate asymmetry, exactly stated: with
+`logs/` deleted at runtime, already-open stores keep serving from their
+open file handles — appends even *ghost-ack* onto the unlinked inode
+(the 200 describes data that dies with the process; the next boot
+recreates the log from sequence 1) — while readiness reports 503 and
+pulls the pod, bounding that ghost window. Readiness errs unavailable,
+never available. The probe writes `health.probe` files in both
+directories; their mtimes are the last successful probe (a stray entry
+shaped like `health.probe` fails the probe too — the safe direction).
 
 ## Shutdown contract
 
