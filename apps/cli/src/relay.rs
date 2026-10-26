@@ -145,9 +145,14 @@ impl<'a> Relay<'a> {
             let plaintext = pursecraft_core::wire::encode_payload(&payload).map_err(|e| {
                 RelayError::BadAnswer(format!("an op payload does not encode: {e}"))
             })?;
-            let payload = cipher
-                .seal(&meta, plaintext)
-                .map_err(|e| RelayError::BadAnswer(format!("an op payload does not seal: {e}")))?;
+            let payload = cipher.seal(&meta, plaintext).map_err(|e| {
+                // A local seal failure is not the relay's doing: missing or
+                // stale keys (ADR 0028). Say that, not "answered strangely".
+                RelayError::Unreachable {
+                    server: self.server.to_owned(),
+                    detail: format!("this device cannot seal the op: {e}"),
+                }
+            })?;
             wire_ops.push(serde_json::json!({ "meta": meta_value, "payload": payload }));
         }
         let body = serde_json::json!({ "v": 1, "ops": wire_ops });

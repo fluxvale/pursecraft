@@ -262,12 +262,11 @@ pub fn add(
     };
 
     let (identity, bootstrapped) = load_or_create_identity(home, session.device_id)?;
-    if bootstrapped {
-        // A world this device creates mints its keys before its first op
-        // (ADR 0028): every payload below is sealed, so the key material must
-        // be durable first.
-        world.found(&identity, session.device_id)?;
-    }
+    // The founding device mints its keys before its first op (ADR 0028):
+    // every payload below is sealed, so the key material must be durable
+    // first. Runs on every capture — the mint is idempotent and resumable, so
+    // a crash that left the keyring half-minted completes here.
+    world.found(&identity, session.device_id)?;
     let (org_scope, budget_scope) = (
         ScopeId::Org(identity.org_id),
         ScopeId::Budget(identity.budget_id),

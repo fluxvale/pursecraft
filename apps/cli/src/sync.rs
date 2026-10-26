@@ -395,6 +395,10 @@ pub fn resume_join(world: &mut World, session: &Session) -> Result<SyncReceipt, 
         return Err(SyncError::NotBootstrapped);
     };
     if world.is_sealed() {
+        // A crash between the marker and the device key leaves a keyring with
+        // no key: complete it here. `join` is idempotent (ADR 0028), and this
+        // is the only command the gate lets a keyless joiner run.
+        world.join()?;
         let relay = Relay::new(&session.server, &session.token);
         publish_and_install(world, &relay, session, mark.org_id)?;
         if !world.holds_log_key(ScopeId::Org(mark.org_id)) {
@@ -428,7 +432,10 @@ fn publish_and_install(
     let mut installed = 0usize;
     for org_pass in [true, false] {
         for wire in &pulled {
-            let is_org_wrap = wire.record.contains(r#""kind":"org""#);
+            let is_org_wrap = matches!(
+                pursecraft_crypto::KeyRecord::parse(&wire.record).ok(),
+                Some(pursecraft_crypto::KeyRecord::Org { .. })
+            );
             if is_org_wrap == org_pass && world.install(&wire.record, org)? {
                 installed += 1;
             }
@@ -474,7 +481,14 @@ fn sync_keys(
                 }
             }
             pursecraft_crypto::KeyRecord::Org { to, wrap } => {
-                covered.entry(to).or_default().insert(wrap.epoch);
+                // Coverage counts only wraps this device can actually open and
+                // that pass the slot check — i.e. ones it holds. A stranger's
+                // forged "to: X" record would otherwise let any member
+                // suppress the genuine wrap for X forever (ADR 0028's
+                // consequence, now pinned here).
+                if world.install(&wire.record, org).unwrap_or(false) {
+                    covered.entry(to).or_default().insert(wrap.epoch);
+                }
             }
             pursecraft_crypto::KeyRecord::Log { .. } => {}
         }
@@ -949,13 +963,21 @@ fn load_join(home: &Path) -> Result<Option<JoinMark>, SyncError> {
 }
 
 fn save_join(home: &Path, mark: JoinMark) -> Result<(), SyncError> {
+    use std::io::Write;
     let path = home.join(JOIN_FILE);
     let tmp = home.join(format!("{JOIN_FILE}.{}.tmp", std::process::id()));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec(&mark).map_err(|e| SyncError::Io(std::io::Error::other(e)))?,
-    )?;
+    {
+        let mut out = std::fs::File::create(&tmp)?;
+        out.write_all(
+            &serde_json::to_vec(&mark).map_err(|e| SyncError::Io(std::io::Error::other(e)))?,
+        )?;
+        out.sync_all()?;
+    }
     std::fs::rename(&tmp, &path)?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(home) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 

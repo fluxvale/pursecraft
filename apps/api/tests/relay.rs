@@ -977,3 +977,77 @@ mod keys {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     }
 }
+
+/// Concurrent publishes to one org (the ordinary two-device case, racing)
+/// never lose an acked record, fail a request, or corrupt the file
+/// (ADR 0028's no-loss contract; hostile-review B1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_key_publishes_lose_nothing() {
+    let mut relay = TestRelay::new("keys-concurrent");
+    let mut devices = Vec::new();
+    for _ in 0..4 {
+        devices.push(Device::enroll(&mut relay).await);
+    }
+    devices[0].create_scope(&mut relay, org_scope()).await;
+    // One code per device: codes are single-use (ADR 0024).
+    for index in 1..devices.len() {
+        let code = devices[0].mint_code(&mut relay, org_scope()).await;
+        devices[index].pair(&mut relay, org_scope(), &code).await;
+    }
+
+    // Eight publishers, each pushing four distinct records, all at once.
+    let mut tasks = Vec::new();
+    for (index, device) in devices.iter().enumerate() {
+        for round in 0..2 {
+            let records: Vec<String> = (0..4)
+                .map(|i| format!(r#"{{"v":1,"kind":"device","device":"{index}-{round}-{i}"}}"#))
+                .collect();
+            let token = device.token.clone();
+            let router = relay.router.clone();
+            tasks.push(tokio::spawn(async move {
+                use axum::body::Body;
+                use axum::http::Request;
+                use tower::ServiceExt;
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/v1/{}/keys", scope_path(org_scope())))
+                            .header("Authorization", format!("Bearer {token}"))
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({ "v": 1, "keys": records }).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&body).to_string())
+            }));
+        }
+    }
+    for task in tasks {
+        let (status, body) = task.await.expect("task");
+        assert_eq!(status, StatusCode::OK, "a racing publish failed: {body}");
+    }
+
+    // Every one of the 32 distinct records is on disk.
+    let (status, body) = relay
+        .request(
+            "GET",
+            &format!("/v1/{}/keys", scope_path(org_scope())),
+            Some(&devices[0].token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["keys"].as_array().unwrap().len(),
+        32,
+        "no acked record may be lost to a racing publish\n{body}"
+    );
+}

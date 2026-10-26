@@ -23,7 +23,7 @@ use pursecraft_core::sync::LogError;
 use pursecraft_core::wire::OpMeta;
 
 use crate::auth::AuthError;
-use crate::keys::{KeyStoreError, MAX_KEY_RECORDS};
+use crate::keys::KeyStoreError;
 use crate::state::{AppState, StateError};
 
 /// The envelope version every body carries (ADR 0024); unknown versions
@@ -612,9 +612,6 @@ async fn publish_keys(
             "key batch of {} exceeds {MAX_KEY_BATCH} records",
             req.keys.len()
         )));
-    }
-    if req.keys.len() > MAX_KEY_RECORDS {
-        return Err(ApiError::too_large("too many key records"));
     }
     let stored = state.keys.publish(org, device, &req.keys)?;
     Ok((

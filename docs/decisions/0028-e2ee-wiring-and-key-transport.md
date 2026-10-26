@@ -309,6 +309,16 @@ shared with whoever is admitted; rotation protects the future only.
   [ADR 0025](0025-authenticated-first-clients.md) already says for restore.
   Losing `keyring.json` alone is recoverable while the relay still holds the
   org's records.
+- **A wrap's coverage label is a claim, so coverage is read from the device's
+  own keyring, not from the relay.** `to` exists to stop a key-holder minting
+  a fresh wrap on every sync; if coverage were computed from served records, a
+  grant-holding member could pre-empt any peer's wrap with one forged
+  `to: <victim>` entry — this device's own keyring, which only it writes, is
+  the only trustworthy source. The same reasoning applies to a `device`
+  record: it is usable only when the relay's authenticated `pushed_by` stamp
+  matches its claimed id, so no member registers a key on another's behalf.
+  Both are cheap hardening against a member, and neither is a fix for the
+  forgery gap below.
 - **Wrap authenticity is still unproven, and the channel now makes the gap
   concrete.** Anyone holding a device's public key can wrap *some* epoch key
   to it — including a hostile relay, which learns every public key from the
@@ -322,6 +332,13 @@ shared with whoever is admitted; rotation protects the future only.
   [ADR 0022](0022-client-side-e2ee.md) already states. Until then the honest
   claim is "the relay cannot read the data", not "the relay cannot disrupt
   the key channel".
+- **Install conflicts are loud, and that includes the crash story.** A wrap
+  addressed to this device that lands in a slot already holding different
+  material fails as `WrongKeySlot` — surfaced, not skipped. The one window
+  that is *not* loud is a wrap sealed to a key this device no longer has:
+  losing `device.key` loses the world, and a torn keyring is completed by the
+  next capture (a founder) or the next `sync` (a joiner), because both mints
+  are idempotent and re-run. Those resumability claims are pinned by tests.
 - **Competing wraps for one slot adopt in relay order.** When two survivors
   mint an epoch concurrently (rotation, later slice), installs conflict
   loudly ([ADR 0022](0022-client-side-e2ee.md)) but *which* one a device

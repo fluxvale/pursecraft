@@ -283,21 +283,32 @@ impl World {
         Ok(LocalStore::open_with(&path, self.cipher()?)?)
     }
 
-    /// The first writing command of a device that creates a world (ADR 0028):
-    /// create the device key and an empty founding keyring, then mint epoch 0
-    /// for the org and one data key per log. Idempotent — a second call loads
-    /// what exists. Runs before the stores exist, so a crash leaves either a
-    /// complete keyring or a resumable one, never an op sealed under a key
-    /// that was not written down.
+    /// The founding device's key mint (ADR 0028): create the device key and a
+    /// founding keyring if absent, then mint epoch 0 for the org and one data
+    /// key per log that has none. Idempotent and **resumable**: it runs on
+    /// every capture of a home that founded its world, so a crash between the
+    /// org key and a log key completes on the next command instead of leaving
+    /// a permanently keyless home. Runs before the stores exist, so a crash
+    /// leaves either a complete keyring or a resumable one, never an op sealed
+    /// under a key that was not written down.
     pub fn found(&mut self, identity: &Identity, device: DeviceId) -> Result<(), KeysError> {
         match &self.mode {
             Mode::Plain => return Ok(()),
-            Mode::Sealed(_) => return Ok(()),
-            Mode::Absent { .. } => {}
+            Mode::Absent { .. } => {
+                // A keyring with no device key (a crash inside `Keys::init`)
+                // is completed here; nothing is bound yet.
+                self.mode = Mode::Sealed(Keys::init(&self.home, true)?);
+            }
+            Mode::Sealed(keys) => {
+                // Only a founding home mints; a joiner's keys arrive wrapped.
+                if !keys.sealed.founded {
+                    return Ok(());
+                }
+            }
         }
-        let keys = Keys::init(&self.home, true)?;
-        keys.ensure_founder_keys(&self.home, identity, device)?;
-        self.mode = Mode::Sealed(keys);
+        if let Mode::Sealed(keys) = &self.mode {
+            keys.ensure_founder_keys(&self.home, identity, device)?;
+        }
         Ok(())
     }
 
@@ -336,6 +347,30 @@ impl World {
                 .to_wire(),
             ),
         }
+    }
+
+    /// The epochs this device has already wrapped for `to` — read from its own
+    /// keyring, so coverage is a fact the device controls rather than a claim
+    /// it read off the relay (a member cannot suppress a peer's wrap this
+    /// way; ADR 0028's consequence about wrap authenticity stands separately).
+    pub fn wrapped_epochs_for(&self, org: OrgId, to: DeviceId) -> BTreeSet<u64> {
+        let Mode::Sealed(keys) = &self.mode else {
+            return BTreeSet::new();
+        };
+        keys.sealed
+            .records
+            .borrow()
+            .iter()
+            .filter_map(|entry| {
+                let record = KeyRecord::parse(&entry.wire).ok()?;
+                match record {
+                    KeyRecord::Org { to: target, wrap } if target == to && wrap.org == org => {
+                        Some(wrap.epoch)
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     /// Wrap the org's held epoch keys to `to`, skipping the epochs it already
@@ -547,30 +582,48 @@ impl Keys {
         {
             return Ok(false);
         }
+        // Ownership is decided by the cryptography, not the labels — but only
+        // "does not open for me" is a skip. A wrap addressed to this device
+        // that fails with anything else is a loud conflict (ADR 0022: a held
+        // slot holding different material is the rotation race, never a silent
+        // no-op), and so is a log wrap whose epoch key this chain holds.
         match &record {
             KeyRecord::Device { .. } => return Ok(false),
             KeyRecord::Org { wrap, .. } => {
-                if self
-                    .sealed
-                    .chain
-                    .borrow_mut()
-                    .install_org_wrap(wrap)
-                    .is_err()
-                {
-                    // Not addressed to this device — every other member's
-                    // wrap, on every pull.
-                    return Ok(false);
+                match self.sealed.chain.borrow_mut().install_org_wrap(wrap) {
+                    Ok(()) => {}
+                    // A wrap sealed to another device's key derives the wrong
+                    // wrap key and fails authentication. That is every other
+                    // member's wrap, on every pull.
+                    Err(CryptoError::Auth) => return Ok(false),
+                    // Everything else — a held slot with different material above
+                    // all — is the loud conflict ADR 0022 refuses to resolve
+                    // silently, never a quiet skip.
+                    Err(other) => return Err(KeysError::Crypto(other)),
                 }
             }
             KeyRecord::Log { wrap } => {
-                if self
+                let holds_epoch_key = self
+                    .sealed
+                    .chain
+                    .borrow()
+                    .current_epoch(&org)
+                    .is_some_and(|held| held >= wrap.epoch);
+                match self
                     .sealed
                     .chain
                     .borrow_mut()
                     .install_log_wrap_for_org(wrap, &org)
-                    .is_err()
                 {
-                    return Ok(false);
+                    Ok(()) => {}
+                    // A log wrap before its org wrap is the ordinary
+                    // out-of-order pull; the two-pass install retries it, and
+                    // the next sync retries again.
+                    Err(CryptoError::MissingEpoch { .. }) if !holds_epoch_key => return Ok(false),
+                    // Addressed at an epoch we hold, and it still refused:
+                    // either a conflicting re-wrap of a held slot or a
+                    // misroute — both loud (ADR 0022).
+                    Err(other) => return Err(KeysError::Crypto(other)),
                 }
             }
         }
@@ -702,14 +755,17 @@ fn read_device_key(path: &Path) -> Result<Option<DeviceKeypair>, KeysError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let bytes: [u8; 32] = bytes
+    // Validation reads the length before anything copies the secret; the
+    // bytes are never printed and live only as long as this frame.
+    let len = bytes.len();
+    let secret: [u8; 32] = bytes
         .as_slice()
         .try_into()
         .map_err(|_| KeysError::BadDeviceKey {
             path: path.to_owned(),
-            len: bytes.len(),
+            len,
         })?;
-    Ok(Some(DeviceKeypair::from_secret_bytes(bytes)))
+    Ok(Some(DeviceKeypair::from_secret_bytes(secret)))
 }
 
 /// The keyring's on-disk shape (ADR 0028).

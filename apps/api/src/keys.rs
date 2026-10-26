@@ -13,6 +13,8 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -85,9 +87,15 @@ impl From<io::Error> for KeyStoreError {
 /// Append-only-by-record set semantics: pushing an exact string twice is a
 /// no-op (at-least-once delivery, ADR 0022's channel contract), and the first
 /// pusher of a given string keeps its stamp.
+///
+/// Every access holds the one lock: a publish is a read-modify-write over a
+/// whole file, so two concurrent syncs (the ordinary two-device case) would
+/// otherwise lose acked records or rename a half-written file into place —
+/// exactly the failure the logs' per-scope mutex prevents (ADR 0024).
 #[derive(Debug)]
 pub struct KeyStore {
     dir: PathBuf,
+    lock: Mutex<()>,
 }
 
 impl KeyStore {
@@ -95,7 +103,10 @@ impl KeyStore {
     pub fn open(data_dir: &Path) -> Result<Self, KeyStoreError> {
         let dir = data_dir.join("keys");
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            lock: Mutex::new(()),
+        })
     }
 
     fn path(&self, org: OrgId) -> PathBuf {
@@ -103,6 +114,7 @@ impl KeyStore {
             .join(format!("org-{}.json", org.as_uuid().simple()))
     }
 
+    /// The unlocked read; every public entry point holds [`Self::lock`].
     fn read(&self, org: OrgId) -> Result<Vec<KeyRow>, KeyStoreError> {
         let path = self.path(org);
         let bytes = match fs::read(&path) {
@@ -139,6 +151,7 @@ impl KeyStore {
                 return Err(KeyStoreError::TooLarge);
             }
         }
+        let _guard = self.lock.lock().expect("key store lock");
         let mut rows = self.read(org)?;
         let mut seen: HashSet<String> = rows.iter().map(|row| row.key.clone()).collect();
         for record in records {
@@ -157,7 +170,15 @@ impl KeyStore {
             v: KEY_FILE_VERSION,
             keys: rows,
         };
-        let tmp = path.with_extension("json.tmp");
+        // A process-unique tmp: concurrent publishes (serialized by the lock
+        // above) and any future multi-threaded caller each own their file.
+        static TMP: AtomicU64 = AtomicU64::new(0);
+        let tmp = self.dir.join(format!(
+            "org-{}.{}.{}.tmp",
+            org.as_uuid().simple(),
+            std::process::id(),
+            TMP.fetch_add(1, Ordering::Relaxed),
+        ));
         {
             let mut out = File::create(&tmp)?;
             out.write_all(
@@ -180,6 +201,7 @@ impl KeyStore {
 
     /// Every record the org holds, with its pusher.
     pub fn records(&self, org: OrgId) -> Result<Vec<KeyRow>, KeyStoreError> {
+        let _guard = self.lock.lock().expect("key store lock");
         self.read(org)
     }
 }
