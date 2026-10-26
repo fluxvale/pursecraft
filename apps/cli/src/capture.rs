@@ -27,6 +27,7 @@ use pursecraft_core::sync::SyncSession;
 use crate::amount;
 use crate::home::{Identity, IdentityError, budget_log, load_or_create_identity, org_log};
 use crate::idmint::mint_uuid;
+use crate::session::Session;
 use crate::sink;
 
 /// The bootstrapped organization's name (ADR 0023: fixed constants until a
@@ -191,8 +192,14 @@ impl From<std::io::Error> for CaptureError {
 /// Capture one transaction (ADR 0023): parse, ensure the bootstrapped
 /// world, resolve account and payee read-then-mint, append the ops through
 /// the [`sink`], return the receipt. Input parsing comes first so a bad
-/// amount or date never creates files.
-pub fn add(home: &Path, raw: &RawAdd<'_>, today: Date) -> Result<Receipt, CaptureError> {
+/// amount or date never creates files. The enrollment's device mints the
+/// ops (ADR 0025) — the relay refuses another device's.
+pub fn add(
+    home: &Path,
+    session: &Session,
+    raw: &RawAdd<'_>,
+    today: Date,
+) -> Result<Receipt, CaptureError> {
     let payee = raw.payee.trim();
     if payee.is_empty() {
         return Err(CaptureError::EmptyPayee);
@@ -205,8 +212,8 @@ pub fn add(home: &Path, raw: &RawAdd<'_>, today: Date) -> Result<Receipt, Captur
         None => today,
     };
 
-    let (identity, bootstrapped) = load_or_create_identity(home)?;
-    let mut minter = Minter::new(&identity);
+    let (identity, bootstrapped) = load_or_create_identity(home, session.device_id)?;
+    let mut minter = Minter::new(session, &identity);
 
     // Org side (ADR 0021): provisioning + the budget registry entry.
     let org_path = org_log(home, identity.org_id);
@@ -286,29 +293,31 @@ pub fn add(home: &Path, raw: &RawAdd<'_>, today: Date) -> Result<Receipt, Captur
 
 /// The device's op mint (ADR 0023): owns the HLC — seeded from the booted
 /// sessions (receive-merge discipline, ADR 0017) so post-boot ticks outrank
-/// every stored op — and mints ids.
-struct Minter {
+/// every stored op — and mints ids. Ops carry the SESSION's device (ADR
+/// 0025: the relay enforces caller == `meta.device_id`) and the world's
+/// user (ADR 0023).
+pub(crate) struct Minter {
     device_id: DeviceId,
     user_id: UserId,
     clock: Hlc,
 }
 
 impl Minter {
-    fn new(identity: &Identity) -> Self {
+    pub(crate) fn new(session: &Session, identity: &Identity) -> Self {
         Self {
-            device_id: identity.device_id,
+            device_id: session.device_id,
             user_id: identity.user_id,
             clock: Hlc::now(),
         }
     }
 
     /// Receive a booted session's clock (ADR 0017).
-    fn absorb(&mut self, remote: Hlc) {
+    pub(crate) fn absorb(&mut self, remote: Hlc) {
         self.clock.merge(remote);
     }
 
     /// Mint one op at the next local tick.
-    fn op_now(
+    pub(crate) fn op_now(
         &mut self,
         scope: ScopeId,
         kind: EntityKind,
@@ -323,7 +332,7 @@ impl Minter {
 
     /// Mint one op at an explicit stamp — the anchored-stamp path for
     /// bootstrap writes (ADR 0021's stale-retry guard).
-    fn op_at(
+    pub(crate) fn op_at(
         &mut self,
         hlc: Hlc,
         scope: ScopeId,
@@ -349,7 +358,7 @@ impl Minter {
 /// The entity id's own UUIDv7 millisecond, logical zero (ADR 0021's
 /// anchoring convention): bootstrap writes stamped here lose every
 /// contested field on merge to any device that has seen the entity.
-fn anchored_at(id: EntityId) -> Hlc {
+pub(crate) fn anchored_at(id: EntityId) -> Hlc {
     Hlc {
         physical_ms: (id.as_uuid().as_u128() >> 80) as u64,
         logical: 0,
@@ -358,7 +367,7 @@ fn anchored_at(id: EntityId) -> Hlc {
 
 /// Boot a session from a store — read-then-mint's read half, the ordinary
 /// replay path (ADR 0018).
-fn boot(store: &LocalStore) -> Result<SyncSession, ApplyError> {
+pub(crate) fn boot(store: &LocalStore) -> Result<SyncSession, ApplyError> {
     let mut session = SyncSession::new();
     session.apply_delta(store.delta_since(0))?;
     Ok(session)
@@ -460,16 +469,10 @@ fn ensure_account(
     Ok(emitted)
 }
 
-/// Resolve the capture account (ADR 0023): `wanted` by exact live name
-/// (earliest id on duplicates — ADR 0016's deterministic convention), or
-/// the bootstrapped account — which must itself be live: a dead or missing
-/// default is a loud error, never a silent fabrication that `list` would
-/// then hide the transaction behind.
-fn resolve_account(
-    state: &ScopeState,
-    wanted: Option<&str>,
-    default: EntityId,
-) -> Result<(EntityId, String), CaptureError> {
+/// The state's live, named accounts as `(id, name)` pairs, earliest id
+/// first (ADR 0016's deterministic convention) — the one enumeration both
+/// capture's account resolution and sync's joiner adoption read.
+pub(crate) fn live_accounts(state: &ScopeState) -> Vec<(EntityId, String)> {
     let mut accounts: Vec<(EntityId, String)> = state
         .entities()
         .filter_map(|entity| match entity {
@@ -481,6 +484,20 @@ fn resolve_account(
         })
         .collect();
     accounts.sort();
+    accounts
+}
+
+/// Resolve the capture account (ADR 0023): `wanted` by exact live name
+/// (earliest id on duplicates — ADR 0016's deterministic convention), or
+/// the bootstrapped account — which must itself be live: a dead or missing
+/// default is a loud error, never a silent fabrication that `list` would
+/// then hide the transaction behind.
+fn resolve_account(
+    state: &ScopeState,
+    wanted: Option<&str>,
+    default: EntityId,
+) -> Result<(EntityId, String), CaptureError> {
+    let accounts = live_accounts(state);
     let find_by_name = |name: &str| accounts.iter().find(|(_, known)| known == name).cloned();
     let known = || accounts.iter().map(|(_, name)| name.clone()).collect();
     match wanted {
@@ -527,6 +544,21 @@ mod tests {
         Date::new(2026, 10, 25).unwrap()
     }
 
+    /// A synthetic enrollment (ADR 0025): the session struct only — no
+    /// relay, no session file; capture is offline.
+    fn session() -> crate::session::Session {
+        crate::session::Session {
+            version: 1,
+            server: "http://127.0.0.1:9".into(),
+            device_id: DeviceId::new(mint_uuid()).unwrap(),
+            token: "test-only".into(),
+        }
+    }
+
+    fn add_cmd(home: &Path, raw: &RawAdd<'_>) -> Result<Receipt, CaptureError> {
+        add(home, &session(), raw, today())
+    }
+
     fn raw<'a>(payee: &'a str, amount: &'a str) -> RawAdd<'a> {
         RawAdd {
             payee,
@@ -554,7 +586,7 @@ mod tests {
     fn capture_round_trips_command_to_replayed_state() {
         let tmp = TempDir::new("roundtrip");
         let home = tmp.path();
-        let receipt = add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        let receipt = add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         assert!(receipt.bootstrapped);
         assert!(receipt.new_payee);
         assert_eq!(receipt.amount, Milliunits::from_milli(-4_500));
@@ -639,13 +671,13 @@ mod tests {
     fn second_capture_reuses_the_payee_and_mints_only_transaction_ops() {
         let tmp = TempDir::new("reuse");
         let home = tmp.path();
-        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         let (identity, store) = reopened(home);
         let tip = store.tip();
         let org_tip_before = org_tip(home, &identity);
         drop(store);
 
-        let receipt = add(home, &raw("coffee", "-8"), today()).unwrap();
+        let receipt = add_cmd(home, &raw("coffee", "-8")).unwrap();
         assert!(!receipt.bootstrapped, "bootstrap happened once");
         assert!(!receipt.new_payee, "the payee is reused");
 
@@ -682,7 +714,7 @@ mod tests {
     fn idempotent_re_runs() {
         let tmp = TempDir::new("idempotent");
         let home = tmp.path();
-        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         let (identity, store) = reopened(home);
         let tip = store.tip();
         let org_tip_before = org_tip(home, &identity);
@@ -690,7 +722,7 @@ mod tests {
 
         // A later add re-ensures the world: no bootstrap ops re-landed —
         // `bread` is a new payee, so six ops land (payee + transaction).
-        add(home, &raw("bread", "-2"), today()).unwrap();
+        add_cmd(home, &raw("bread", "-2")).unwrap();
         let (_, store) = reopened(home);
         assert_eq!(
             org_tip(home, &identity),
@@ -726,7 +758,7 @@ mod tests {
     fn minter_absorbs_the_log_clock() {
         let tmp = TempDir::new("absorb");
         let home = tmp.path();
-        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         let (identity, mut store) = reopened(home);
         let mut session = SyncSession::new();
         session.apply_delta(store.delta_since(0)).unwrap();
@@ -761,7 +793,7 @@ mod tests {
         drop(store);
 
         // …and the next capture (payee reused, five ops) still mints above it.
-        add(home, &raw("coffee", "-2"), today()).unwrap();
+        add_cmd(home, &raw("coffee", "-2")).unwrap();
         let (_, store) = reopened(home);
         let fresh: Vec<Op> = store.delta_since(tip).map(|s| s.op.clone()).collect();
         assert_eq!(fresh.len(), 5);
@@ -804,14 +836,14 @@ mod tests {
     fn a_payee_only_torn_capture_is_resumed_not_duplicated() {
         let tmp = TempDir::new("torn-payee");
         let home = tmp.path();
-        let (identity, _) = load_or_create_identity(home).unwrap();
+        let (identity, _) = load_or_create_identity(home, session().device_id).unwrap();
         seed_budget_op(
             home,
             &identity,
             payee_name_op(&identity, EntityId::new(mint_uuid()).unwrap(), "coffee"),
         );
 
-        let receipt = add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        let receipt = add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         assert!(!receipt.new_payee, "the torn attempt's payee is reused");
         let (_, store) = reopened(home);
         assert_eq!(store.tip(), 8, "payee(1) + account(2) + transaction(5)");
@@ -834,7 +866,7 @@ mod tests {
     fn a_half_written_account_is_completed_not_redone() {
         let tmp = TempDir::new("torn-account");
         let home = tmp.path();
-        let (identity, _) = load_or_create_identity(home).unwrap();
+        let (identity, _) = load_or_create_identity(home, session().device_id).unwrap();
         seed_budget_op(
             home,
             &identity,
@@ -851,7 +883,7 @@ mod tests {
             },
         );
 
-        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         let (_, store) = reopened(home);
         // Seeded name + emitted kind + payee + 5 transaction ops.
         assert_eq!(store.tip(), 8);
@@ -870,7 +902,7 @@ mod tests {
     fn a_partial_org_provisioning_is_completed() {
         let tmp = TempDir::new("torn-org");
         let home = tmp.path();
-        let (identity, _) = load_or_create_identity(home).unwrap();
+        let (identity, _) = load_or_create_identity(home, session().device_id).unwrap();
         let org_path = org_log(home, identity.org_id);
         std::fs::create_dir_all(org_path.parent().unwrap()).unwrap();
         let mut org_store = LocalStore::open(&org_path).unwrap();
@@ -892,7 +924,7 @@ mod tests {
         }
         drop(org_store);
 
-        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         assert_eq!(
             org_tip(home, &identity),
             5,
@@ -919,7 +951,7 @@ mod tests {
     fn a_torn_transaction_renders_unknown_cells() {
         let tmp = TempDir::new("torn-txn");
         let home = tmp.path();
-        add(home, &raw("coffee", "-4.50"), today()).unwrap();
+        add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         let identity = load_identity(home).unwrap().unwrap();
         let torn = EntityId::new(mint_uuid()).unwrap();
         seed_budget_op(
@@ -941,7 +973,7 @@ mod tests {
             },
         );
 
-        let list = crate::list::list(home).unwrap();
+        let list = crate::list::list(home, &session()).unwrap();
         let torn_row = list
             .lines()
             .find(|l| l.contains('?'))
@@ -965,7 +997,7 @@ mod tests {
     fn flags_select_date_and_account() {
         let tmp = TempDir::new("flags");
         let home = tmp.path();
-        let receipt = add(
+        let receipt = add_cmd(
             home,
             &RawAdd {
                 payee: "Meralco",
@@ -973,13 +1005,12 @@ mod tests {
                 date: Some("2026-10-24"),
                 account: Some(ACCOUNT_NAME),
             },
-            today(),
         )
         .unwrap();
         assert_eq!(receipt.date, Date::new(2026, 10, 24).unwrap());
         assert_eq!(receipt.account_name, ACCOUNT_NAME);
         // An invalid calendar date is a loud error, not a normalized one.
-        let err = add(
+        let err = add_cmd(
             home,
             &RawAdd {
                 payee: "x",
@@ -987,7 +1018,6 @@ mod tests {
                 date: Some("2026-02-30"),
                 account: None,
             },
-            today(),
         )
         .unwrap_err();
         assert!(matches!(err, CaptureError::Date { .. }), "{err}");
@@ -997,7 +1027,7 @@ mod tests {
     fn unknown_account_lists_the_known_ones() {
         let tmp = TempDir::new("account");
         let home = tmp.path();
-        let err = add(
+        let err = add_cmd(
             home,
             &RawAdd {
                 payee: "coffee",
@@ -1005,7 +1035,6 @@ mod tests {
                 date: None,
                 account: Some("Nope"),
             },
-            today(),
         )
         .unwrap_err();
         match err {
@@ -1016,7 +1045,7 @@ mod tests {
             other => panic!("expected UnknownAccount, got {other}"),
         }
         assert!(
-            add(home, &raw("coffee", "4.50"), today()).is_err(),
+            add_cmd(home, &raw("coffee", "4.50")).is_err(),
             "unsigned amounts are rejected"
         );
     }

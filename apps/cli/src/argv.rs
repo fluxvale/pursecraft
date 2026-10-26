@@ -7,7 +7,8 @@
 
 use std::fmt;
 
-/// One parsed command line (ADR 0023's surface).
+/// One parsed command line (ADR 0023's surface, grown by ADR 0025's
+/// enrollment gate and first sync).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Cmd {
     /// `add <payee> <amount> [--date YYYY-MM-DD] [--account <name>]` —
@@ -21,6 +22,22 @@ pub enum Cmd {
     },
     /// `list` — the minimal recap.
     List,
+    /// `login <server-url>` — enroll against the relay; the enrollment
+    /// secret rides stdin (ADR 0025).
+    Login { server: String },
+    /// `sync` — push the outbox and pull deltas through the relay
+    /// (ADR 0025).
+    Sync,
+    /// `pair` — mint pairing codes and print the join command (ADR 0025).
+    Pair,
+    /// `join <org-id> <org-code> <budget-id> <budget-code>` — bring a
+    /// second device into an existing world (ADR 0025).
+    Join {
+        org_id: String,
+        org_code: String,
+        budget_id: String,
+        budget_code: String,
+    },
     /// `--help` / `help`.
     Help,
     /// `--version` / `version`.
@@ -42,7 +59,11 @@ impl std::error::Error for UsageError {}
 /// The usage block every usage error carries.
 pub const USAGE: &str = "usage: pursecraft add <payee> <amount> \
                          [--date YYYY-MM-DD] [--account <name>]\n       \
-                         pursecraft list";
+                         pursecraft list\n       \
+                         pursecraft login <relay-url>\n       \
+                         pursecraft sync\n       \
+                         pursecraft pair\n       \
+                         pursecraft join <org-id> <org-code> <budget-id> <budget-code>";
 
 /// The `--help` text.
 pub const HELP: &str = "\
@@ -51,18 +72,32 @@ pursecraft — fast local-first transaction capture
 usage:
   pursecraft add <payee> <amount> [--date YYYY-MM-DD] [--account <name>]
   pursecraft list
+  pursecraft login <relay-url>
+  pursecraft sync
+  pursecraft pair
+  pursecraft join <org-id> <org-code> <budget-id> <budget-code>
 
 commands:
   add    record a transaction; spending is negative, income positive
          (add coffee -4.50), amounts allow up to 3 fraction digits
   list   show the most recent transactions
 
+  login  enroll this device with the relay (once; the enrollment secret
+         is read from stdin, one line); capture stays fully offline
+  sync   push captured ops to the relay and pull deltas back
+  pair   print a join command (fresh single-use pairing codes) for
+         another device
+  join   bring this fresh device into an existing relay world using the
+         codes pursecraft pair printed there
+
 options:
   --date YYYY-MM-DD   transaction date (default: today)
   --account <name>    account to file under (default: Wallet)
 
 data lives under the pursecraft data home (PURSECRAFT_HOME overrides);
-capture is offline by design — sync arrives in a later release.";
+every command except help and version requires a one-time enrollment
+(pursecraft login) — afterwards capture works fully offline, and
+pursecraft sync sends and receives when the relay is reachable";
 
 /// Parse the arguments after the program name.
 ///
@@ -82,6 +117,48 @@ pub fn parse(args: &[String]) -> Result<Cmd, UsageError> {
                 Ok(Cmd::List)
             } else {
                 Err(UsageError(format!("list takes no arguments, got {rest:?}")))
+            }
+        }
+        "login" => {
+            if rest.len() != 1 {
+                Err(UsageError(format!(
+                    "login takes exactly one relay url (http://host:port), got {rest:?}"
+                )))
+            } else {
+                Ok(Cmd::Login {
+                    server: rest[0].clone(),
+                })
+            }
+        }
+        "sync" => {
+            if rest.is_empty() {
+                Ok(Cmd::Sync)
+            } else {
+                Err(UsageError(format!("sync takes no arguments, got {rest:?}")))
+            }
+        }
+        "pair" => {
+            if rest.is_empty() {
+                Ok(Cmd::Pair)
+            } else {
+                Err(UsageError(format!("pair takes no arguments, got {rest:?}")))
+            }
+        }
+        "join" => {
+            if rest.len() == 4 {
+                let [org_id, org_code, budget_id, budget_code] = rest else {
+                    unreachable!("checked length");
+                };
+                Ok(Cmd::Join {
+                    org_id: org_id.clone(),
+                    org_code: org_code.clone(),
+                    budget_id: budget_id.clone(),
+                    budget_code: budget_code.clone(),
+                })
+            } else {
+                Err(UsageError(format!(
+                    "join takes <org-id> <org-code> <budget-id> <budget-code>, got {rest:?}"
+                )))
             }
         }
         "--help" | "help" => {
@@ -243,6 +320,43 @@ mod tests {
                     .contains(&format!("{alias:?} takes no arguments")),
                 "{err}"
             );
+        }
+    }
+
+    /// The ADR 0025 surface: login/sync/pair/join parse exactly their
+    /// shapes and teach on the wrong ones.
+    #[test]
+    fn enrollment_commands_parse() {
+        assert_eq!(
+            parse(&args(&["login", "http://127.0.0.1:8080"])),
+            Ok(Cmd::Login {
+                server: "http://127.0.0.1:8080".into()
+            })
+        );
+        assert_eq!(parse(&args(&["sync"])), Ok(Cmd::Sync));
+        assert_eq!(parse(&args(&["pair"])), Ok(Cmd::Pair));
+        let join = parse(&args(&["join", "o", "co", "b", "cb"])).unwrap();
+        assert_eq!(
+            join,
+            Cmd::Join {
+                org_id: "o".into(),
+                org_code: "co".into(),
+                budget_id: "b".into(),
+                budget_code: "cb".into()
+            }
+        );
+        for (line, want) in [
+            (args(&["login"]), "exactly one relay url"),
+            (args(&["login", "a", "b"]), "exactly one relay url"),
+            (args(&["sync", "x"]), "sync takes no arguments"),
+            (args(&["pair", "x"]), "pair takes no arguments"),
+            (args(&["join", "a", "b", "c"]), "join takes"),
+            (args(&["join", "a", "b", "c", "d", "e"]), "join takes"),
+        ] {
+            let err = parse(&line)
+                .err()
+                .unwrap_or_else(|| panic!("{line:?} parsed"));
+            assert!(err.to_string().contains(want), "{err} lacks {want:?}");
         }
     }
 }

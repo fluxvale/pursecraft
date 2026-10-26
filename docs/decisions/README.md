@@ -46,3 +46,5 @@ their replacement.
 | [0021](0021-organizations-own-budgets.md) | Organizations own budgets: personal-org-per-user, memberships with roles | Accepted |
 | [0022](0022-client-side-e2ee.md) | Client-side E2EE: envelope encryption over the payload choke point | Accepted |
 | [0023](0023-capture-cli.md) | Capture CLI: fast local transaction capture | Accepted |
+| [0024](0024-rendezvous-sync-relay.md) | Rendezvous sync relay: HTTP delta relay on apps/api | Accepted |
+| [0025](0025-authenticated-first-clients.md) | Authenticated-first clients: enrollment gate and first sync | Accepted |

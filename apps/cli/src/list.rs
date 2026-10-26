@@ -15,6 +15,8 @@ use pursecraft_core::store::{LocalStore, StoreError};
 use pursecraft_core::sync::SyncSession;
 
 use crate::home::{IdentityError, budget_log, load_identity};
+use crate::session::Session;
+use crate::sync;
 
 /// How many transactions `list` shows (ADR 0023's minimal recap).
 pub const RECENT: usize = 10;
@@ -26,6 +28,8 @@ pub enum ListError {
     Store(StoreError),
     /// A stored op was rejected during replay — loud, never merged.
     Apply(ApplyError),
+    /// The pending-sync count failed (ADR 0011's badge must not lie).
+    Sync(sync::SyncError),
 }
 
 impl fmt::Display for ListError {
@@ -34,6 +38,7 @@ impl fmt::Display for ListError {
             Self::Identity(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Apply(e) => write!(f, "stored op rejected by the engine: {e}"),
+            Self::Sync(e) => write!(f, "{e}"),
         }
     }
 }
@@ -44,6 +49,7 @@ impl std::error::Error for ListError {
             Self::Identity(e) => Some(e),
             Self::Store(e) => Some(e),
             Self::Apply(e) => Some(e),
+            Self::Sync(e) => Some(e),
         }
     }
 }
@@ -66,23 +72,33 @@ impl From<ApplyError> for ListError {
     }
 }
 
+impl From<sync::SyncError> for ListError {
+    fn from(e: sync::SyncError) -> Self {
+        Self::Sync(e)
+    }
+}
+
 const EMPTY: &str = "no transactions yet\n\ntry: pursecraft add coffee -4.50\n";
 
 /// Render the recap for the data home at `home` (ADR 0023): the last
-/// [`RECENT`] visible transactions, newest first, with a count footer.
-/// Read-only — an absent world shows the getting-started hint.
-pub fn list(home: &Path) -> Result<String, ListError> {
+/// [`RECENT`] visible transactions, newest first, with a count footer —
+/// and, when captures wait for the relay, the visible pending-sync badge
+/// (ADR 0011, ADR 0025). Read-only — an absent world shows the
+/// getting-started hint.
+pub fn list(home: &Path, session: &Session) -> Result<String, ListError> {
     let Some(identity) = load_identity(home)? else {
         return Ok(EMPTY.to_owned());
     };
+    // The badge (ADR 0025): derived, never stored; zero after a sync.
+    let pending = sync::pending_count(home, session, &identity)?;
     let path = budget_log(home, identity.budget_id);
     if !path.exists() {
-        return Ok(EMPTY.to_owned());
+        return Ok(with_pending(EMPTY.to_owned(), pending));
     }
     let store = LocalStore::open(&path)?;
-    let mut session = SyncSession::new();
-    session.apply_delta(store.delta_since(0))?;
-    let state = session.state();
+    let mut replay = SyncSession::new();
+    replay.apply_delta(store.delta_since(0))?;
+    let state = replay.state();
 
     let mut rows: Vec<(Option<Date>, String, String, String, TransactionId)> = Vec::new();
     for entity in state.entities() {
@@ -95,7 +111,7 @@ pub fn list(home: &Path) -> Result<String, ListError> {
         rows.push(row(state, txn));
     }
     if rows.is_empty() {
-        return Ok(EMPTY.to_owned());
+        return Ok(with_pending(EMPTY.to_owned(), pending));
     }
     // Newest first: date descending, then id descending (UUIDv7 is
     // chronological within clock skew — ADR 0016). Undated transactions
@@ -114,7 +130,19 @@ pub fn list(home: &Path) -> Result<String, ListError> {
     } else {
         out.push_str(&format!("\n{total} transactions\n"));
     }
-    Ok(out)
+    Ok(with_pending(out, pending))
+}
+
+/// Append the pending-sync badge (ADR 0011) when captures wait for the
+/// relay; a synced home shows nothing extra (feedback first, never noise).
+fn with_pending(mut out: String, pending: u64) -> String {
+    if pending > 0 {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("{pending} pending sync — run: pursecraft sync\n"));
+    }
+    out
 }
 
 /// One recap row: (date key for ordering, date cell, resolved live payee

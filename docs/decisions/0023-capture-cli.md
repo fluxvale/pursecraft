@@ -2,6 +2,9 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-25
+- **Amended (in part) by:** [ADR 0025](0025-authenticated-first-clients.md) —
+  the zero-setup bootstrap clause: first capture follows one-time
+  enrollment.
 - **Builds on:** [ADR 0006](0006-integer-money.md),
   [ADR 0007](0007-oplog-sync-protocol.md),
   [ADR 0009](0009-e2ee-opaque-payloads.md),
@@ -39,6 +42,9 @@ per [ADR 0011](0011-capture-first-mobile.md). "Fast" is boot-to-exit well under
 a second: the work is opening two small store files, replaying them through
 the ordinary `SyncSession` path, minting ops, and appending — linear in op
 count and milliseconds for years of captures.
+*(Amended by [ADR 0025](0025-authenticated-first-clients.md): the sync slice
+has landed — `pursecraft sync` is networked, manually invoked; capture itself
+stays offline, and a one-time enrollment gate now precedes every command.)*
 
 ### Command surface: `add` and `list`
 
@@ -168,7 +174,12 @@ clock and OS entropy, so no `rng` feature and no `rand` tree),
 would misdate every capture west of midnight UTC; license `Unlicense OR MIT`,
 satisfied by the deny-list's MIT; the resolved unix build pulls just
 `jiff-core`, while Cargo.lock additionally pins jiff's optional and
-other-target dependencies). No floats (workspace guard), no `unsafe`
+other-target dependencies).
+*(Amended by [ADR 0025](0025-authenticated-first-clients.md): `minreq`
+(no default features, `json-using-serde` only — zero new transitive
+dependencies, license ISC per deny.toml) joins for the relay's plain-HTTP
+sync surface.)*
+No floats (workspace guard), no `unsafe`
 (workspace forbid) — which rules out `std::env::set_var` in tests, so the
 library is fully injectable: explicit home paths, explicit `today`, argv as
 a slice; the environment is read only in `data_home()` and the thin
@@ -195,8 +206,11 @@ a slice; the environment is read only in `data_home()` and the thin
 
 ## Consequences
 
-- First capture works with zero setup: `pursecraft add coffee -4.50` and the
-  org/budget/account world exists, durably, offline.
+- First capture works with zero setup *(amended by
+  [ADR 0025](0025-authenticated-first-clients.md): after one-time enrollment —
+  `pursecraft login <relay-url>`; bootstrap mechanics are unchanged)*:
+  `pursecraft add coffee -4.50` and the org/budget/account world exists,
+  durably, offline.
 - The core is untouched — the parallel lanes rebase onto an unchanged core.
 - The sign convention is learned once from a helpful error; the confirmation
   line always shows the stored signed amount.
@@ -204,5 +218,7 @@ a slice; the environment is read only in `data_home()` and the thin
   change when that lane lands.
 - Everything is pending sync (none exists yet) — the pending-sync badge of
   [ADR 0011](0011-capture-first-mobile.md) arrives with the sync slice.
+  *(It has: [ADR 0025](0025-authenticated-first-clients.md) — `list` shows
+  the pending footer, `pursecraft sync` drains it.)*
 - Deleting `identity.json` orphans prior stores on disk (they are no longer
   discoverable); the file is the root and is never recreated around.

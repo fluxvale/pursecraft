@@ -34,4 +34,8 @@ allow = [
     # any future BSD-3-Clause dep is admitted identically — adding one
     # is a supply-chain decision to make consciously, not silently.
     "BSD-3-Clause",
+    # minreq 2.14 (the CLI's relay client, ADR 0025) is ISC — the
+    # MIT-equivalent permissive license (OpenBSD, musl). Same conscious
+    # shape as BSD-3-Clause above.
+    "ISC",
 ]
