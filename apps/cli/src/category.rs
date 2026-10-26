@@ -1,4 +1,4 @@
-//! The category surface (ADR 0026): `category new/list`, category and
+//! The category surface (ADR 0027): `category new/list`, category and
 //! group name resolution, and the Inbox ensure — every budget-writing
 //! command's read-then-mint step for the review queue.
 
@@ -21,7 +21,7 @@ use crate::idmint::mint_uuid;
 use crate::session::Session;
 use crate::sink;
 
-/// The review queue's name (ADR 0026): the earliest live category named
+/// The review queue's name (ADR 0027): the earliest live category named
 /// this IS the inbox — bootstrap mints it, a user-created one is adopted.
 pub const INBOX_NAME: &str = "Inbox";
 
@@ -38,13 +38,13 @@ pub enum CategoryError {
     /// `category new` with an empty name (argv rejects this; the public
     /// API defends it too).
     EmptyName,
-    /// A live category of this exact name exists (ADR 0026: name-keyed
+    /// A live category of this exact name exists (ADR 0027: name-keyed
     /// resolution must stay unambiguous); `known` lists what does.
     Duplicate {
         name: String,
         known: Vec<String>,
     },
-    /// The name is the Inbox's — reserved by adoption (ADR 0026); a
+    /// The name is the Inbox's — reserved by adoption (ADR 0027); a
     /// distinct teaching instead of the generic duplicate.
     Reserved,
     /// No live category of this exact name; `known` lists what does —
@@ -213,7 +213,7 @@ pub(crate) fn known_names(state: &ScopeState) -> Vec<String> {
 }
 
 /// Find the earliest-created live category named exactly `name` (ADR
-/// 0026's name-keyed resolution — the payee precedent).
+/// 0027's name-keyed resolution — the payee precedent).
 pub(crate) fn find_category(state: &ScopeState, name: &str) -> Option<EntityId> {
     state
         .entities()
@@ -226,13 +226,13 @@ pub(crate) fn find_category(state: &ScopeState, name: &str) -> Option<EntityId> 
         .min()
 }
 
-/// The inbox category (ADR 0026): the earliest live category named
+/// The inbox category (ADR 0027): the earliest live category named
 /// [`INBOX_NAME`], as the typed id the core projection takes.
 pub(crate) fn inbox_of(state: &ScopeState) -> Option<CategoryId> {
     find_category(state, INBOX_NAME).map(|id| CategoryId::new(id.as_uuid()).expect("stored v7"))
 }
 
-/// Ensure the Inbox category exists (ADR 0026): every budget-writing
+/// Ensure the Inbox category exists (ADR 0027): every budget-writing
 /// command's first budget-log step — find-by-name, else mint one entity
 /// with an anchored name op (the account ensure pattern: a stale retry
 /// loses contested fields, a torn one self-heals). Returns whether this
@@ -261,7 +261,7 @@ pub(crate) fn ensure_inbox(
     Ok(true)
 }
 
-/// The line every command that mints the Inbox prints (ADR 0026's
+/// The line every command that mints the Inbox prints (ADR 0027's
 /// teaching, once per world).
 pub(crate) fn inbox_line() -> String {
     format!(
@@ -269,7 +269,7 @@ pub(crate) fn inbox_line() -> String {
     )
 }
 
-/// `pursecraft category new <name> [--group <name>]` (ADR 0026): an
+/// `pursecraft category new <name> [--group <name>]` (ADR 0027): an
 /// explicit mint — duplicate live names are refused (name-keyed
 /// resolution must stay unambiguous), the optional group is
 /// find-or-create (a label, not money).
@@ -321,7 +321,7 @@ pub fn new_category(
     let scope = ScopeId::Budget(identity.budget_id);
     let id = EntityId::new(mint_uuid()).expect("minted v7");
 
-    // Groups are find-or-create labels (ADR 0026): find the earliest
+    // Groups are find-or-create labels (ADR 0027): find the earliest
     // live group of this exact name, else mint one — a typo'd group is
     // cosmetic, never money.
     let mut ops = Vec::new();
@@ -376,7 +376,7 @@ pub fn new_category(
     Ok(out)
 }
 
-/// `pursecraft category list` (ADR 0026): live categories grouped, the
+/// `pursecraft category list` (ADR 0027): live categories grouped, the
 /// Inbox marked. Read-only — no world shows the getting-started hint.
 pub fn list(home: &Path, session: &Session) -> Result<String, CategoryError> {
     let Some(identity) = load_identity(home)? else {
@@ -422,7 +422,7 @@ pub fn list(home: &Path, session: &Session) -> Result<String, CategoryError> {
 pub(crate) type CategoryBlock = (Option<String>, Vec<(EntityId, String)>);
 
 /// Live named categories in display order (shared by `category list`
-/// and `budget`'s grouped rows, ADR 0026): groups by name ascending,
+/// and `budget`'s grouped rows, ADR 0027): groups by name ascending,
 /// the ungrouped block last; within a block, name ascending then id.
 pub(crate) fn grouped(state: &ScopeState) -> Vec<CategoryBlock> {
     // (group id, group name) for every live named group.
@@ -538,12 +538,12 @@ mod tests {
         assert!(!err.to_string().contains("already exists"), "{err}");
 
         // A world with no Inbox (identity + capture ops seeded, inbox
-        // entity stripped the way a pre-0026 world would look): naming
+        // entity stripped the way a pre-0027 world would look): naming
         // it adopts — the mint IS the ensure, never a self-defeating
         // "already exists".
         let tmp2 = TempDir::new("category-adopt");
         let home2 = tmp2.path();
-        // A pre-0026 shape: identity and a seeded payee op, no Inbox in
+        // A pre-0027 shape: identity and a seeded payee op, no Inbox in
         // the log (`capture` itself now always ensures, so this is
         // seeded by hand).
         let (identity, _) =

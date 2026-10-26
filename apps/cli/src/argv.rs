@@ -8,7 +8,7 @@
 use std::fmt;
 
 /// One parsed command line (ADR 0023's surface, grown by ADR 0025's
-/// enrollment gate and first sync, and ADR 0026's budgeting commands).
+/// enrollment gate and first sync, and ADR 0027's budgeting commands).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Cmd {
     /// `add <payee> <amount> [--date YYYY-MM-DD] [--account <name>]
@@ -23,24 +23,24 @@ pub enum Cmd {
     },
     /// `list` — the minimal recap.
     List,
-    /// `category new <name> [--group <name>]` (ADR 0026).
+    /// `category new <name> [--group <name>]` (ADR 0027).
     CategoryNew { name: String, group: Option<String> },
-    /// `category list` (ADR 0026).
+    /// `category list` (ADR 0027).
     CategoryList,
     /// `categorize` (the inbox review listing) or `categorize <txn>
-    /// <category>` (file one transaction) — ADR 0026.
+    /// <category>` (file one transaction) — ADR 0027.
     Categorize {
         txn: Option<String>,
         category: Option<String>,
     },
     /// `assign <category> <amount> [--month YYYY-MM]` — raw strings
-    /// (ADR 0026).
+    /// (ADR 0027).
     Assign {
         category: String,
         amount: String,
         month: Option<String>,
     },
-    /// `budget [show] [YYYY-MM]` — the balances view (ADR 0026); the
+    /// `budget [show] [YYYY-MM]` — the balances view (ADR 0027); the
     /// optional `show` word is dropped here.
     Budget { month: Option<String> },
     /// `login <server-url>` — enroll against the relay; the enrollment
@@ -298,7 +298,7 @@ fn parse_add(args: &[String]) -> Result<Cmd, UsageError> {
     })
 }
 
-/// `category new <name> [--group <name>]` | `category list` (ADR 0026).
+/// `category new <name> [--group <name>]` | `category list` (ADR 0027).
 fn parse_category(args: &[String]) -> Result<Cmd, UsageError> {
     match args.split_first() {
         Some((first, rest)) if first == "new" => {
@@ -338,7 +338,7 @@ fn parse_category(args: &[String]) -> Result<Cmd, UsageError> {
     }
 }
 
-/// `assign <category> <amount> [--month YYYY-MM]` (ADR 0026).
+/// `assign <category> <amount> [--month YYYY-MM]` (ADR 0027).
 fn parse_assign(args: &[String]) -> Result<Cmd, UsageError> {
     let mut category: Option<String> = None;
     let mut amount: Option<String> = None;
@@ -382,7 +382,7 @@ fn parse_assign(args: &[String]) -> Result<Cmd, UsageError> {
 }
 
 /// `budget [show] [YYYY-MM]` — the `show` word is optional anywhere
-/// (ADR 0026); what remains is nothing or one month.
+/// (ADR 0027); what remains is nothing or one month.
 fn parse_budget(args: &[String]) -> Result<Cmd, UsageError> {
     let mut rest: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "show").collect();
     let dropped = args.len() - rest.len();
@@ -532,7 +532,7 @@ mod tests {
         }
     }
 
-    /// The ADR 0026 surface: category/categorize/assign/budget parse
+    /// The ADR 0027 surface: category/categorize/assign/budget parse
     /// exactly their shapes and teach on the wrong ones.
     #[test]
     fn budgeting_commands_parse() {

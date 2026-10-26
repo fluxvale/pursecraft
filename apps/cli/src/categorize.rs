@@ -1,4 +1,4 @@
-//! The inbox review pass (ADR 0026): `pursecraft categorize` lists the
+//! The inbox review pass (ADR 0027): `pursecraft categorize` lists the
 //! bucket — visible transactions resolving to no category or to the
 //! Inbox — and `pursecraft categorize <txn> <category>` files one by
 //! its id. One-shot, id-exact, no prompts: a list that changed between
@@ -124,7 +124,7 @@ impl From<std::io::Error> for CategorizeError {
     }
 }
 
-/// The bucket's members (ADR 0026): visible transactions resolving to
+/// The bucket's members (ADR 0027): visible transactions resolving to
 /// `Uncategorized` or the Inbox entity — newest first (date descending,
 /// then id descending, `list`'s convention).
 fn bucket(state: &ScopeState) -> Vec<&pursecraft_core::domain::Transaction> {
@@ -153,7 +153,7 @@ fn short_id(txn: &pursecraft_core::domain::Transaction) -> String {
     simple[simple.len() - SHORT_ID..].to_owned()
 }
 
-/// `pursecraft categorize` — the review listing (ADR 0026). Read-only;
+/// `pursecraft categorize` — the review listing (ADR 0027). Read-only;
 /// an absent world shows the getting-started hint.
 pub fn review(home: &Path, session: &Session) -> Result<String, CategorizeError> {
     let Some(identity) = load_identity(home)? else {
@@ -200,7 +200,7 @@ pub fn review(home: &Path, session: &Session) -> Result<String, CategorizeError>
 }
 
 /// `pursecraft categorize <txn> <category>` — file one visible
-/// transaction (ADR 0026). Re-filing between categories is free; filing
+/// transaction (ADR 0027). Re-filing between categories is free; filing
 /// into the Inbox un-files. Id-exact: the printed short form or the
 /// full UUID, nothing looser.
 pub fn file(

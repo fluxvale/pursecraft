@@ -1,4 +1,4 @@
-# 0026 — Budgeting Semantics in the CLI: Categories, Inbox, Allocation, Balances
+# 0027 — Budgeting Semantics in the CLI: Categories, Inbox, Allocation, Balances
 
 - **Status:** Accepted
 - **Date:** 2026-10-26
@@ -277,7 +277,7 @@ the sink and carry ADR 0011's pending badge; exit codes stay `0`/`2`/`1`.
   (deterministic, over-stating) and the next `assign` folds them — it
   targets the earliest cell and zeroes the rest, correcting the total.
 - Twin **Inboxes** are possible exactly where twin cells are (two
-  devices ensuring offline on a pre-0026 world): every replica
+  devices ensuring offline on a pre-0027 world): every replica
   deterministically treats the earliest as *the* Inbox (name resolution
   is min-id), and the later twin renders as an inert envelope until a
   delete/merge surface exists — the same accepted class.

@@ -172,7 +172,7 @@ pub(crate) fn resolved_payee_name(
 /// name, resolved category cell, amount cell, id for the tiebreak).
 /// Torn cells render `?` — a missing amount must never fake a real zero
 /// capture as `0.000`. An unset category is NOT a tear: it is the
-/// designed ready-to-assign state and renders as the Inbox (ADR 0026).
+/// designed ready-to-assign state and renders as the Inbox (ADR 0027).
 #[allow(clippy::type_complexity)]
 fn row(
     state: &pursecraft_core::ops::ScopeState,

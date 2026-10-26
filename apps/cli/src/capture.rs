@@ -56,7 +56,7 @@ pub struct Receipt {
     /// The bootstrap ran this call (identity freshly created).
     pub bootstrapped: bool,
     /// The Inbox ensure minted the review queue's category this call
-    /// (ADR 0026 — bootstrap or a legacy world's first writing command).
+    /// (ADR 0027 — bootstrap or a legacy world's first writing command).
     pub created_inbox: bool,
     /// No live payee of this name existed, so one was minted.
     pub new_payee: bool,
@@ -65,7 +65,7 @@ pub struct Receipt {
     pub date: Date,
     pub account_name: String,
     /// The category the capture filed under, when one was named (ADR
-    /// 0026: absent means the transaction stays in the Inbox bucket).
+    /// 0027: absent means the transaction stays in the Inbox bucket).
     pub category_name: Option<String>,
 }
 
@@ -118,7 +118,7 @@ pub enum CaptureError {
     NoDefaultAccount {
         known: Vec<String>,
     },
-    /// `--category` named no live category (ADR 0026); `known` lists
+    /// `--category` named no live category (ADR 0027); `known` lists
     /// what exists.
     UnknownCategory {
         wanted: String,
@@ -258,7 +258,7 @@ pub fn add(
     ensure_org(&mut minter, &mut org_store, &identity)?;
     drop(org_store);
 
-    // Budget side: ensure the account and the Inbox (ADR 0026), then
+    // Budget side: ensure the account and the Inbox (ADR 0027), then
     // boot fresh for the capture.
     let budget_path = budget_log(home, identity.budget_id);
     std::fs::create_dir_all(budget_path.parent().expect("store parent"))?;
@@ -289,7 +289,7 @@ pub fn add(
             (id, true, vec![op])
         }
     };
-    // A named category resolves exactly (ADR 0026): unknown names are
+    // A named category resolves exactly (ADR 0027): unknown names are
     // teaching errors, never find-or-create — a typo at capture must not
     // mint an envelope.
     let category = match raw.category.map(str::trim).filter(|c| !c.is_empty()) {
@@ -685,7 +685,7 @@ mod tests {
             Some(MembershipRole::Owner)
         );
 
-        // Budget log: account (2) + inbox (1, ADR 0026) + payee (1) +
+        // Budget log: account (2) + inbox (1, ADR 0027) + payee (1) +
         // transaction (5), replayed into exactly the captured transaction.
         let (_, store) = reopened(home);
         assert_eq!(store.tip(), 9);
@@ -1129,7 +1129,7 @@ mod tests {
         );
     }
 
-    /// Category-aware capture (issue #29 / ADR 0026): `--category` files
+    /// Category-aware capture (issue #29 / ADR 0027): `--category` files
     /// exactly by name; an unknown name is a teaching error listing the
     /// known ones; bare capture still writes no category op (the Inbox
     /// is the view of unset, never a write).

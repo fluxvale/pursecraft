@@ -1,4 +1,4 @@
-//! The month budget projection (ADR 0026): a pure derivation of
+//! The month budget projection (ADR 0027): a pure derivation of
 //! per-category envelopes and to-be-budgeted from a budget's state —
 //! never stored (stored balances invite drift, ADR 0016), never mutating.
 //!
@@ -6,10 +6,10 @@
 //! `available = assigned + activity` per category per month, and the
 //! conservation identity `Σ(available) + to_be_budgeted = Σ(all visible
 //! transaction amounts in the month)`. Months are calendar months of the
-//! transaction date; the window is single-month (no carry, ADR 0026).
+//! transaction date; the window is single-month (no carry, ADR 0027).
 //!
 //! The caller supplies the one policy input `inbox` — which category is
-//! the review queue (ADR 0026: the earliest live category named
+//! the review queue (ADR 0027: the earliest live category named
 //! "Inbox") — so the projection itself stays policy-free. Ordering is by
 //! category id (earliest-created first, ADR 0016's deterministic
 //! convention); presentation sorting is the client's concern.
@@ -26,7 +26,7 @@ use crate::resolve::{
 };
 
 /// One category's envelope for one month. The equation holds by
-/// construction: `available == assigned + activity` (ADR 0026).
+/// construction: `available == assigned + activity` (ADR 0027).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CategoryRow {
     pub category: CategoryId,
@@ -35,7 +35,7 @@ pub struct CategoryRow {
     pub available: Milliunits,
 }
 
-/// The inbox bucket's row (ADR 0026): activity counts only the bucket's
+/// The inbox bucket's row (ADR 0027): activity counts only the bucket's
 /// non-positive transactions — positives are inflow (to-be-budgeted),
 /// and a positive filed into a category is a refund of that category's
 /// activity instead. `count` is the bucket's in-month membership
@@ -55,7 +55,7 @@ pub struct InboxRow {
     pub count: usize,
 }
 
-/// One month's budget, derived (ADR 0026).
+/// One month's budget, derived (ADR 0027).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BudgetMonth {
     pub month: Month,
@@ -71,7 +71,7 @@ pub struct BudgetMonth {
 
 impl BudgetMonth {
     /// All available summed — the conservation identity's left side
-    /// (test-pinned, ADR 0026).
+    /// (test-pinned, ADR 0027).
     #[cfg(test)]
     fn total_available(&self) -> Milliunits {
         self.rows
@@ -86,7 +86,7 @@ fn add(lhs: Milliunits, rhs: Milliunits) -> Milliunits {
     lhs.checked_add(rhs).expect("month sums fit in milliunits")
 }
 
-/// Project one month's budget (ADR 0026).
+/// Project one month's budget (ADR 0027).
 ///
 /// Only landed ops count (ADR 0016's no-silent-zero rule): a transaction
 /// without its `date` (no month bucket) or `amount`, and a month cell
@@ -111,7 +111,7 @@ pub fn project(state: &ScopeState, month: Month, inbox: Option<CategoryId>) -> B
             && let Some(budgeted) = cell.budgeted
         {
             // month_category_visible guarantees a live category, so the
-            // envelope exists; twin cells (ADR 0026) sum by accumulation.
+            // envelope exists; twin cells (ADR 0027) sum by accumulation.
             let category = cell.category_id.expect("visible cell has a category");
             if Some(category) == inbox {
                 inbox_assigned = add(inbox_assigned, budgeted);
@@ -496,7 +496,7 @@ mod tests {
         );
     }
 
-    /// Twin cells (two devices assigning offline, ADR 0026) sum —
+    /// Twin cells (two devices assigning offline, ADR 0027) sum —
     /// deterministic on every replica, overstating rather than losing,
     /// and the next assign re-targets the earliest cell.
     #[test]
@@ -509,7 +509,7 @@ mod tests {
     }
 
     /// The bucket does not need the entity: with no Inbox minted,
-    /// uncategorized money still inflows and nags (ADR 0026).
+    /// uncategorized money still inflows and nags (ADR 0027).
     #[test]
     fn the_bucket_renders_without_the_inbox_entity() {
         let mut fx = Fx::default();

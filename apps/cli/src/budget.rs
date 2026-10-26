@@ -1,4 +1,4 @@
-//! Allocation and the balances view (ADR 0026): `assign` writes the
+//! Allocation and the balances view (ADR 0027): `assign` writes the
 //! month × category cell read-then-mint, `budget` renders the core's
 //! projection — assigned, activity, available per category, plus
 //! to-be-budgeted. All derived, never stored.
@@ -35,7 +35,7 @@ pub enum BudgetError {
         input: String,
     },
     /// The amount carries a sign — assignment is a bare magnitude
-    /// (ADR 0026: "no sign").
+    /// (ADR 0027: "no sign").
     Signed {
         input: String,
     },
@@ -44,7 +44,7 @@ pub enum BudgetError {
         input: String,
     },
     /// `assign` targeted the Inbox — a review surface, not an envelope
-    /// (ADR 0026).
+    /// (ADR 0027).
     AssignsInbox,
 }
 
@@ -140,7 +140,7 @@ impl From<std::io::Error> for BudgetError {
 }
 
 /// The month an assign or view targets: `--month`/positional strict
-/// `YYYY-MM`, else today's calendar month (ADR 0026 — the local civil
+/// `YYYY-MM`, else today's calendar month (ADR 0027 — the local civil
 /// today, never a UTC month).
 fn resolve_month(raw: Option<&str>, today: Date) -> Result<Month, BudgetError> {
     match raw.map(str::trim) {
@@ -154,7 +154,7 @@ fn resolve_month(raw: Option<&str>, today: Date) -> Result<Month, BudgetError> {
 }
 
 /// Parse an assignment magnitude: the core's exact Milliunits grammar,
-/// bare digits — no sign in either direction (ADR 0026).
+/// bare digits — no sign in either direction (ADR 0027).
 fn parse_magnitude(input: &str) -> Result<Milliunits, BudgetError> {
     let trimmed = input.trim();
     if trimmed.starts_with('-') || trimmed.starts_with('+') {
@@ -167,7 +167,7 @@ fn parse_magnitude(input: &str) -> Result<Milliunits, BudgetError> {
     })
 }
 
-/// `pursecraft assign <category> <amount> [--month YYYY-MM]` (ADR 0026):
+/// `pursecraft assign <category> <amount> [--month YYYY-MM]` (ADR 0027):
 /// the month × category cell's `budgeted`, read-then-mint — the earliest
 /// cell for the pair gets the write (this is the household race LWW
 /// exists for), a cell is minted only when none exists, and a torn cell
@@ -218,7 +218,7 @@ pub fn assign(
     // Every live cell for (month, category), earliest id first: the
     // earliest gets the write (this is the household race LWW exists
     // for); any twin (two devices minting offline) is zeroed so the
-    // next assign corrects the total, exactly as ADR 0026 promises.
+    // next assign corrects the total, exactly as ADR 0027 promises.
     let mut cells: Vec<(EntityId, Option<Milliunits>)> = Vec::new();
     for entity in state.entities() {
         let Entity::MonthCategory(cell) = entity else {
@@ -299,7 +299,7 @@ pub fn assign(
     Ok(out)
 }
 
-/// `pursecraft budget [show] [YYYY-MM]` (ADR 0026): the can-I-buy-this
+/// `pursecraft budget [show] [YYYY-MM]` (ADR 0027): the can-I-buy-this
 /// view — the core projection rendered, grouped like `category list`,
 /// the Inbox row shown only when the bucket is non-empty that month.
 /// Read-only; an absent world shows the getting-started hint.
@@ -350,7 +350,7 @@ pub fn show(
         out.push_str("\nno categories yet — try: pursecraft category new Food\n");
     }
     if projected.inbox.count > 0 || projected.inbox.assigned != Milliunits::ZERO {
-        // The nag renders on bucket membership (ADR 0026: "non-empty
+        // The nag renders on bucket membership (ADR 0027: "non-empty
         // that month"), not on activity — an income-only bucket still
         // awaits review, its amounts sitting in inflow.
         let label = if projected.inbox.count > 0 {
@@ -375,7 +375,7 @@ pub fn show(
     ))
 }
 
-/// One envelope row: `  name  assigned  activity  available` (ADR 0026's
+/// One envelope row: `  name  assigned  activity  available` (ADR 0027's
 /// three columns; the equation holds cell-by-cell in the projection).
 /// Amounts stringify first — Milliunits' Display ignores formatter
 /// width, so padding a String is what makes the columns align.
@@ -537,7 +537,7 @@ mod tests {
         );
     }
 
-    /// Twin cells fold (hostile-review P2-2, ADR 0026's correction
+    /// Twin cells fold (hostile-review P2-2, ADR 0027's correction
     /// promise): a later assign targets the earliest cell AND zeroes the
     /// twin — the total becomes exactly the new amount, never floored by
     /// a stale duplicate.
@@ -612,7 +612,7 @@ mod tests {
     }
 
     /// A torn cell (month+category landed, budgeted not) is completed by
-    /// the next assign — never twinned (crash window, ADR 0026).
+    /// the next assign — never twinned (crash window, ADR 0027).
     #[test]
     fn a_torn_cell_is_completed_not_twinned() {
         let tmp = TempDir::new("torn-cell");

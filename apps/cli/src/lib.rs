@@ -92,7 +92,7 @@ pub fn run(args: &[String], ctx: impl FnOnce() -> Result<Context, home::NoHomeEr
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
         // The gated surface (ADR 0025): no client interaction before
-        // enrollment. ADR 0026's budgeting commands join it — they touch
+        // enrollment. ADR 0027's budgeting commands join it — they touch
         // data like every other.
         Ok(
             gated @ (argv::Cmd::Add { .. }
