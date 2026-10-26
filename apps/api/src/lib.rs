@@ -11,4 +11,4 @@ pub mod http;
 pub mod state;
 
 pub use http::router;
-pub use state::AppState;
+pub use state::{AppState, READINESS_PROBE_TTL};

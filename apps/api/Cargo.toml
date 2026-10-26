@@ -11,7 +11,10 @@ workspace = true
 [dependencies]
 pursecraft-core = { path = "../core/crates/pursecraft-core" }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# net/signal/time/sync are the binary's own needs (bind, SIGTERM drain,
+# the drain window, the shutdown oneshot) — declared here rather than
+# borrowed from whatever axum happens to enable.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
