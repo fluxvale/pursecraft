@@ -1,11 +1,14 @@
-//! End-to-end tests (issue #21): whole command lines through
-//! [`run`](pursecraft_cli::run) — with an injected home and date, never
-//! the process environment (workspace `unsafe_code = forbid` rules out
-//! `env::set_var` in tests).
+//! End-to-end tests (issues #21, #26): whole command lines through
+//! [`run`](pursecraft_cli::run) — with an injected home, date, and stdin,
+//! never the process environment (workspace `unsafe_code = forbid` rules
+//! out `env::set_var` in tests). ADR 0025: data commands run enrolled (a
+//! synthetic session — no relay needed for capture-side behavior; the
+//! relay-driven suite lives in `tests/sync.rs`).
 
 use std::path::{Path, PathBuf};
 
-use pursecraft_cli::{Context, run};
+use pursecraft_cli::run;
+use pursecraft_cli::session::{self, Session};
 use pursecraft_core::date::Date;
 
 /// A per-test scratch directory, removed on drop (the core testkit
@@ -36,17 +39,35 @@ impl Drop for TempDir {
     }
 }
 
-fn ctx(home: &Path) -> Context {
-    Context {
-        home: home.to_owned(),
-        today: Date::new(2026, 10, 25).unwrap(),
-    }
+/// A synthetic enrollment (ADR 0025): a real session file pointing at a
+/// relay that does not exist — capture is offline; only sync would care.
+fn enroll(home: &Path) {
+    let device = pursecraft_core::ids::DeviceId::new(uuid::Uuid::new_v4()).unwrap();
+    session::publish(
+        home,
+        &Session {
+            version: 1,
+            server: "http://127.0.0.1:9".into(),
+            device_id: device,
+            token: "test-only".into(),
+        },
+    )
+    .unwrap();
+}
+
+fn run_with(home: &Path, stdin: &str, args: &[&str]) -> pursecraft_cli::Output {
+    let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    run(&argv, || {
+        Ok(pursecraft_cli::Context {
+            home: home.to_owned(),
+            today: Date::new(2026, 10, 25).unwrap(),
+            stdin: stdin.to_owned(),
+        })
+    })
 }
 
 fn run_args(home: &Path, args: &[&str]) -> pursecraft_cli::Output {
-    let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let ctx = ctx(home);
-    run(&argv, || Ok(ctx))
+    run_with(home, "", args)
 }
 
 #[test]
@@ -56,6 +77,7 @@ fn help_version_and_usage_exit_codes() {
     assert_eq!(help.code, 0);
     assert!(help.stdout.contains("usage:"), "{}", help.stdout);
     assert!(help.stdout.contains("spending is negative"));
+    assert!(help.stdout.contains("pursecraft sync"));
     let version = run_args(tmp.path(), &["--version"]);
     assert_eq!(version.code, 0);
     assert_eq!(
@@ -82,30 +104,121 @@ fn meta_commands_need_no_environment() {
             out.stderr
         );
     }
-    // …while a data-needing command surfaces the environment failure.
+    // …while a data-needing command surfaces the environment failure —
+    // still before the gate (the gate needs the home too).
     let out = run(&argv(&["list"]), || Err(pursecraft_cli::home::NoHomeError));
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("no data home"), "{}", out.stderr);
+}
+
+/// THE gate test (issue #26): un-enrolled, every data command — read-only
+/// `list` included — refuses with the teaching message and creates
+/// NOTHING. `login` stays open (it is the door), and help/version answer
+/// untouched.
+#[test]
+fn gate_blocks_unenrolled() {
+    let tmp = TempDir::new("gate");
+    let home = tmp.path();
+    for cmd in [
+        vec!["add", "coffee", "-4.50"],
+        vec!["list"],
+        vec!["sync"],
+        vec!["pair"],
+        vec!["join", "o", "c1", "b", "c2"],
+    ] {
+        let out = run_args(home, &cmd);
+        assert_eq!(out.code, 1, "{cmd:?}: {}{}", out.stdout, out.stderr);
+        assert!(
+            out.stderr.contains("not enrolled"),
+            "{cmd:?}: {}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("pursecraft login"),
+            "{cmd:?}: {}",
+            out.stderr
+        );
+        assert!(out.stdout.is_empty(), "{cmd:?}: {}", out.stdout);
+    }
+    // The refusal creates nothing — no session, no identity, no stores.
+    assert!(std::fs::read_dir(home).unwrap().next().is_none());
+    // And the door itself parses open (a real login runs in tests/sync.rs).
+    let login = run_args(home, &["login", "http://127.0.0.1:9"]);
+    assert!(
+        login.stderr.contains("enrollment secret"),
+        "{}",
+        login.stderr
+    );
+    // Meta commands never see the gate.
+    assert_eq!(run_args(home, &["--version"]).code, 0);
+}
+
+/// Enrolled-but-offline is full function (ADR 0025): captures land, list
+/// reads (with the pending badge, ADR 0011), and only sync fails —
+/// teaching, exit 1, data intact.
+#[test]
+fn enrolled_offline_capture_and_list_work_and_sync_teaches() {
+    let tmp = TempDir::new("enrolled-offline");
+    let home = tmp.path();
+    enroll(home);
+
+    let add = run_args(home, &["add", "coffee", "-4.50"]);
+    assert_eq!(add.code, 0, "{}{}", add.stdout, add.stderr);
+    assert!(
+        add.stdout.contains("initialized org") && add.stdout.contains("added coffee"),
+        "{}",
+        add.stdout
+    );
+
+    let list = run_args(home, &["list"]);
+    assert_eq!(list.code, 0, "{}", list.stderr);
+    assert!(list.stdout.contains("coffee"), "{}", list.stdout);
+    assert!(
+        list.stdout.contains("13 pending sync"),
+        "the badge shows unsynced captures\n{}",
+        list.stdout
+    );
+
+    let sync = run_args(home, &["sync"]);
+    assert_eq!(sync.code, 1, "{}", sync.stdout);
+    assert!(
+        sync.stderr.contains("cannot reach the relay"),
+        "{}",
+        sync.stderr
+    );
+    assert!(
+        sync.stderr.contains("captures stay queued"),
+        "{}",
+        sync.stderr
+    );
+
+    // Full function offline: nothing was lost, the badge persists.
+    let again = run_args(home, &["list"]);
+    assert!(again.stdout.contains("13 pending sync"), "{}", again.stdout);
+    assert!(again.stdout.contains("1 transaction"), "{}", again.stdout);
 }
 
 #[test]
 fn add_confirms_and_list_recaps_end_to_end() {
     let tmp = TempDir::new("e2e");
     let home = tmp.path();
+    enroll(home);
 
     let first = run_args(home, &["add", "coffee", "-4.50"]);
     assert_eq!(first.code, 0, "{}{}", first.stdout, first.stderr);
     assert_eq!(
         first.stdout,
         "initialized org \"Personal\", budget \"Personal\", account \"Wallet\"\n\
-         added coffee -4.500 on 2026-10-25 (Wallet, new payee)\n"
+         added coffee -4.500 on 2026-10-25 (Wallet, new payee)\n\
+         13 pending sync — run: pursecraft sync\n"
     );
 
     let second = run_args(home, &["add", "Meralco", "--date", "2026-10-24", "-890"]);
     assert_eq!(second.code, 0);
     assert_eq!(
         second.stdout,
-        "added Meralco -890.000 on 2026-10-24 (Wallet, new payee)\n"
+        "added Meralco -890.000 on 2026-10-24 (Wallet, new payee)\n\
+         19 pending sync — run: pursecraft sync\n"
     );
 
     // Newest first, exact amounts, count footer.
@@ -127,11 +240,13 @@ fn add_confirms_and_list_recaps_end_to_end() {
             "2026-10-24", "Meralco", "-890.000"
         )
     );
-    assert_eq!(*lines.last().unwrap(), "2 transactions");
     assert_eq!(
-        lines.len(),
-        5,
-        "header, two rows, blank, footer\n{}",
+        *lines.last().unwrap(),
+        "19 pending sync — run: pursecraft sync"
+    );
+    assert!(
+        list.stdout.contains("2 transactions"),
+        "the count footer stays\n{}",
         list.stdout
     );
 }
@@ -140,6 +255,7 @@ fn add_confirms_and_list_recaps_end_to_end() {
 fn same_day_captures_list_newest_first() {
     let tmp = TempDir::new("order");
     let home = tmp.path();
+    enroll(home);
     for payee in ["first", "second", "third"] {
         let out = run_args(home, &["add", payee, "-1"]);
         assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
@@ -153,13 +269,14 @@ fn same_day_captures_list_newest_first() {
         "the last capture leads\n{}",
         list.stdout
     );
-    assert!(list.stdout.ends_with("3 transactions\n"));
+    assert!(list.stdout.contains("3 transactions"));
 }
 
 #[test]
 fn list_on_a_fresh_home_hint_and_does_not_create() {
     let tmp = TempDir::new("empty");
     let home = tmp.path();
+    enroll(home);
     let list = run_args(home, &["list"]);
     assert_eq!(list.code, 0);
     assert_eq!(
@@ -176,6 +293,7 @@ fn list_on_a_fresh_home_hint_and_does_not_create() {
 fn amount_and_flag_errors_reach_the_user() {
     let tmp = TempDir::new("errors");
     let home = tmp.path();
+    enroll(home);
     let unsigned = run_args(home, &["add", "coffee", "4.50"]);
     assert_eq!(unsigned.code, 1);
     assert!(
@@ -211,6 +329,7 @@ fn amount_and_flag_errors_reach_the_user() {
 fn income_and_milliunit_precision_round_trip() {
     let tmp = TempDir::new("income");
     let home = tmp.path();
+    enroll(home);
     let out = run_args(home, &["add", "salary", "+50000.125"]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     // The core's exact display: positives carry no `+` sign (ADR 0016).

@@ -1,7 +1,9 @@
-//! The thin binary (ADR 0023): the only reader of the process environment
-//! and the wall clock; everything else is injected into the library.
+//! The thin binary (ADRs 0023, 0025): the only reader of the process
+//! environment and the wall clock; everything else is injected into the
+//! library. `login` alone reads stdin (the enrollment secret, one line —
+//! ADR 0025), so no other command ever blocks on an interactive terminal.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use pursecraft_cli::{Context, home, run};
@@ -9,11 +11,17 @@ use pursecraft_core::date::Date;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let reads_stdin = args.first().is_some_and(|first| first == "login");
     let out = run(&args, || {
         let home = home::data_home()?;
         Ok(Context {
             home,
             today: today_local(),
+            stdin: if reads_stdin {
+                read_stdin()
+            } else {
+                String::new()
+            },
         })
     });
     // A closed pipe (e.g. `pursecraft list | head`) is a truncation, not a
@@ -27,6 +35,15 @@ fn main() -> ExitCode {
         let _ = std::io::stderr().flush();
     }
     ExitCode::from(u8::try_from(out.code).unwrap_or(1))
+}
+
+/// The enrollment secret (ADR 0025): all of stdin, first line used. Read
+/// only for `login` — interactive users paste the secret and press
+/// Ctrl-D; scripts pipe it.
+fn read_stdin() -> String {
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_to_string(&mut buf);
+    buf
 }
 
 /// Today's local civil date (ADR 0023): jiff resolves the system timezone —

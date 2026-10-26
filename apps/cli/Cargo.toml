@@ -16,6 +16,20 @@ serde_json = "1"
 # Local civil date for the `today` default (ADR 0023): std-only — pulls just
 # jiff-core on unix. License `Unlicense OR MIT`, satisfied by deny.toml's MIT.
 jiff = { version = "0.2", default-features = false, features = ["std"] }
+# The relay's plain-HTTP client (ADR 0025): no default features and no TLS —
+# the relay is plain HTTP (ADR 0024), and this adds ZERO transitive crates
+# (ureq would drag the `url`/ICU tree for a localhost call). License ISC —
+# deny.toml's one conscious addition for this slice. TLS arrives with the
+# deployment slice (ADR 0013).
+minreq = { version = "2", default-features = false, features = ["json-using-serde"] }
+
+[dev-dependencies]
+# Integration tests (ADR 0025) drive the real relay router over a real
+# localhost socket: the axum server the CLI's minreq client talks to.
+pursecraft-api = { path = "../api" }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync"] }
+uuid = { version = "1", features = ["v4"] }
 
 [[bin]]
 name = "pursecraft"

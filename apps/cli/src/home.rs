@@ -21,13 +21,16 @@ const BUDGET_DIR: &str = "budgets";
 /// The identity file version this CLI writes and reads.
 const IDENTITY_VERSION: u16 = 1;
 
-/// The persisted ids of the bootstrapped world (ADR 0023): the device and
-/// user (auth is a later slice; both are locally minted opaque UUIDs), and
-/// the org, membership, budget, and account bootstrap minted. This file is
-/// the root: deleting it orphans the stores.
+/// The persisted ids of the bootstrapped world (ADR 0023): the founding
+/// device (the enrollment that minted this world, ADR 0025) and user
+/// (locally minted, opaque — auth is a later slice), and the org,
+/// membership, budget, and account bootstrap minted. This file is the
+/// root: deleting it orphans the stores.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Identity {
     pub version: u16,
+    /// The world's founding device (ADR 0025); ops are minted under the
+    /// SESSION's device, which equals this except after a re-login.
     pub device_id: DeviceId,
     pub user_id: UserId,
     pub org_id: OrgId,
@@ -59,6 +62,11 @@ pub enum IdentityError {
     Raced {
         path: PathBuf,
     },
+    /// The file already exists — a joiner cannot overlay a world (the
+    /// identity is the root, ADRs 0023, 0025).
+    Exists {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for IdentityError {
@@ -76,6 +84,10 @@ impl fmt::Display for IdentityError {
             Self::Raced { path } => write!(
                 f,
                 "{path:?} was created concurrently by another pursecraft; rerun the command"
+            ),
+            Self::Exists { path } => write!(
+                f,
+                "{path:?} already exists — this home already holds a world (ADR 0025: join is for a fresh device)"
             ),
         }
     }
@@ -178,17 +190,22 @@ pub fn load_identity(home: &Path) -> Result<Option<Identity>, IdentityError> {
 }
 
 /// Load the identity file, creating it (atomically, before any store op
-/// exists — ADR 0023) when absent. Returns the identity and whether this
-/// call created it. A present-but-unreadable file is a loud error, never
-/// recreated over.
-pub fn load_or_create_identity(home: &Path) -> Result<(Identity, bool), IdentityError> {
+/// exists — ADR 0023) when absent. The founding device (ADR 0025: the
+/// enrollment that minted this world) is fixed at creation; a present file
+/// is returned as-is whatever device asks. Returns the identity and
+/// whether this call created it. A present-but-unreadable file is a loud
+/// error, never recreated over.
+pub fn load_or_create_identity(
+    home: &Path,
+    founding_device: DeviceId,
+) -> Result<(Identity, bool), IdentityError> {
     if let Some(identity) = load_identity(home)? {
         return Ok((identity, false));
     }
     fs::create_dir_all(home)?;
     let identity = Identity {
         version: IDENTITY_VERSION,
-        device_id: DeviceId::new(mint_uuid()).expect("any version accepted"),
+        device_id: founding_device,
         user_id: UserId::new(mint_uuid()).expect("any version accepted"),
         org_id: OrgId::new(mint_uuid()).expect("minted v7"),
         membership_id: EntityId::new(mint_uuid()).expect("minted v7"),
@@ -197,6 +214,18 @@ pub fn load_or_create_identity(home: &Path) -> Result<(Identity, bool), Identity
     };
     publish_identity(home, &identity)?;
     Ok((identity, true))
+}
+
+/// Publish a caller-minted identity (the join path, ADR 0025): durably
+/// and alone, refusing an existing file — a world that exists cannot be
+/// joined over.
+pub fn create_identity(home: &Path, identity: &Identity) -> Result<(), IdentityError> {
+    if load_identity(home)?.is_some() {
+        return Err(IdentityError::Exists {
+            path: identity_path(home),
+        });
+    }
+    publish_identity(home, identity)
 }
 
 /// Publish a freshly minted identity durably and alone: a process-unique
@@ -286,11 +315,14 @@ mod tests {
     #[test]
     fn identity_creates_once_then_round_trips() {
         let tmp = TempDir::new("identity");
-        let (first, created) = load_or_create_identity(tmp.path()).unwrap();
+        let device = DeviceId::new(mint_uuid()).unwrap();
+        let (first, created) = load_or_create_identity(tmp.path(), device).unwrap();
         assert!(created);
-        let (again, created) = load_or_create_identity(tmp.path()).unwrap();
+        assert_eq!(first.device_id, device, "the founder is fixed at creation");
+        let (again, created) =
+            load_or_create_identity(tmp.path(), DeviceId::new(mint_uuid()).unwrap()).unwrap();
         assert!(!created, "the second call reads, never remints");
-        assert_eq!(first, again);
+        assert_eq!(first, again, "a present file ignores the asking device");
         // The file landed atomically: no tmp straggler, real content.
         let strays: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -303,16 +335,16 @@ mod tests {
     #[test]
     fn corrupt_and_future_identities_are_refused() {
         let tmp = TempDir::new("identity-corrupt");
-        load_or_create_identity(tmp.path()).unwrap();
+        load_or_create_identity(tmp.path(), DeviceId::new(mint_uuid()).unwrap()).unwrap();
         let path = identity_path(tmp.path());
         std::fs::write(&path, b"{ not an identity").unwrap();
         assert!(matches!(
-            load_or_create_identity(tmp.path()),
+            load_or_create_identity(tmp.path(), DeviceId::new(mint_uuid()).unwrap()),
             Err(IdentityError::Decode { .. })
         ));
         let (identity, _) = {
             let tmp2 = TempDir::new("identity-version");
-            load_or_create_identity(tmp2.path()).unwrap()
+            load_or_create_identity(tmp2.path(), DeviceId::new(mint_uuid()).unwrap()).unwrap()
         };
         let future = serde_json::to_string(&Identity {
             version: identity.version + 1,
@@ -321,8 +353,26 @@ mod tests {
         .unwrap();
         std::fs::write(&path, future).unwrap();
         assert!(matches!(
-            load_or_create_identity(tmp.path()),
+            load_or_create_identity(tmp.path(), DeviceId::new(mint_uuid()).unwrap()),
             Err(IdentityError::Unsupported { .. })
+        ));
+    }
+
+    /// The join path's root-first rule (ADR 0025): `create_identity`
+    /// publishes a caller-minted world and refuses to overlay one.
+    #[test]
+    fn create_identity_publishes_once_then_refuses() {
+        let tmp = TempDir::new("identity-join");
+        let (identity, _) =
+            load_or_create_identity(tmp.path(), DeviceId::new(mint_uuid()).unwrap()).unwrap();
+        // A second home accepts a caller-minted identity...
+        let tmp2 = TempDir::new("identity-join-2");
+        create_identity(tmp2.path(), &identity).unwrap();
+        assert_eq!(load_identity(tmp2.path()).unwrap(), Some(identity.clone()));
+        // ...and refuses to be joined over.
+        assert!(matches!(
+            create_identity(tmp2.path(), &identity),
+            Err(IdentityError::Exists { .. })
         ));
     }
 }

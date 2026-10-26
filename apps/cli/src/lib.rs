@@ -1,9 +1,11 @@
 //! The `pursecraft` command-line app (ADR 0023): fast local-first
 //! transaction capture riding the shared core — one-shot argv commands,
-//! offline by design, every minted op through the single payload sink
-//! ([`sink`]). The library is fully injectable (home path, today's date,
-//! argv slice); the thin binary `main.rs` is the only reader of the
-//! process environment.
+//! every minted op through the single payload [`sink`] — and, since ADR
+//! 0025, authenticated-first: every data command requires a one-time
+//! enrollment (`session.json`), and `sync` drives the rendezvous relay.
+//! The library is fully injectable (home path, today's date, stdin, argv
+//! slice); the thin binary `main.rs` is the only reader of the process
+//! environment.
 
 pub mod amount;
 pub mod argv;
@@ -11,18 +13,24 @@ pub mod capture;
 pub mod home;
 pub mod idmint;
 pub mod list;
+pub mod relay;
+pub mod session;
 pub mod sink;
+pub mod sync;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pursecraft_core::date::Date;
 
-/// What the environment supplies a command (ADR 0023): the data home and
-/// the local civil date captures default to. Injected so tests (and any
+/// What the environment supplies a command (ADR 0023; grown by ADR 0025):
+/// the data home, the local civil date captures default to, and stdin —
+/// `login`'s enrollment secret (read by `main` only for `login`; every
+/// other command sees an empty string). Injected so tests (and any
 /// embedder) never touch the process environment.
 pub struct Context {
     pub home: PathBuf,
     pub today: Date,
+    pub stdin: String,
 }
 
 /// What one command produced: process exit code, stdout, stderr.
@@ -60,40 +68,223 @@ impl Output {
 
 /// Run one command line to its printable outcome (ADR 0023). Exit codes:
 /// `0` success, `2` usage errors, `1` everything else. `ctx` supplies the
-/// data home and today only when a command actually needs them — help,
-/// version, and usage errors answer without touching the environment.
+/// data home, today, and stdin only when a command actually needs them —
+/// help, version, and usage errors answer without touching the
+/// environment.
+///
+/// The enrollment gate (ADR 0025) is the dispatch's one choke point: every
+/// command that touches data — `add`, `list`, `sync`, `pair`, `join`,
+/// read-only `list` included — answers with the teaching refusal until
+/// `session.json` exists. The check is file presence, never a network
+/// round-trip: enrolled-but-offline is full function.
 pub fn run(args: &[String], ctx: impl FnOnce() -> Result<Context, home::NoHomeError>) -> Output {
     match argv::parse(args) {
         Ok(argv::Cmd::Help) => Output::ok(format!("{}\n", argv::HELP.trim_end())),
         Ok(argv::Cmd::Version) => Output::ok(format!("pursecraft {}\n", env!("CARGO_PKG_VERSION"))),
-        Ok(argv::Cmd::List) => match ctx() {
-            Ok(ctx) => match list::list(&ctx.home) {
-                Ok(text) => Output::ok(text),
+        Ok(argv::Cmd::Login { server }) => match ctx() {
+            Ok(ctx) => match login(&ctx.home, &server, &ctx.stdin) {
+                Ok(line) => Output::ok(line),
                 Err(e) => Output::fail(format!("error: {e}\n")),
             },
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
-        Ok(argv::Cmd::Add {
+        // The gated surface (ADR 0025): no client interaction before
+        // enrollment.
+        Ok(
+            gated @ (argv::Cmd::Add { .. }
+            | argv::Cmd::List
+            | argv::Cmd::Sync
+            | argv::Cmd::Pair
+            | argv::Cmd::Join { .. }),
+        ) => match ctx() {
+            Ok(ctx) => match session::load(&ctx.home) {
+                Ok(Some(session)) => dispatch(gated, ctx, session),
+                Ok(None) => Output::fail(format!("error: {}\n", session::GATE_MESSAGE)),
+                Err(e) => Output::fail(format!("error: {e}\n")),
+            },
+            Err(e) => Output::fail(format!("error: {e}\n")),
+        },
+        Err(e) => Output::usage(&e.to_string()),
+    }
+}
+
+/// Dispatch a gated command — the session exists by construction.
+fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
+    match cmd {
+        argv::Cmd::Add {
             payee,
             amount,
             date,
             account,
-        }) => match ctx() {
-            Ok(ctx) => {
-                let raw = capture::RawAdd {
-                    payee: &payee,
-                    amount: &amount,
-                    date: date.as_deref(),
-                    account: account.as_deref(),
-                };
-                match capture::add(&ctx.home, &raw, ctx.today) {
-                    Ok(receipt) => Output::ok(receipt.confirmation()),
-                    Err(e) => Output::fail(format!("error: {e}\n")),
-                }
+        } => {
+            let raw = capture::RawAdd {
+                payee: &payee,
+                amount: &amount,
+                date: date.as_deref(),
+                account: account.as_deref(),
+            };
+            match capture::add(&ctx.home, &session, &raw, ctx.today) {
+                Ok(receipt) => Output::ok(with_pending_badge(&ctx.home, &session, receipt)),
+                Err(e) => Output::fail(format!("error: {e}\n")),
             }
+        }
+        argv::Cmd::List => match list::list(&ctx.home, &session) {
+            Ok(text) => Output::ok(text),
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
-        Err(e) => Output::usage(&e.to_string()),
+        argv::Cmd::Sync => match run_sync(&ctx.home, &session) {
+            Ok(text) => Output::ok(text),
+            Err(e) => Output::fail(format!("error: {e}\n")),
+        },
+        argv::Cmd::Pair => {
+            let no_world =
+                "nothing to pair yet — capture a transaction first: pursecraft add coffee -4.50";
+            match home::load_identity(&ctx.home) {
+                Ok(Some(identity)) => match sync::pair(&ctx.home, &session, &identity) {
+                    Ok(text) => Output::ok(text),
+                    Err(e) => Output::fail(format!("error: {e}\n")),
+                },
+                Ok(None) => Output::fail(format!("error: {no_world}\n")),
+                Err(e) => Output::fail(format!("error: {e}\n")),
+            }
+        }
+        argv::Cmd::Join {
+            org_id,
+            org_code,
+            budget_id,
+            budget_code,
+        } => {
+            let args = sync::JoinArgs {
+                org_id: &org_id,
+                org_code: &org_code,
+                budget_id: &budget_id,
+                budget_code: &budget_code,
+            };
+            match sync::join(&ctx.home, &session, &args) {
+                Ok(text) => Output::ok(text),
+                Err(e) => Output::fail(format!("error: {e}\n")),
+            }
+        }
+        // Help/Version/login answered before the gate; parse errors never
+        // reach dispatch.
+        argv::Cmd::Help | argv::Cmd::Version | argv::Cmd::Login { .. } => {
+            unreachable!("meta commands answer before the gate")
+        }
+    }
+}
+
+/// A capture's confirmation plus ADR 0011's badge (ADR 0025): one extra
+/// line exactly when captures wait for the relay — a synced capture stays
+/// one line. The count derives from the stores (never stored itself).
+fn with_pending_badge(
+    home: &Path,
+    session: &session::Session,
+    receipt: capture::Receipt,
+) -> String {
+    let pending = match home::load_identity(home) {
+        Ok(Some(identity)) => match sync::pending_count(home, session, &identity) {
+            Ok(pending) => pending,
+            Err(e) => return format!("error: {e}\n"),
+        },
+        // Unreachable in practice (add just bootstrapped); quiet stays.
+        Ok(None) => 0,
+        Err(e) => return format!("error: {e}\n"),
+    };
+    let mut out = receipt.confirmation();
+    if pending > 0 {
+        out.push_str(&format!("{pending} pending sync — run: pursecraft sync\n"));
+    }
+    out
+}
+
+/// `sync`'s preconditions: a world to sync (identity exists — capture
+/// owns bootstrap, ADR 0023), then the ordinary sync (ADR 0025).
+fn run_sync(home: &Path, session: &session::Session) -> Result<String, sync::SyncError> {
+    match home::load_identity(home)? {
+        Some(identity) => Ok(sync::sync(home, session, &identity)?.render()),
+        None => Err(sync::SyncError::NotBootstrapped),
+    }
+}
+
+/// Enroll this device (ADR 0025): validate the URL, present the operator's
+/// secret (stdin, one line) to the relay, publish the session. The secret
+/// and the returned token never appear in the output.
+fn login(home: &Path, server: &str, stdin: &str) -> Result<String, LoginError> {
+    let server = normalize_server(server)?;
+    let secret = stdin.lines().next().unwrap_or("").trim();
+    if secret.is_empty() {
+        return Err(LoginError::NoSecret);
+    }
+    let (device_id, token) = relay::enroll(&server, secret)?;
+    session::publish(
+        home,
+        &session::Session {
+            version: 1,
+            server: server.clone(),
+            device_id,
+            token,
+        },
+    )?;
+    Ok(format!("enrolled with {server} — capture is unlocked\n"))
+}
+
+/// Validate and normalize a relay URL (ADR 0025): plain `http`, host and
+/// optional port, no path — TLS arrives with the hosted-relay slice.
+fn normalize_server(server: &str) -> Result<String, LoginError> {
+    let server = server.trim().trim_end_matches('/');
+    if let Some(rest) = server.strip_prefix("https://") {
+        let _ = rest;
+        return Err(LoginError::BadServer(
+            "v1 speaks plain http to a local relay; TLS arrives with the hosted-relay slice".into(),
+        ));
+    }
+    let Some(rest) = server.strip_prefix("http://") else {
+        return Err(LoginError::BadServer(
+            "the relay url must look like http://host:port".into(),
+        ));
+    };
+    if rest.is_empty() || rest.contains('/') {
+        return Err(LoginError::BadServer(
+            "the relay url must be a bare http://host:port (no path)".into(),
+        ));
+    }
+    Ok(server.to_owned())
+}
+
+/// A failed enrollment (ADR 0025).
+#[derive(Debug)]
+enum LoginError {
+    BadServer(String),
+    NoSecret,
+    Relay(relay::RelayError),
+    Session(session::SessionError),
+}
+
+impl std::fmt::Display for LoginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadServer(message) => write!(f, "{message}"),
+            Self::NoSecret => write!(
+                f,
+                "login reads the enrollment secret from stdin (one line); it lives in the relay's data directory (enrollment.secret)"
+            ),
+            Self::Relay(e) => write!(f, "{e}"),
+            Self::Session(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoginError {}
+
+impl From<relay::RelayError> for LoginError {
+    fn from(e: relay::RelayError) -> Self {
+        Self::Relay(e)
+    }
+}
+
+impl From<session::SessionError> for LoginError {
+    fn from(e: session::SessionError) -> Self {
+        Self::Session(e)
     }
 }
 
@@ -127,5 +318,45 @@ pub(crate) mod testsupport {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_urls_are_normalized_and_refused_with_teaching() {
+        assert_eq!(
+            normalize_server("http://127.0.0.1:8080").unwrap(),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(normalize_server(" http://host/ ").unwrap(), "http://host");
+        assert!(
+            normalize_server("https://host")
+                .unwrap_err()
+                .to_string()
+                .contains("plain http")
+        );
+        assert!(
+            normalize_server("host:8080")
+                .unwrap_err()
+                .to_string()
+                .contains("http://host:port")
+        );
+        // "http://" loses its slashes to the trailing-slash trim and is
+        // caught by the scheme check — same teaching outcome.
+        assert!(
+            normalize_server("http://")
+                .unwrap_err()
+                .to_string()
+                .contains("http://host:port")
+        );
+        assert!(
+            normalize_server("http://h/p")
+                .unwrap_err()
+                .to_string()
+                .contains("no path")
+        );
     }
 }

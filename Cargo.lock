@@ -552,6 +552,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minreq"
+version = "2.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05015102dad0f7d61691ca347e9d9d9006685a64aefb3d79eecf62665de2153d"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -632,10 +642,14 @@ dependencies = [
 name = "pursecraft-cli"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "jiff",
+ "minreq",
+ "pursecraft-api",
  "pursecraft-core",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
