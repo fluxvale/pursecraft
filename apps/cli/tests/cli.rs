@@ -122,6 +122,11 @@ fn gate_blocks_unenrolled() {
     for cmd in [
         vec!["add", "coffee", "-4.50"],
         vec!["list"],
+        vec!["category", "new", "Food"],
+        vec!["category", "list"],
+        vec!["categorize"],
+        vec!["assign", "Food", "500"],
+        vec!["budget"],
         vec!["sync"],
         vec!["pair"],
         vec!["join", "o", "c1", "b", "c2"],
@@ -174,7 +179,7 @@ fn enrolled_offline_capture_and_list_work_and_sync_teaches() {
     assert_eq!(list.code, 0, "{}", list.stderr);
     assert!(list.stdout.contains("coffee"), "{}", list.stdout);
     assert!(
-        list.stdout.contains("13 pending sync"),
+        list.stdout.contains("14 pending sync"),
         "the badge shows unsynced captures\n{}",
         list.stdout
     );
@@ -194,7 +199,7 @@ fn enrolled_offline_capture_and_list_work_and_sync_teaches() {
 
     // Full function offline: nothing was lost, the badge persists.
     let again = run_args(home, &["list"]);
-    assert!(again.stdout.contains("13 pending sync"), "{}", again.stdout);
+    assert!(again.stdout.contains("14 pending sync"), "{}", again.stdout);
     assert!(again.stdout.contains("1 transaction"), "{}", again.stdout);
 }
 
@@ -209,8 +214,10 @@ fn add_confirms_and_list_recaps_end_to_end() {
     assert_eq!(
         first.stdout,
         "initialized org \"Personal\", budget \"Personal\", account \"Wallet\"\n\
+         created the \"Inbox\" category — uncategorized captures land there \
+         (review: pursecraft categorize)\n\
          added coffee -4.500 on 2026-10-25 (Wallet, new payee)\n\
-         13 pending sync — run: pursecraft sync\n"
+         14 pending sync — run: pursecraft sync\n"
     );
 
     let second = run_args(home, &["add", "Meralco", "--date", "2026-10-24", "-890"]);
@@ -218,7 +225,7 @@ fn add_confirms_and_list_recaps_end_to_end() {
     assert_eq!(
         second.stdout,
         "added Meralco -890.000 on 2026-10-24 (Wallet, new payee)\n\
-         19 pending sync — run: pursecraft sync\n"
+         20 pending sync — run: pursecraft sync\n"
     );
 
     // Newest first, exact amounts, count footer.
@@ -227,22 +234,28 @@ fn add_confirms_and_list_recaps_end_to_end() {
     let lines: Vec<&str> = list.stdout.lines().collect();
     assert_eq!(
         lines[0],
-        format!("{:<10}   {:<24} {:>12}", "DATE", "PAYEE", "AMOUNT")
+        format!(
+            "{:<10}   {:<24} {:<16} {:>12}",
+            "DATE", "PAYEE", "CATEGORY", "AMOUNT"
+        )
     );
     assert_eq!(
         lines[1],
-        format!("{:<10}   {:<24} {:>12}", "2026-10-25", "coffee", "-4.500")
+        format!(
+            "{:<10}   {:<24} {:<16} {:>12}",
+            "2026-10-25", "coffee", "Inbox", "-4.500"
+        )
     );
     assert_eq!(
         lines[2],
         format!(
-            "{:<10}   {:<24} {:>12}",
-            "2026-10-24", "Meralco", "-890.000"
+            "{:<10}   {:<24} {:<16} {:>12}",
+            "2026-10-24", "Meralco", "Inbox", "-890.000"
         )
     );
     assert_eq!(
         *lines.last().unwrap(),
-        "19 pending sync — run: pursecraft sync"
+        "20 pending sync — run: pursecraft sync"
     );
     assert!(
         list.stdout.contains("2 transactions"),

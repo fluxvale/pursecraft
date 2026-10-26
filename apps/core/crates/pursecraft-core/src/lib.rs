@@ -10,6 +10,7 @@
 //! scope of ADR 0021: orgs own budgets, personal-org provisioning, and
 //! org-level roles and resolution.
 
+pub mod budget;
 pub mod date;
 pub mod domain;
 pub mod hlc;

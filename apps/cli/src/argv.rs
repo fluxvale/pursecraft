@@ -8,20 +8,41 @@
 use std::fmt;
 
 /// One parsed command line (ADR 0023's surface, grown by ADR 0025's
-/// enrollment gate and first sync).
+/// enrollment gate and first sync, and ADR 0027's budgeting commands).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Cmd {
-    /// `add <payee> <amount> [--date YYYY-MM-DD] [--account <name>]` —
-    /// raw strings; amounts and dates are parsed in [`crate::capture`]
-    /// where their error messages live.
+    /// `add <payee> <amount> [--date YYYY-MM-DD] [--account <name>]
+    /// [--category <name>]` — raw strings; amounts and dates are parsed
+    /// in [`crate::capture`] where their error messages live.
     Add {
         payee: String,
         amount: String,
         date: Option<String>,
         account: Option<String>,
+        category: Option<String>,
     },
     /// `list` — the minimal recap.
     List,
+    /// `category new <name> [--group <name>]` (ADR 0027).
+    CategoryNew { name: String, group: Option<String> },
+    /// `category list` (ADR 0027).
+    CategoryList,
+    /// `categorize` (the inbox review listing) or `categorize <txn>
+    /// <category>` (file one transaction) — ADR 0027.
+    Categorize {
+        txn: Option<String>,
+        category: Option<String>,
+    },
+    /// `assign <category> <amount> [--month YYYY-MM]` — raw strings
+    /// (ADR 0027).
+    Assign {
+        category: String,
+        amount: String,
+        month: Option<String>,
+    },
+    /// `budget [show] [YYYY-MM]` — the balances view (ADR 0027); the
+    /// optional `show` word is dropped here.
+    Budget { month: Option<String> },
     /// `login <server-url>` — enroll against the relay; the enrollment
     /// secret rides stdin (ADR 0025).
     Login { server: String },
@@ -57,30 +78,49 @@ impl fmt::Display for UsageError {
 impl std::error::Error for UsageError {}
 
 /// The usage block every usage error carries.
-pub const USAGE: &str = "usage: pursecraft add <payee> <amount> \
-                         [--date YYYY-MM-DD] [--account <name>]\n       \
-                         pursecraft list\n       \
-                         pursecraft login <relay-url>\n       \
-                         pursecraft sync\n       \
-                         pursecraft pair\n       \
-                         pursecraft join <org-id> <org-code> <budget-id> <budget-code>";
+pub const USAGE: &str = "usage: pursecraft add <payee> <amount> [--date YYYY-MM-DD] \
+                        [--account <name>] [--category <name>]\n       \
+                        pursecraft list\n       \
+                        pursecraft category new <name> [--group <name>]\n       \
+                        pursecraft category list\n       \
+                        pursecraft categorize [<txn> <category>]\n       \
+                        pursecraft assign <category> <amount> [--month YYYY-MM]\n       \
+                        pursecraft budget [show] [YYYY-MM]\n       \
+                        pursecraft login <relay-url>\n       \
+                        pursecraft sync\n       \
+                        pursecraft pair\n       \
+                        pursecraft join <org-id> <org-code> <budget-id> <budget-code>";
 
 /// The `--help` text.
 pub const HELP: &str = "\
-pursecraft — fast local-first transaction capture
+pursecraft — fast local-first budgeting
 
 usage:
-  pursecraft add <payee> <amount> [--date YYYY-MM-DD] [--account <name>]
+  pursecraft add <payee> <amount> [--date YYYY-MM-DD] [--account <name>] [--category <name>]
   pursecraft list
+  pursecraft category new <name> [--group <name>]
+  pursecraft category list
+  pursecraft categorize [<txn> <category>]
+  pursecraft assign <category> <amount> [--month YYYY-MM]
+  pursecraft budget [show] [YYYY-MM]
   pursecraft login <relay-url>
   pursecraft sync
   pursecraft pair
   pursecraft join <org-id> <org-code> <budget-id> <budget-code>
 
 commands:
-  add    record a transaction; spending is negative, income positive
-         (add coffee -4.50), amounts allow up to 3 fraction digits
-  list   show the most recent transactions
+  add         record a transaction; spending is negative, income positive
+              (add coffee -4.50), amounts allow up to 3 fraction digits
+  list        show the most recent transactions
+  category    new <name> makes an envelope (--group files it under a
+              label, created if needed); list shows them
+  categorize  review uncaptured classification: bare, it lists the inbox;
+              with <txn> <category> it files one transaction (the txn id
+              is the 8-character short form the listing prints)
+  assign      set what a category holds for a month (assign Food 500,
+              --month defaults to the current month)
+  budget      the can-I-buy-this view: per category assigned, activity,
+              and available (assigned + activity), plus to-be-budgeted
 
   login  enroll this device with the relay (once; the enrollment secret
          is read from stdin, one line); capture stays fully offline
@@ -93,6 +133,10 @@ commands:
 options:
   --date YYYY-MM-DD   transaction date (default: today)
   --account <name>    account to file under (default: Wallet)
+  --category <name>   category to file under (default: the Inbox, where
+                      uncategorized captures wait for pursecraft categorize)
+  --group <name>      group label for category new (created if needed)
+  --month YYYY-MM     month for assign (default: the current month)
 
 data lives under the pursecraft data home (PURSECRAFT_HOME overrides);
 every command except help and version requires a one-time enrollment
@@ -119,6 +163,22 @@ pub fn parse(args: &[String]) -> Result<Cmd, UsageError> {
                 Err(UsageError(format!("list takes no arguments, got {rest:?}")))
             }
         }
+        "category" => parse_category(rest),
+        "categorize" => match rest {
+            [] => Ok(Cmd::Categorize {
+                txn: None,
+                category: None,
+            }),
+            [txn, category] => Ok(Cmd::Categorize {
+                txn: Some(txn.clone()),
+                category: Some(category.clone()),
+            }),
+            other => Err(UsageError(format!(
+                "categorize takes no arguments or <txn> <category>, got {other:?}"
+            ))),
+        },
+        "assign" => parse_assign(rest),
+        "budget" => parse_budget(rest),
         "login" => {
             if rest.len() != 1 {
                 Err(UsageError(format!(
@@ -188,6 +248,7 @@ fn parse_add(args: &[String]) -> Result<Cmd, UsageError> {
     let mut amount: Option<String> = None;
     let mut date: Option<String> = None;
     let mut account: Option<String> = None;
+    let mut category: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let value_after = |flag: &str| -> Result<String, UsageError> {
@@ -202,6 +263,10 @@ fn parse_add(args: &[String]) -> Result<Cmd, UsageError> {
             }
             "--account" => {
                 account = Some(value_after("--account")?);
+                i += 2;
+            }
+            "--category" => {
+                category = Some(value_after("--category")?);
                 i += 2;
             }
             positional => {
@@ -229,7 +294,110 @@ fn parse_add(args: &[String]) -> Result<Cmd, UsageError> {
         amount,
         date,
         account,
+        category,
     })
+}
+
+/// `category new <name> [--group <name>]` | `category list` (ADR 0027).
+fn parse_category(args: &[String]) -> Result<Cmd, UsageError> {
+    match args.split_first() {
+        Some((first, rest)) if first == "new" => {
+            let mut name: Option<String> = None;
+            let mut group: Option<String> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--group" => {
+                        group = Some(
+                            rest.get(i + 1)
+                                .cloned()
+                                .ok_or_else(|| UsageError("--group needs a value".into()))?,
+                        );
+                        i += 2;
+                    }
+                    positional => {
+                        if name.is_some() {
+                            return Err(UsageError(format!(
+                                "unexpected argument {positional:?} (category new takes <name>)"
+                            )));
+                        }
+                        name = Some(positional.to_owned());
+                        i += 1;
+                    }
+                }
+            }
+            let name = name
+                .filter(|n| !n.trim().is_empty())
+                .ok_or_else(|| UsageError("category new needs <name>".into()))?;
+            Ok(Cmd::CategoryNew { name, group })
+        }
+        Some((first, rest)) if first == "list" && rest.is_empty() => Ok(Cmd::CategoryList),
+        _ => Err(UsageError(
+            "expected: category new <name> [--group <name>] or category list".into(),
+        )),
+    }
+}
+
+/// `assign <category> <amount> [--month YYYY-MM]` (ADR 0027).
+fn parse_assign(args: &[String]) -> Result<Cmd, UsageError> {
+    let mut category: Option<String> = None;
+    let mut amount: Option<String> = None;
+    let mut month: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--month" => {
+                month = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| UsageError("--month needs a value".into()))?,
+                );
+                i += 2;
+            }
+            positional => {
+                if category.is_none() {
+                    category = Some(positional.to_owned());
+                } else if amount.is_none() {
+                    amount = Some(positional.to_owned());
+                } else {
+                    return Err(UsageError(format!(
+                        "unexpected argument {positional:?} (assign takes <category> <amount>)"
+                    )));
+                }
+                i += 1;
+            }
+        }
+    }
+    let category = category
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| UsageError("assign needs <category> <amount>".into()))?;
+    let amount = amount
+        .filter(|a| !a.trim().is_empty())
+        .ok_or_else(|| UsageError("assign needs <category> <amount>".into()))?;
+    Ok(Cmd::Assign {
+        category,
+        amount,
+        month,
+    })
+}
+
+/// `budget [show] [YYYY-MM]` — the `show` word is optional anywhere
+/// (ADR 0027); what remains is nothing or one month.
+fn parse_budget(args: &[String]) -> Result<Cmd, UsageError> {
+    let mut rest: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "show").collect();
+    let dropped = args.len() - rest.len();
+    if dropped > 1 {
+        return Err(UsageError("budget takes at most one \"show\"".into()));
+    }
+    match rest.len() {
+        0 => Ok(Cmd::Budget { month: None }),
+        1 => Ok(Cmd::Budget {
+            month: Some(rest.remove(0).clone()),
+        }),
+        _ => Err(UsageError(
+            "budget takes [show] [YYYY-MM] and nothing else".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +417,8 @@ mod tests {
                 payee: "coffee".into(),
                 amount: "-4.50".into(),
                 date: None,
-                account: None
+                account: None,
+                category: None
             }
         );
         let cmd = parse(&args(&[
@@ -260,6 +429,8 @@ mod tests {
             "-890",
             "--account",
             "Wallet",
+            "--category",
+            "Power",
         ]))
         .unwrap();
         assert_eq!(
@@ -268,7 +439,8 @@ mod tests {
                 payee: "Meralco".into(),
                 amount: "-890".into(),
                 date: Some("2026-10-24".into()),
-                account: Some("Wallet".into())
+                account: Some("Wallet".into()),
+                category: Some("Power".into())
             }
         );
     }
@@ -352,6 +524,106 @@ mod tests {
             (args(&["pair", "x"]), "pair takes no arguments"),
             (args(&["join", "a", "b", "c"]), "join takes"),
             (args(&["join", "a", "b", "c", "d", "e"]), "join takes"),
+        ] {
+            let err = parse(&line)
+                .err()
+                .unwrap_or_else(|| panic!("{line:?} parsed"));
+            assert!(err.to_string().contains(want), "{err} lacks {want:?}");
+        }
+    }
+
+    /// The ADR 0027 surface: category/categorize/assign/budget parse
+    /// exactly their shapes and teach on the wrong ones.
+    #[test]
+    fn budgeting_commands_parse() {
+        assert_eq!(
+            parse(&args(&["category", "new", "Food"])),
+            Ok(Cmd::CategoryNew {
+                name: "Food".into(),
+                group: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&["category", "new", "Power", "--group", "Bills"])),
+            Ok(Cmd::CategoryNew {
+                name: "Power".into(),
+                group: Some("Bills".into())
+            })
+        );
+        assert_eq!(parse(&args(&["category", "list"])), Ok(Cmd::CategoryList));
+        assert_eq!(
+            parse(&args(&["categorize"])),
+            Ok(Cmd::Categorize {
+                txn: None,
+                category: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&["categorize", "0192ab", "Food"])),
+            Ok(Cmd::Categorize {
+                txn: Some("0192ab".into()),
+                category: Some("Food".into())
+            })
+        );
+        assert_eq!(
+            parse(&args(&["assign", "Food", "500"])),
+            Ok(Cmd::Assign {
+                category: "Food".into(),
+                amount: "500".into(),
+                month: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&["assign", "Food", "500", "--month", "2026-10"])),
+            Ok(Cmd::Assign {
+                category: "Food".into(),
+                amount: "500".into(),
+                month: Some("2026-10".into())
+            })
+        );
+        for (line, month) in [
+            (args(&["budget"]), None),
+            (args(&["budget", "show"]), None),
+            (args(&["budget", "2026-10"]), Some("2026-10")),
+            (args(&["budget", "show", "2026-10"]), Some("2026-10")),
+            (args(&["budget", "2026-10", "show"]), Some("2026-10")),
+        ] {
+            assert_eq!(
+                parse(&line),
+                Ok(Cmd::Budget {
+                    month: month.map(str::to_owned)
+                })
+            );
+        }
+        for (line, want) in [
+            (args(&["category"]), "expected: category new"),
+            (args(&["category", "new"]), "category new needs"),
+            (
+                args(&["category", "new", "Food", "extra"]),
+                "unexpected argument",
+            ),
+            (
+                args(&["category", "new", "Food", "--group"]),
+                "--group needs a value",
+            ),
+            (args(&["category", "list", "x"]), "expected: category new"),
+            (
+                args(&["categorize", "only"]),
+                "no arguments or <txn> <category>",
+            ),
+            (
+                args(&["categorize", "a", "b", "c"]),
+                "no arguments or <txn> <category>",
+            ),
+            (args(&["assign"]), "assign needs"),
+            (args(&["assign", "Food"]), "assign needs"),
+            (args(&["assign", "Food", "500", "x"]), "unexpected argument"),
+            (
+                args(&["assign", "Food", "500", "--month"]),
+                "--month needs a value",
+            ),
+            (args(&["budget", "2026-10", "2026-11"]), "nothing else"),
+            (args(&["budget", "show", "show"]), "at most one"),
         ] {
             let err = parse(&line)
                 .err()

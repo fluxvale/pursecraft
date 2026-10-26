@@ -9,7 +9,10 @@
 
 pub mod amount;
 pub mod argv;
+pub mod budget;
 pub mod capture;
+pub mod categorize;
+pub mod category;
 pub mod home;
 pub mod idmint;
 pub mod list;
@@ -89,10 +92,16 @@ pub fn run(args: &[String], ctx: impl FnOnce() -> Result<Context, home::NoHomeEr
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
         // The gated surface (ADR 0025): no client interaction before
-        // enrollment.
+        // enrollment. ADR 0027's budgeting commands join it — they touch
+        // data like every other.
         Ok(
             gated @ (argv::Cmd::Add { .. }
             | argv::Cmd::List
+            | argv::Cmd::CategoryNew { .. }
+            | argv::Cmd::CategoryList
+            | argv::Cmd::Categorize { .. }
+            | argv::Cmd::Assign { .. }
+            | argv::Cmd::Budget { .. }
             | argv::Cmd::Sync
             | argv::Cmd::Pair
             | argv::Cmd::Join { .. }),
@@ -116,21 +125,17 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
             amount,
             date,
             account,
+            category,
         } => {
             let raw = capture::RawAdd {
                 payee: &payee,
                 amount: &amount,
                 date: date.as_deref(),
                 account: account.as_deref(),
+                category: category.as_deref(),
             };
             match capture::add(&ctx.home, &session, &raw, ctx.today) {
-                Ok(receipt) => match with_pending_badge(&ctx.home, &session, &receipt) {
-                    Ok(text) => Output::ok(text),
-                    Err(e) => Output::fail(format!(
-                        "{}\nerror: {e}\n",
-                        receipt.confirmation().trim_end()
-                    )),
-                },
+                Ok(receipt) => finish_write(&ctx.home, &session, receipt.confirmation()),
                 Err(e) => Output::fail(format!("error: {e}\n")),
             }
         }
@@ -138,6 +143,50 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
             Ok(text) => Output::ok(text),
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
+        argv::Cmd::CategoryNew { name, group } => {
+            match category::new_category(&ctx.home, &session, &name, group.as_deref()) {
+                Ok(text) => finish_write(&ctx.home, &session, text),
+                Err(e) => Output::fail(format!("error: {e}\n")),
+            }
+        }
+        argv::Cmd::CategoryList => match category::list(&ctx.home, &session) {
+            Ok(text) => Output::ok(text),
+            Err(e) => Output::fail(format!("error: {e}\n")),
+        },
+        argv::Cmd::Categorize { txn, category } => match (txn, category) {
+            (None, _) => match categorize::review(&ctx.home, &session) {
+                Ok(text) => Output::ok(text),
+                Err(e) => Output::fail(format!("error: {e}\n")),
+            },
+            (Some(txn), Some(category)) => {
+                match categorize::file(&ctx.home, &session, &txn, &category) {
+                    Ok(text) => finish_write(&ctx.home, &session, text),
+                    Err(e) => Output::fail(format!("error: {e}\n")),
+                }
+            }
+            (Some(_), None) => unreachable!("argv pairs the selector with a category"),
+        },
+        argv::Cmd::Assign {
+            category,
+            amount,
+            month,
+        } => match budget::assign(
+            &ctx.home,
+            &session,
+            &category,
+            &amount,
+            month.as_deref(),
+            ctx.today,
+        ) {
+            Ok(text) => finish_write(&ctx.home, &session, text),
+            Err(e) => Output::fail(format!("error: {e}\n")),
+        },
+        argv::Cmd::Budget { month } => {
+            match budget::show(&ctx.home, &session, month.as_deref(), ctx.today) {
+                Ok(text) => Output::ok(text),
+                Err(e) => Output::fail(format!("error: {e}\n")),
+            }
+        }
         argv::Cmd::Sync => match run_sync(&ctx.home, &session) {
             Ok(text) => Output::ok(text),
             Err(e) => Output::fail(format!("error: {e}\n")),
@@ -179,27 +228,27 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
     }
 }
 
-/// A capture's confirmation plus ADR 0011's badge (ADR 0025): one extra
-/// line exactly when captures wait for the relay — a synced capture stays
-/// one line. The count derives from the stores (never stored itself); a
-/// failure computing it is LOUD (exit 1, matching `list`) — the caller
-/// prints the confirmation alongside the error so the stored capture is
-/// never hidden.
-fn with_pending_badge(
-    home: &Path,
-    session: &session::Session,
-    receipt: &capture::Receipt,
-) -> Result<String, sync::SyncError> {
-    let pending = match home::load_identity(home)? {
-        Some(identity) => sync::pending_count(home, session, &identity)?,
-        // Unreachable in practice (add just bootstrapped); quiet stays.
-        None => 0,
+/// A write command's finish (ADR 0011's badge, ADR 0025): the
+/// confirmation plus the pending line exactly when ops wait for the
+/// relay. The count derives from the stores; a failure computing it is
+/// LOUD (exit 1) — the caller's confirmation is printed alongside the
+/// error so what was stored is never hidden.
+fn finish_write(home: &Path, session: &session::Session, confirmation: String) -> Output {
+    let pending = match home::load_identity(home) {
+        Ok(Some(identity)) => match sync::pending_count(home, session, &identity) {
+            Ok(pending) => pending,
+            Err(e) => return Output::fail(format!("{}\nerror: {e}\n", confirmation.trim_end())),
+        },
+        // Unreachable in practice (the write just bootstrapped); quiet
+        // stays.
+        Ok(None) => 0,
+        Err(e) => return Output::fail(format!("{}\nerror: {e}\n", confirmation.trim_end())),
     };
-    let mut out = receipt.confirmation();
+    let mut out = confirmation;
     if pending > 0 {
         out.push_str(&format!("{pending} pending sync — run: pursecraft sync\n"));
     }
-    Ok(out)
+    Output::ok(out)
 }
 
 /// `sync`'s preconditions: a world to sync (identity exists — capture

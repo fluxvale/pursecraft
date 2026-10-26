@@ -49,3 +49,4 @@ their replacement.
 | [0024](0024-rendezvous-sync-relay.md) | Rendezvous sync relay: HTTP delta relay on apps/api | Accepted |
 | [0025](0025-authenticated-first-clients.md) | Authenticated-first clients: enrollment gate and first sync | Accepted |
 | [0026](0026-relay-containerization.md) | Relay containerization: one image, two-route health, bounded drain | Accepted |
+| [0027](0027-budgeting-semantics-cli.md) | Budgeting semantics in the CLI: categories, inbox, allocation, balances | Accepted |
