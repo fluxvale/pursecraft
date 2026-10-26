@@ -23,9 +23,14 @@ pub mod cipher;
 pub mod envelope;
 pub mod error;
 pub mod keys;
+pub mod record;
 
 pub use chain::{Grant, KeyChain, Rotation};
 pub use cipher::ScopeCipher;
 pub use error::CryptoError;
 pub use keys::FORMAT_VERSION;
 pub use keys::{DataKey, DeviceKeypair, DevicePublicKey, WrappedLogKey, WrappedOrgKey};
+pub use record::KeyRecord;
+/// The crate's wipe-on-drop wrapper, for the one place a device secret exists
+/// as plain bytes outside `StaticSecret` (ADR 0022's hygiene clause).
+pub use zeroize::Zeroizing;

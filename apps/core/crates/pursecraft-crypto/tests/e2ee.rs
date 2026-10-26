@@ -680,3 +680,22 @@ fn the_cipher_round_trips_its_keychain() {
         "payload"
     );
 }
+
+/// The chain's two presence queries (ADR 0028): what a client asks before it
+/// seals its first op or decides a device is still waiting for its wraps.
+#[test]
+fn presence_queries_report_what_the_chain_actually_holds() {
+    let mut chain = KeyChain::new(DeviceKeypair::generate().unwrap());
+    let org = org();
+    assert!(chain.held_orgs().is_empty(), "a fresh chain holds no org");
+    assert_eq!(chain.current_epoch(&org), None);
+    assert!(!chain.holds_log_key(&ScopeId::Org(org)));
+
+    chain.create_org(org).unwrap();
+    chain.add_log(org, ScopeId::Org(org)).unwrap();
+    assert_eq!(chain.held_orgs(), vec![org]);
+    assert_eq!(chain.current_epoch(&org), Some(0));
+    assert!(chain.holds_log_key(&ScopeId::Org(org)));
+    // A scope it was never given stays absent.
+    assert!(!chain.holds_log_key(&ScopeId::Budget(budget())));
+}

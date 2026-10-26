@@ -326,6 +326,19 @@ impl KeyChain {
             .and_then(|o| o.epochs.keys().copied().max())
     }
 
+    /// The orgs this chain holds any epoch key for — a founder's own org, or
+    /// one it was admitted to (ADR 0028's "has the world's keys arrived").
+    pub fn held_orgs(&self) -> Vec<OrgId> {
+        self.orgs.keys().copied().collect()
+    }
+
+    /// Whether this chain holds a data key for `scope` (ADR 0028's founder
+    /// mint checks it before minting, so a store that already exists can
+    /// never gain a second, unshareable key).
+    pub fn holds_log_key(&self, scope: &ScopeId) -> bool {
+        self.logs.contains_key(scope)
+    }
+
     fn org_key(&self, org: &OrgId, epoch: u64) -> Option<&DataKey> {
         self.orgs.get(org).and_then(|o| o.epochs.get(&epoch))
     }

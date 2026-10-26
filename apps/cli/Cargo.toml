@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 pursecraft-core = { path = "../core/crates/pursecraft-core" }
+# The E2EE adapter (ADR 0022) the CLI installs (ADR 0028): envelope sealing,
+# device keys, and the key records the relay carries. Crypto lives here, not
+# in core or the relay — the dependency points one way (ADR 0001's adapters).
+pursecraft-crypto = { path = "../core/crates/pursecraft-crypto" }
 # Id minting only (`from_u128`/bit inspection): v7 ids are minted in this
 # crate (ADR 0023) from the clock plus /dev/urandom, so no `rng` feature —
 # the `rand` tree stays out of the lockfile (cargo-deny/machete lean).

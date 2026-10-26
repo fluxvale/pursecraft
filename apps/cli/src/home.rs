@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use pursecraft_core::ids::{BudgetId, DeviceId, EntityId, OrgId, UserId};
+use pursecraft_core::ids::{BudgetId, DeviceId, EntityId, OrgId, ScopeId, UserId};
 use serde::{Deserialize, Serialize};
 
 use crate::idmint::mint_uuid;
@@ -176,6 +176,14 @@ pub fn org_log(home: &Path, org: OrgId) -> PathBuf {
 /// The budget log path for `budget` under `home`.
 pub fn budget_log(home: &Path, budget: BudgetId) -> PathBuf {
     home.join(BUDGET_DIR).join(format!("{budget}.ops"))
+}
+
+/// The store path for a typed scope (ADR 0021: one file per log).
+pub fn scope_log(home: &Path, scope: ScopeId) -> PathBuf {
+    match scope {
+        ScopeId::Org(org) => org_log(home, org),
+        ScopeId::Budget(budget) => budget_log(home, budget),
+    }
 }
 
 /// Load the identity file if it exists (`None` when absent). Read-only —

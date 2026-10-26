@@ -15,6 +15,7 @@ pub mod categorize;
 pub mod category;
 pub mod home;
 pub mod idmint;
+pub mod keys;
 pub mod list;
 pub mod relay;
 pub mod session;
@@ -25,15 +26,18 @@ use std::path::{Path, PathBuf};
 
 use pursecraft_core::date::Date;
 
-/// What the environment supplies a command (ADR 0023; grown by ADR 0025):
-/// the data home, the local civil date captures default to, and stdin —
-/// `login`'s enrollment secret (read by `main` only for `login`; every
-/// other command sees an empty string). Injected so tests (and any
-/// embedder) never touch the process environment.
+/// What the environment supplies a command (ADR 0023; grown by ADR 0025 and
+/// ADR 0028): the data home, the local civil date captures default to, stdin —
+/// `login`'s enrollment secret (read by `main` only for `login`; every other
+/// command sees an empty string) — and the self-host E2EE switch. Injected so
+/// tests (and any embedder) never touch the process environment.
 pub struct Context {
     pub home: PathBuf,
     pub today: Date,
     pub stdin: String,
+    /// `false` only when `PURSECRAFT_E2EE=off` (ADR 0028): plaintext payloads,
+    /// the no-E2EE self-host mode ADR 0009 allows.
+    pub e2ee: bool,
 }
 
 /// What one command produced: process exit code, stdout, stderr.
@@ -107,7 +111,21 @@ pub fn run(args: &[String], ctx: impl FnOnce() -> Result<Context, home::NoHomeEr
             | argv::Cmd::Join { .. }),
         ) => match ctx() {
             Ok(ctx) => match session::load(&ctx.home) {
-                Ok(Some(session)) => dispatch(gated, ctx, session),
+                Ok(Some(session)) => match keys::World::open(&ctx.home, ctx.e2ee) {
+                    // The mode's front door (ADR 0028): a ciphered/plaintext
+                    // mismatch refuses here, before any command touches a log.
+                    Ok(world) => {
+                        // A joiner whose keys have not arrived yet says so
+                        // instead of rendering an empty world (ADR 0028);
+                        // `sync` is the way forward, so it is let through.
+                        if world.pending_join() && !matches!(gated, argv::Cmd::Sync) {
+                            Output::fail(format!("error: {}\n", keys::KeysError::NoKeys))
+                        } else {
+                            dispatch(gated, ctx, world, session)
+                        }
+                    }
+                    Err(e) => Output::fail(format!("error: {e}\n")),
+                },
                 Ok(None) => Output::fail(format!("error: {}\n", session::GATE_MESSAGE)),
                 Err(e) => Output::fail(format!("error: {e}\n")),
             },
@@ -117,8 +135,14 @@ pub fn run(args: &[String], ctx: impl FnOnce() -> Result<Context, home::NoHomeEr
     }
 }
 
-/// Dispatch a gated command — the session exists by construction.
-fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
+/// Dispatch a gated command — the session exists and the world's mode has
+/// been resolved by construction.
+fn dispatch(
+    cmd: argv::Cmd,
+    ctx: Context,
+    mut world: keys::World,
+    session: session::Session,
+) -> Output {
     match cmd {
         argv::Cmd::Add {
             payee,
@@ -134,33 +158,33 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
                 account: account.as_deref(),
                 category: category.as_deref(),
             };
-            match capture::add(&ctx.home, &session, &raw, ctx.today) {
-                Ok(receipt) => finish_write(&ctx.home, &session, receipt.confirmation()),
+            match capture::add(&mut world, &session, &raw, ctx.today) {
+                Ok(receipt) => finish_write(&world, &session, receipt.confirmation()),
                 Err(e) => Output::fail(format!("error: {e}\n")),
             }
         }
-        argv::Cmd::List => match list::list(&ctx.home, &session) {
+        argv::Cmd::List => match list::list(&world, &session) {
             Ok(text) => Output::ok(text),
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
         argv::Cmd::CategoryNew { name, group } => {
-            match category::new_category(&ctx.home, &session, &name, group.as_deref()) {
-                Ok(text) => finish_write(&ctx.home, &session, text),
+            match category::new_category(&world, &session, &name, group.as_deref()) {
+                Ok(text) => finish_write(&world, &session, text),
                 Err(e) => Output::fail(format!("error: {e}\n")),
             }
         }
-        argv::Cmd::CategoryList => match category::list(&ctx.home, &session) {
+        argv::Cmd::CategoryList => match category::list(&world, &session) {
             Ok(text) => Output::ok(text),
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
         argv::Cmd::Categorize { txn, category } => match (txn, category) {
-            (None, _) => match categorize::review(&ctx.home, &session) {
+            (None, _) => match categorize::review(&world, &session) {
                 Ok(text) => Output::ok(text),
                 Err(e) => Output::fail(format!("error: {e}\n")),
             },
             (Some(txn), Some(category)) => {
-                match categorize::file(&ctx.home, &session, &txn, &category) {
-                    Ok(text) => finish_write(&ctx.home, &session, text),
+                match categorize::file(&world, &session, &txn, &category) {
+                    Ok(text) => finish_write(&world, &session, text),
                     Err(e) => Output::fail(format!("error: {e}\n")),
                 }
             }
@@ -171,23 +195,23 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
             amount,
             month,
         } => match budget::assign(
-            &ctx.home,
+            &world,
             &session,
             &category,
             &amount,
             month.as_deref(),
             ctx.today,
         ) {
-            Ok(text) => finish_write(&ctx.home, &session, text),
+            Ok(text) => finish_write(&world, &session, text),
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
         argv::Cmd::Budget { month } => {
-            match budget::show(&ctx.home, &session, month.as_deref(), ctx.today) {
+            match budget::show(&world, &session, month.as_deref(), ctx.today) {
                 Ok(text) => Output::ok(text),
                 Err(e) => Output::fail(format!("error: {e}\n")),
             }
         }
-        argv::Cmd::Sync => match run_sync(&ctx.home, &session) {
+        argv::Cmd::Sync => match run_sync(&mut world, &session) {
             Ok(text) => Output::ok(text),
             Err(e) => Output::fail(format!("error: {e}\n")),
         },
@@ -195,7 +219,7 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
             let no_world =
                 "nothing to pair yet — capture a transaction first: pursecraft add coffee -4.50";
             match home::load_identity(&ctx.home) {
-                Ok(Some(identity)) => match sync::pair(&ctx.home, &session, &identity) {
+                Ok(Some(identity)) => match sync::pair(&world, &session, &identity) {
                     Ok(text) => Output::ok(text),
                     Err(e) => Output::fail(format!("error: {e}\n")),
                 },
@@ -215,7 +239,7 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
                 budget_id: &budget_id,
                 budget_code: &budget_code,
             };
-            match sync::join(&ctx.home, &session, &args) {
+            match sync::join(&mut world, &session, &args) {
                 Ok(text) => Output::ok(text),
                 Err(e) => Output::fail(format!("error: {e}\n")),
             }
@@ -233,9 +257,9 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
 /// relay. The count derives from the stores; a failure computing it is
 /// LOUD (exit 1) — the caller's confirmation is printed alongside the
 /// error so what was stored is never hidden.
-fn finish_write(home: &Path, session: &session::Session, confirmation: String) -> Output {
-    let pending = match home::load_identity(home) {
-        Ok(Some(identity)) => match sync::pending_count(home, session, &identity) {
+fn finish_write(world: &keys::World, session: &session::Session, confirmation: String) -> Output {
+    let pending = match home::load_identity(&world.home) {
+        Ok(Some(identity)) => match sync::pending_count(world, session, &identity) {
             Ok(pending) => pending,
             Err(e) => return Output::fail(format!("{}\nerror: {e}\n", confirmation.trim_end())),
         },
@@ -251,11 +275,19 @@ fn finish_write(home: &Path, session: &session::Session, confirmation: String) -
     Output::ok(out)
 }
 
-/// `sync`'s preconditions: a world to sync (identity exists — capture
-/// owns bootstrap, ADR 0023), then the ordinary sync (ADR 0025).
-fn run_sync(home: &Path, session: &session::Session) -> Result<String, sync::SyncError> {
-    match home::load_identity(home)? {
-        Some(identity) => Ok(sync::sync(home, session, &identity)?.render()),
+/// `sync`'s preconditions: a world to sync (identity exists — capture owns
+/// bootstrap, ADR 0023), then the ordinary sync (ADR 0025). An unfinished
+/// join has no identity yet by design and is the one exception (ADR 0028):
+/// `sync` finishes it.
+fn run_sync(
+    world: &mut keys::World,
+    session: &session::Session,
+) -> Result<String, sync::SyncError> {
+    match home::load_identity(&world.home)? {
+        Some(identity) => Ok(sync::sync(world, session, &identity)?.render()),
+        None if sync::has_pending_join(&world.home)? => {
+            Ok(sync::resume_join(world, session)?.render())
+        }
         None => Err(sync::SyncError::NotBootstrapped),
     }
 }

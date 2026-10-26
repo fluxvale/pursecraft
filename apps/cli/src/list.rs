@@ -4,19 +4,19 @@
 //! projections ([ADR 0016](../../../docs/decisions/0016-core-domain-model.md)).
 
 use std::fmt;
-use std::path::Path;
 
 use pursecraft_core::date::Date;
 use pursecraft_core::domain::{Entity, Transaction};
-use pursecraft_core::ids::{EntityId, TransactionId};
+use pursecraft_core::ids::{EntityId, ScopeId, TransactionId};
 use pursecraft_core::ops::ApplyError;
 use pursecraft_core::resolve::{
     CategoryResolution, transaction_category, transaction_payee, transaction_visible,
 };
-use pursecraft_core::store::{LocalStore, StoreError};
+use pursecraft_core::store::StoreError;
 use pursecraft_core::sync::SyncSession;
 
 use crate::home::{IdentityError, budget_log, load_identity};
+use crate::keys::{KeysError, World};
 use crate::session::Session;
 use crate::sync;
 
@@ -26,6 +26,7 @@ pub const RECENT: usize = 10;
 #[derive(Debug)]
 pub enum ListError {
     Identity(IdentityError),
+    Keys(KeysError),
     Store(StoreError),
     /// A stored op was rejected during replay — loud, never merged.
     Apply(ApplyError),
@@ -37,6 +38,7 @@ impl fmt::Display for ListError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Identity(e) => write!(f, "{e}"),
+            Self::Keys(e) => write!(f, "{e}"),
             Self::Store(e) => write!(f, "{e}"),
             Self::Apply(e) => write!(f, "stored op rejected by the engine: {e}"),
             Self::Sync(e) => write!(f, "{e}"),
@@ -48,6 +50,7 @@ impl std::error::Error for ListError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Identity(e) => Some(e),
+            Self::Keys(e) => Some(e),
             Self::Store(e) => Some(e),
             Self::Apply(e) => Some(e),
             Self::Sync(e) => Some(e),
@@ -58,6 +61,12 @@ impl std::error::Error for ListError {
 impl From<IdentityError> for ListError {
     fn from(e: IdentityError) -> Self {
         Self::Identity(e)
+    }
+}
+
+impl From<KeysError> for ListError {
+    fn from(e: KeysError) -> Self {
+        Self::Keys(e)
     }
 }
 
@@ -86,17 +95,18 @@ const EMPTY: &str = "no transactions yet\n\ntry: pursecraft add coffee -4.50\n";
 /// and, when captures wait for the relay, the visible pending-sync badge
 /// (ADR 0011, ADR 0025). Read-only — an absent world shows the
 /// getting-started hint.
-pub fn list(home: &Path, session: &Session) -> Result<String, ListError> {
+pub fn list(world: &World, session: &Session) -> Result<String, ListError> {
+    let home = world.home.as_path();
     let Some(identity) = load_identity(home)? else {
         return Ok(EMPTY.to_owned());
     };
     // The badge (ADR 0025): derived, never stored; zero after a sync.
-    let pending = sync::pending_count(home, session, &identity)?;
+    let pending = sync::pending_count(world, session, &identity)?;
     let path = budget_log(home, identity.budget_id);
     if !path.exists() {
         return Ok(with_pending_sync(EMPTY.to_owned(), pending));
     }
-    let store = LocalStore::open(&path)?;
+    let store = world.open_log(ScopeId::Budget(identity.budget_id))?;
     let mut replay = SyncSession::new();
     replay.apply_delta(store.delta_since(0))?;
     let state = replay.state();

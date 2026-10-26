@@ -62,6 +62,9 @@ fn run_with(home: &Path, stdin: &str, args: &[&str]) -> pursecraft_cli::Output {
             home: home.to_owned(),
             today: Date::new(2026, 10, 25).unwrap(),
             stdin: stdin.to_owned(),
+            // The self-host mode (ADR 0028): these suites exercise the
+            // plaintext path; the E2EE path has its own suite.
+            e2ee: false,
         })
     })
 }

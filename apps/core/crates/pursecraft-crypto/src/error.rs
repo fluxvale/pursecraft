@@ -34,6 +34,11 @@ pub enum CryptoError {
     /// offered for — misrouted key material, refused rather than stored
     /// under the wrong identity.
     WrongKeySlot,
+    /// A key record ([ADR 0028]) that is not a v1 record of a known kind —
+    /// foreign bytes, an unknown kind, or a shape that does not match its
+    /// own tag. Refused, never skipped: a device that ignored its own
+    /// rotation wrap would keep sealing under a dead epoch.
+    BadRecord(String),
     /// The OS random generator failed. The ecosystem convention panics
     /// here; this crate surfaces it instead — no key was minted, so
     /// nothing is half-created.
@@ -69,6 +74,7 @@ impl fmt::Display for CryptoError {
                 "key wrap does not match the org/scope/epoch it was offered for"
             ),
             Self::Rng(e) => write!(f, "OS random generator failed: {e}"),
+            Self::BadRecord(detail) => write!(f, "not a v1 key record: {detail}"),
         }
     }
 }
@@ -138,6 +144,10 @@ mod tests {
         assert_eq!(
             CryptoError::Rng("entropy exhausted".into()).to_string(),
             "OS random generator failed: entropy exhausted"
+        );
+        assert_eq!(
+            CryptoError::BadRecord("unknown kind \"epoch\"".into()).to_string(),
+            "not a v1 key record: unknown kind \"epoch\""
         );
     }
 }
