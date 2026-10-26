@@ -538,7 +538,7 @@ fn sync_keys(
     // a member cannot register a key for someone else.
     let mut known: Vec<(DeviceId, pursecraft_crypto::DevicePublicKey)> = Vec::new();
     for wire in &outcome.pulled {
-        // An unparseable record is a granted member's planted bytes, not a
+        // An unparsable record is a granted member's planted bytes, not a
         // reason to stop syncing: skip it here (the install pass already
         // collected it as a conflict) rather than wedge the data path.
         let Ok(record) = pursecraft_crypto::KeyRecord::parse(&wire.record) else {

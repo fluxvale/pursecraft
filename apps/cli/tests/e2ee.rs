@@ -650,7 +650,7 @@ fn a_poisoned_key_record_reports_but_does_not_wedge_the_data_sync() {
     let tampered = r#"{"v":1,"kind":"log","wrap":{"v":1,"scope":{"Org":""#.to_owned()
         + &org_id
         + r#""},"epoch":0,"n":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","c":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#;
-    // And an unparseable string: the relay stores bytes verbatim by design, so
+    // And an unparsable string: the relay stores bytes verbatim by design, so
     // this must not stop a sync either.
     client
         .publish_keys(org, &[tampered, "not-a-key-record at all".to_owned()])
