@@ -124,7 +124,13 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
                 account: account.as_deref(),
             };
             match capture::add(&ctx.home, &session, &raw, ctx.today) {
-                Ok(receipt) => Output::ok(with_pending_badge(&ctx.home, &session, receipt)),
+                Ok(receipt) => match with_pending_badge(&ctx.home, &session, &receipt) {
+                    Ok(text) => Output::ok(text),
+                    Err(e) => Output::fail(format!(
+                        "{}\nerror: {e}\n",
+                        receipt.confirmation().trim_end()
+                    )),
+                },
                 Err(e) => Output::fail(format!("error: {e}\n")),
             }
         }
@@ -175,26 +181,25 @@ fn dispatch(cmd: argv::Cmd, ctx: Context, session: session::Session) -> Output {
 
 /// A capture's confirmation plus ADR 0011's badge (ADR 0025): one extra
 /// line exactly when captures wait for the relay — a synced capture stays
-/// one line. The count derives from the stores (never stored itself).
+/// one line. The count derives from the stores (never stored itself); a
+/// failure computing it is LOUD (exit 1, matching `list`) — the caller
+/// prints the confirmation alongside the error so the stored capture is
+/// never hidden.
 fn with_pending_badge(
     home: &Path,
     session: &session::Session,
-    receipt: capture::Receipt,
-) -> String {
-    let pending = match home::load_identity(home) {
-        Ok(Some(identity)) => match sync::pending_count(home, session, &identity) {
-            Ok(pending) => pending,
-            Err(e) => return format!("error: {e}\n"),
-        },
+    receipt: &capture::Receipt,
+) -> Result<String, sync::SyncError> {
+    let pending = match home::load_identity(home)? {
+        Some(identity) => sync::pending_count(home, session, &identity)?,
         // Unreachable in practice (add just bootstrapped); quiet stays.
-        Ok(None) => 0,
-        Err(e) => return format!("error: {e}\n"),
+        None => 0,
     };
     let mut out = receipt.confirmation();
     if pending > 0 {
         out.push_str(&format!("{pending} pending sync — run: pursecraft sync\n"));
     }
-    out
+    Ok(out)
 }
 
 /// `sync`'s preconditions: a world to sync (identity exists — capture
@@ -232,8 +237,7 @@ fn login(home: &Path, server: &str, stdin: &str) -> Result<String, LoginError> {
 /// optional port, no path — TLS arrives with the hosted-relay slice.
 fn normalize_server(server: &str) -> Result<String, LoginError> {
     let server = server.trim().trim_end_matches('/');
-    if let Some(rest) = server.strip_prefix("https://") {
-        let _ = rest;
+    if server.starts_with("https://") {
         return Err(LoginError::BadServer(
             "v1 speaks plain http to a local relay; TLS arrives with the hosted-relay slice".into(),
         ));

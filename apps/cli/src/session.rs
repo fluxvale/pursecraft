@@ -22,7 +22,9 @@ const SESSION_VERSION: u16 = 1;
 /// The enrollment record (ADR 0025): what a client needs to reach its sync
 /// home. `device_id` is the SERVER's mint (enrollment response), not a
 /// local one — the relay enforces that pushed ops carry it.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+// No `Debug`: a derived printer would make the token one `{:?}` away
+// from a log line (ADR 0025: the token appears only in the header).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub version: u16,
     /// The relay base URL (`http://host:port`, no path — ADR 0025).
@@ -161,7 +163,8 @@ mod tests {
         assert!(load(tmp.path()).unwrap().is_none(), "no session, no gate");
         let session = session();
         publish(tmp.path(), &session).unwrap();
-        assert_eq!(load(tmp.path()).unwrap(), Some(session));
+        let loaded = load(tmp.path()).unwrap();
+        assert!(loaded == Some(session), "round-trips");
         // Atomic: no tmp straggler.
         let names: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()

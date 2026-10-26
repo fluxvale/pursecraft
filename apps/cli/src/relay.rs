@@ -19,6 +19,13 @@ use pursecraft_core::wire::OpMeta;
 const TIMEOUT_SECS: u64 = 30;
 
 /// A relay call failed — transport, refusal, or a malformed answer.
+///
+/// The relay's error shape is `{"error": code, "message": …}`; the code
+/// is coarse ("forbidden" covers wrong-secret, ungranted, and expired),
+/// so teaching branches below match on the MESSAGE prose — strings owned
+/// by pursecraft-api's `AuthError` in this same repo, pinned end-to-end
+/// by tests/sync.rs (the expired and invalid pairings and the refused
+/// enrollment secret). A message drift there fails a test here.
 #[derive(Debug)]
 pub enum RelayError {
     /// No HTTP conversation happened (connection refused, timeout, DNS).
@@ -92,14 +99,12 @@ impl<'a> Relay<'a> {
 
     /// `POST /v1/{kind}/{id}` — create the scope; the creator is granted
     /// and one single-use pairing code is minted (ADR 0024).
-    pub fn create_scope(&self, scope: ScopeId) -> Result<ScopeCreated, RelayError> {
+    pub fn create_scope(&self, scope: ScopeId) -> Result<String, RelayError> {
         let resp = self.send(minreq::post(self.scope_url(scope)), None)?;
-        let pairing_code = resp
-            .get("pairing_code")
+        resp.get("pairing_code")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| RelayError::BadAnswer("scope create missing code".into()))?
-            .to_owned();
-        Ok(ScopeCreated { pairing_code })
+            .map(str::to_owned)
+            .ok_or_else(|| RelayError::BadAnswer("scope create missing code".into()))
     }
 
     /// `POST /v1/{kind}/{id}/pairing-codes` — mint a fresh single-use code.
@@ -188,7 +193,9 @@ impl<'a> Relay<'a> {
             has_more: resp
                 .get("has_more")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+                .ok_or_else(|| {
+                    RelayError::BadAnswer("pull answer missing a boolean has_more".into())
+                })?,
         })
     }
 
@@ -299,12 +306,6 @@ fn decode_body(server: &str, response: Response) -> Result<serde_json::Value, Re
         .map_err(|e| RelayError::BadAnswer(format!("a 2xx body does not decode: {e}")))
 }
 
-/// A scope's creation answer: the single-use pairing code for the next
-/// device (the caller prints it; it is shown once, ADR 0024).
-pub struct ScopeCreated {
-    pub pairing_code: String,
-}
-
 /// One pulled op, wire-shaped: the relay's sequence, the server-visible
 /// metadata, and the payload string — decoded client-side (ADR 0024).
 #[derive(Clone, Debug)]
@@ -315,7 +316,10 @@ pub struct PullOpWire {
 }
 
 /// One pull page (ADR 0024): ops ascending since the cursor, and
-/// whether more pages remain (`has_more` drives the loop).
+/// whether more pages remain (`has_more` drives the loop; a missing or
+/// non-boolean `has_more` is a loud [`RelayError::BadAnswer`], never a
+/// guess — a guessed `false` would strand the log's tail behind a cursor
+/// that claims "synced").
 #[derive(Clone, Debug)]
 pub struct PullPage {
     pub ops: Vec<PullOpWire>,

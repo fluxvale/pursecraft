@@ -396,8 +396,24 @@ fn a_late_joiner_catches_up_and_round_trips() {
     );
     assert_eq!(a.budget_state(), b.budget_state());
 
-    // And the round trip: the joiner captures, the founder catches it.
+    // The joiner ADOPTED the founder's account (hostile-review finding:
+    // the joiner's first capture must not mint a twin Wallet) — one
+    // account after join, still one after the joiner captures.
+    let account_count = |home: &Home| {
+        home.budget_state()
+            .entities()
+            .filter(|e| matches!(e, pursecraft_core::domain::Entity::Account(_)))
+            .count()
+    };
+    assert_eq!(account_count(&b), 1, "join adopts, never twins");
     assert_eq!(b.run("", &["add", "fare", "-12.5"]).code, 0);
+    assert_eq!(
+        account_count(&b),
+        1,
+        "the joiner's capture files into the adopted account"
+    );
+
+    // And the round trip: the joiner captures, the founder catches it.
     assert_eq!(b.run("", &["sync"]).code, 0);
     assert_eq!(a.run("", &["sync"]).code, 0);
     assert_eq!(a.budget_state(), b.budget_state());
@@ -539,6 +555,48 @@ fn re_login_stranded_ops_are_counted_never_hidden() {
     assert!(list.stdout.contains("bread"), "{}", list.stdout);
 }
 
+/// A badge failure is loud, never a faked success (hostile-review
+/// finding): with an unreadable `sync.json`, `add` still stores the
+/// transaction — and says so on stderr, exit 1, confirmation included.
+#[test]
+fn add_with_corrupt_sync_state_stores_loudly() {
+    let relay = LiveRelay::start("corrupt-state");
+    let home = Home::new("corrupt-state");
+    assert_eq!(home.login(&relay).code, 0);
+    assert_eq!(home.run("", &["add", "coffee", "-4.50"]).code, 0);
+    assert_eq!(home.run("", &["sync"]).code, 0);
+
+    std::fs::write(home.path().join("sync.json"), b"{ nope").unwrap();
+    let add = home.run("", &["add", "tea", "-3"]);
+    assert_eq!(add.code, 1, "{}{}", add.stdout, add.stderr);
+    assert!(
+        add.stderr.contains("added tea"),
+        "the stored capture is named, never hidden\n{}",
+        add.stderr
+    );
+    assert!(
+        add.stderr.contains("sync.json") && add.stderr.contains("sync state"),
+        "{}",
+        add.stderr
+    );
+    assert!(add.stdout.is_empty(), "{}", add.stdout);
+    // The capture itself landed — verified through the engine, since
+    // `list` refuses the same corrupt state (correctly: its badge IS
+    // its job).
+    let mut replay = SyncSession::new();
+    let identity = load_identity(home.path()).unwrap().unwrap();
+    let store = LocalStore::open(&budget_log(home.path(), identity.budget_id)).unwrap();
+    replay.apply_delta(store.delta_since(0)).unwrap();
+    assert_eq!(
+        replay
+            .state()
+            .entities()
+            .filter(|e| matches!(e, pursecraft_core::domain::Entity::Transaction(_)))
+            .count(),
+        2,
+        "coffee and tea both stored"
+    );
+}
 /// Session files carry the server's device mint (enrollment), not a local
 /// one — the relay's caller-identity check depends on it (ADR 0025).
 #[test]

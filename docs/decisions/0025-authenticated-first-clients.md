@@ -170,13 +170,16 @@ headline; invites/accounts ([ADR 0024]) automate the same shape later.
 - **Torn joins resume, never re-join:** after the identity lands, a crash
   anywhere later (membership ops, cursors, the closing sync) resumes as
   an ordinary `pursecraft sync` — the identity is the root and re-join is
-  refused. One honest edge: a crash in the tiny window between the
+  refused. Two honest edges: a crash in the tiny window between the
   identity and the membership ops leaves the membership unminted, and the
-  next capture's ensure-style bootstrap self-heals it
-  ([ADR 0023]'s `provision_personal_org` probes the missing fields) —
-  with the joiner's role claimed as Owner rather than Editor. Roles are
-  pre-accounts client claims ([ADR 0024]); the enforcement slice is where
-  that stops being cosmetic.
+  next capture's ensure-style bootstrap self-heals it ([ADR 0023]'s
+  `provision_personal_org` probes the missing fields) — with the joiner's
+  role claimed as Owner rather than Editor (roles are pre-accounts client
+  claims, [ADR 0024]; the enforcement slice is where that stops being
+  cosmetic). And a bundle that fails validation *after* redemption (a
+  dead org, ids that parse but point nowhere) burns the single-use codes
+  — structurally unavoidable, since the redeem IS the grant that lets
+  the joiner pull and validate; the recovery is fresh codes via `pair`.
 
 ### Pending state (ADR 0011's badge, CLI form)
 
@@ -185,10 +188,10 @@ headline; invites/accounts ([ADR 0024]) automate the same shape later.
   looks: `add`'s confirmation (the capture moment, when "it's offline,
   did it stick?" is the question) and `list`'s footer. It disappears
   after a successful sync; a synced capture stays one line.
-- Sync failures teach rather than alarm: unreachable relay → `error: … N
-  ops remain pending — retry: pursecraft sync`; a refused token (401) →
-  re-enroll with `pursecraft login`; a refused scope (403) → the relay's
-  message plus the pairing hint.
+- Sync failures teach rather than alarm: unreachable relay → `cannot
+  reach the relay at … — captures stay queued; retry: pursecraft sync`;
+  a refused token (401) → re-enroll with `pursecraft login`; a refused
+  scope (403) → the relay's message plus the pairing/restore hint.
 
 ### Stranded ops: the re-login edge, honest and visible
 
@@ -198,6 +201,12 @@ them (local ops beyond `pushed_through` whose device is the founding
 device, not the session's) and reports the count once per run. They are
 never silently dropped, never block new captures or pushes, and remain in
 the log and in `list` forever — local-first means unsyncable, not gone.
+One recorded blind spot: the count covers ops **never pushed** (beyond
+`pushed_through`). A relay wiped *after* a full sync strands the pushed
+history too — there `sync` reports `pushed 0, pulled 0` beside a scope
+creation it should not have needed (the wipe's visible symptom), not a
+stranded count; the authoritative fix for a wiped relay is restoring its
+data directory.
 
 ## Alternatives considered
 

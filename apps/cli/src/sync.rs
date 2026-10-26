@@ -13,11 +13,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use pursecraft_core::domain::{
-    AccountField, AccountKind, Entity, Field, MembershipField, MembershipRole,
-};
+use pursecraft_core::domain::{AccountField, AccountKind, Field, MembershipField, MembershipRole};
 use pursecraft_core::ids::{BudgetId, EntityId, OrgId, ScopeId, UserId};
 use pursecraft_core::ops::{ApplyError, Op};
 use pursecraft_core::org::org_alive;
@@ -62,6 +60,12 @@ pub enum SyncError {
         source: serde_json::Error,
     },
     Io(std::io::Error),
+    /// `sync.json` does not decode or speaks an unknown version — loud,
+    /// never reset (the identity discipline, ADR 0023).
+    BadState {
+        path: PathBuf,
+        detail: String,
+    },
     /// `pair` before the relay knows this home's scopes.
     NotSyncedYet,
     /// `sync` or `pair` before the first capture — bootstrap is capture's
@@ -86,6 +90,9 @@ impl fmt::Display for SyncError {
                 "a pulled op ({scope} seq {seq}) does not decode: {source} — nothing was applied past it"
             ),
             Self::Io(e) => write!(f, "io error: {e}"),
+            Self::BadState { path, detail } => {
+                write!(f, "{} is not a usable sync state: {detail}", path.display())
+            }
             Self::NotSyncedYet => {
                 write!(
                     f,
@@ -227,7 +234,7 @@ pub fn sync(home: &Path, session: &Session, identity: &Identity) -> Result<SyncR
         // already exists — fine exactly when this device is granted.
         if !file.scopes.contains_key(&key) {
             match relay.create_scope(scope) {
-                Ok(created) => {
+                Ok(code) => {
                     if receipt.created.is_none() {
                         receipt.created = Some(PairingBundle {
                             server: session.server.to_owned(),
@@ -239,8 +246,8 @@ pub fn sync(home: &Path, session: &Session, identity: &Identity) -> Result<SyncR
                     }
                     let bundle = receipt.created.as_mut().expect("just set");
                     match scope {
-                        ScopeId::Org(_) => bundle.org_code = created.pairing_code,
-                        ScopeId::Budget(_) => bundle.budget_code = created.pairing_code,
+                        ScopeId::Org(_) => bundle.org_code = code,
+                        ScopeId::Budget(_) => bundle.budget_code = code,
                     }
                 }
                 Err(RelayError::Status { code: 409, .. }) => {
@@ -348,8 +355,8 @@ pub fn join(home: &Path, session: &Session, args: &JoinArgs<'_>) -> Result<Strin
     if load_identity(home)?.is_some() {
         return Err(SyncError::AlreadyHasWorld);
     }
-    let org_id = parse_org_id(args.org_id)?;
-    let budget_id = parse_budget_id(args.budget_id)?;
+    let org_id = parse_v7_id(args.org_id, "org id", OrgId::new)?;
+    let budget_id = parse_v7_id(args.budget_id, "budget id", BudgetId::new)?;
     let org_scope = ScopeId::Org(org_id);
     let budget_scope = ScopeId::Budget(budget_id);
     let relay = Relay::new(&session.server, &session.token);
@@ -380,7 +387,13 @@ pub fn join(home: &Path, session: &Session, args: &JoinArgs<'_>) -> Result<Strin
     // The joiner's slice, minted locally (ADR 0025): a fresh user and
     // membership (Editor — the pairing code is the authorization; roles
     // are data until an enforcement slice, ADR 0021), and the joined
-    // budget's earliest live account as the capture default.
+    // budget's earliest live account ADOPTED as the capture default —
+    // a Wallet is minted only when none exists.
+    let adopted = earliest_live_account(budget_session.state());
+    let account_id = match adopted {
+        Some((id, _)) => id,
+        None => EntityId::new(mint_uuid()).expect("minted v7"),
+    };
     let identity = Identity {
         version: 1,
         device_id: session.device_id,
@@ -388,15 +401,14 @@ pub fn join(home: &Path, session: &Session, args: &JoinArgs<'_>) -> Result<Strin
         org_id,
         membership_id: EntityId::new(mint_uuid()).expect("minted v7"),
         budget_id,
-        account_id: EntityId::new(mint_uuid()).expect("minted v7"),
+        account_id,
     };
     let mut minter = Minter::new(session, &identity);
     minter.absorb(org_session.clock());
     minter.absorb(budget_session.clock());
 
     let mut account_ops = Vec::new();
-    let account = earliest_live_account(budget_session.state());
-    let account_name = match account {
+    let account_name = match adopted {
         Some((_, name)) => name,
         None => {
             let anchor = anchored_at(identity.account_id);
@@ -558,12 +570,14 @@ fn drain_pull(
                 })
             })
             .collect::<Result<Vec<_>, SyncError>>()?;
-        sync_session.apply_delta(&batch)?;
+        let summary = sync_session.apply_delta(&batch)?;
         for sequenced in &batch {
             sink::sink(store, sequenced.op.clone())?;
         }
         remote_seen = page.ops.last().expect("nonempty page").seq;
-        pulled += batch.len() as u64;
+        // New-to-here ops only (applied + stale): echoes of this device's
+        // own pushes are duplicates and must not pad the count.
+        pulled += summary.applied + summary.stale;
         if !page.has_more {
             return Ok((remote_seen, pulled));
         }
@@ -605,36 +619,21 @@ fn open_store(path: &std::path::Path) -> Result<LocalStore, SyncError> {
 /// The earliest live account in a budget state (ADR 0016's deterministic
 /// earliest-created convention) — the joiner's default.
 fn earliest_live_account(state: &pursecraft_core::ops::ScopeState) -> Option<(EntityId, String)> {
-    state
-        .entities()
-        .filter_map(|entity| match entity {
-            Entity::Account(a) if !a.deleted && a.name.is_some() => Some((
-                EntityId::new(a.id.as_uuid()).expect("stored v7"),
-                a.name.clone().unwrap_or_default(),
-            )),
-            _ => None,
-        })
-        .min()
+    crate::capture::live_accounts(state).into_iter().min()
 }
 
 /// Parse one join-bundle scope id with a teaching failure — the ids come
 /// from `pursecraft pair`'s printed bundle and are UUIDv7.
-fn parse_org_id(raw: &str) -> Result<OrgId, SyncError> {
+fn parse_v7_id<T>(
+    raw: &str,
+    what: &str,
+    mk: impl Fn(uuid::Uuid) -> Result<T, pursecraft_core::ids::IdVersionError>,
+) -> Result<T, SyncError> {
     let uuid = uuid::Uuid::parse_str(raw.trim())
-        .map_err(|e| SyncError::BadBundle(format!("the org id {raw:?} is not a uuid: {e}")))?;
-    OrgId::new(uuid).map_err(|_| {
+        .map_err(|e| SyncError::BadBundle(format!("the {what} {raw:?} is not a uuid: {e}")))?;
+    mk(uuid).map_err(|_| {
         SyncError::BadBundle(format!(
-            "the org id {raw:?} is not a v7 id from pursecraft pair"
-        ))
-    })
-}
-
-fn parse_budget_id(raw: &str) -> Result<BudgetId, SyncError> {
-    let uuid = uuid::Uuid::parse_str(raw.trim())
-        .map_err(|e| SyncError::BadBundle(format!("the budget id {raw:?} is not a uuid: {e}")))?;
-    BudgetId::new(uuid).map_err(|_| {
-        SyncError::BadBundle(format!(
-            "the budget id {raw:?} is not a v7 id from pursecraft pair"
+            "the {what} {raw:?} is not a v7 id from pursecraft pair"
         ))
     })
 }
@@ -677,18 +676,18 @@ fn load_sync_file(home: &Path) -> Result<SyncFile, SyncError> {
         return Ok(SyncFile::default());
     }
     let bytes = std::fs::read(&path)?;
-    let file: SyncFile = serde_json::from_slice(&bytes).map_err(|source| {
-        SyncError::Io(std::io::Error::other(format!(
-            "{} does not decode: {source}",
-            path.display()
-        )))
+    let file: SyncFile = serde_json::from_slice(&bytes).map_err(|source| SyncError::BadState {
+        path: path.clone(),
+        detail: format!("does not decode: {source}"),
     })?;
     if file.version != SYNC_VERSION {
-        return Err(SyncError::Io(std::io::Error::other(format!(
-            "{} has sync-state version {}, this pursecraft supports {SYNC_VERSION}",
-            path.display(),
-            file.version
-        ))));
+        return Err(SyncError::BadState {
+            path,
+            detail: format!(
+                "version {} is not this pursecraft's {SYNC_VERSION}",
+                file.version
+            ),
+        });
     }
     Ok(file)
 }
@@ -707,5 +706,9 @@ fn save_sync_file(home: &Path, file: &SyncFile) -> Result<(), SyncError> {
         out.sync_all()?;
     }
     std::fs::rename(&tmp, &path)?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(home) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }

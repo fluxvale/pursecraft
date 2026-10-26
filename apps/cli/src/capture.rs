@@ -469,16 +469,10 @@ fn ensure_account(
     Ok(emitted)
 }
 
-/// Resolve the capture account (ADR 0023): `wanted` by exact live name
-/// (earliest id on duplicates — ADR 0016's deterministic convention), or
-/// the bootstrapped account — which must itself be live: a dead or missing
-/// default is a loud error, never a silent fabrication that `list` would
-/// then hide the transaction behind.
-fn resolve_account(
-    state: &ScopeState,
-    wanted: Option<&str>,
-    default: EntityId,
-) -> Result<(EntityId, String), CaptureError> {
+/// The state's live, named accounts as `(id, name)` pairs, earliest id
+/// first (ADR 0016's deterministic convention) — the one enumeration both
+/// capture's account resolution and sync's joiner adoption read.
+pub(crate) fn live_accounts(state: &ScopeState) -> Vec<(EntityId, String)> {
     let mut accounts: Vec<(EntityId, String)> = state
         .entities()
         .filter_map(|entity| match entity {
@@ -490,6 +484,20 @@ fn resolve_account(
         })
         .collect();
     accounts.sort();
+    accounts
+}
+
+/// Resolve the capture account (ADR 0023): `wanted` by exact live name
+/// (earliest id on duplicates — ADR 0016's deterministic convention), or
+/// the bootstrapped account — which must itself be live: a dead or missing
+/// default is a loud error, never a silent fabrication that `list` would
+/// then hide the transaction behind.
+fn resolve_account(
+    state: &ScopeState,
+    wanted: Option<&str>,
+    default: EntityId,
+) -> Result<(EntityId, String), CaptureError> {
+    let accounts = live_accounts(state);
     let find_by_name = |name: &str| accounts.iter().find(|(_, known)| known == name).cloned();
     let known = || accounts.iter().map(|(_, name)| name.clone()).collect();
     match wanted {
