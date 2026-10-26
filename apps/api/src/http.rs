@@ -12,7 +12,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -538,11 +538,46 @@ async fn pull_ops(
     ))
 }
 
+// ---------------------------------------------------------------------
+// Health (ADR 0026): the fleet's two-route contract — liveness touches
+// nothing (a store blip pulls the pod, never restart-storms it);
+// readiness reflects the store's actual health.
+// ---------------------------------------------------------------------
+
+/// Liveness (ADR 0026): unconditional while the process serves — the
+/// dependency-free route the fleet's liveness and startup probes hit.
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// Readiness (ADR 0026): the store's write health through
+/// [`AppState::readiness`] — 200 while a durable write into both on-disk
+/// homes succeeds, 503 (detail server-side only) when it does not.
+async fn ready(State(state): State<Arc<AppState>>) -> Response {
+    match state.readiness() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ready" })),
+        )
+            .into_response(),
+        Err(e) => {
+            eprintln!("pursecraft-api: readiness probe failed: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "unavailable" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// The relay's router (ADR 0024). `GET /v1/{kind}/{id}/ops` pulls a delta
 /// since the cursor; the routes and their auth are the crate's whole
-/// HTTP surface.
+/// HTTP surface, plus the two unauthenticated health routes (ADR 0026).
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/health", get(health))
+        .route("/health/ready", get(ready))
         .route("/v1/devices", post(create_device))
         .route("/v1/{kind}/{id}", post(create_scope))
         .route("/v1/{kind}/{id}/pairing-codes", post(mint_pairing_code))

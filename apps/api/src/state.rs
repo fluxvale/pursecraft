@@ -8,8 +8,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pursecraft_core::ids::ScopeId;
 use pursecraft_core::store::{OpaqueStore, StoreError};
@@ -96,4 +98,29 @@ impl AppState {
         logs.insert(scope, Arc::clone(&store));
         Ok(Some(store))
     }
+
+    /// Whether the relay can durably persist right now (ADR 0026): a
+    /// write-then-fsync probe into each on-disk home — the data directory
+    /// (the auth db) and `logs/` (the scope logs). This is readiness,
+    /// not liveness: a failing probe means the pod leaves rotation, never
+    /// restarts — a read-only volume cannot be restarted into health.
+    pub fn readiness(&self) -> std::io::Result<()> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the system clock is after the epoch")
+            .as_nanos()
+            .to_string();
+        probe_dir(&self.data_dir, &stamp)?;
+        probe_dir(&self.data_dir.join("logs"), &stamp)?;
+        Ok(())
+    }
+}
+
+/// One honest write into `dir`: create, write, fsync — the same media and
+/// the same durability the relay's real writes need, so the probe fails
+/// exactly when serving would (ADR 0026).
+fn probe_dir(dir: &Path, stamp: &str) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(dir.join("health.probe"))?;
+    file.write_all(stamp.as_bytes())?;
+    file.sync_all()
 }

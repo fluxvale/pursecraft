@@ -9,6 +9,16 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Manual runs (ADR 0026): dispatch with push-image=true builds and
+  # pushes the relay image's sha-<sha> tag from any branch whose image
+  # inputs differ from main — the pre-merge/candidate path (the fleet
+  # lane's bootstrap). `latest` still moves only on main merges.
+  workflow_dispatch:
+    inputs:
+      push-image:
+        description: "Push the relay image to GHCR (sha-<sha> only; latest moves only on main merges)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -29,6 +39,7 @@ jobs:
       deny: ${{ steps.filter.outputs.deny }}
       machete: ${{ steps.filter.outputs.machete }}
       typos: ${{ steps.filter.outputs.typos }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       # persist-credentials: false — later steps run no git-authenticated ops
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -55,6 +66,7 @@ jobs:
             api:
               - "apps/api/**"
               - "apps/core/**" # core is shared: a core change re-runs every consumer
+              - "Dockerfile" # the api image bakes this crate; its CI surface includes it
               - "scripts/ci/api.sh"
               - "scripts/ci/rust.sh"
               - "scripts/ci/mise-version.sh"
@@ -97,6 +109,20 @@ jobs:
               # any file can hold a typo — typos.toml makes the action walk
               # hidden paths (.github/, dotfiles) too, so "**" is literal
               - "**"
+            # the release-image job's inputs (ADR 0026): the image bakes
+            # pursecraft-api + core and pins the toolchain mise names.
+            # Deliberately a SUBSET of the api filter above — the job
+            # needs api, so a path that trips docker must trip api too,
+            # or a Dockerfile-only change could skip its own publish.
+            docker:
+              - "Dockerfile"
+              - ".dockerignore"
+              - "apps/api/**"
+              - "apps/core/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "mise.toml"
+              - ".github/workflows/ci.yml"
 
   core:
     name: Core CI
@@ -340,14 +366,95 @@ jobs:
       # pinned to commit — mutable tags execute unreviewed code
       - uses: crate-ci/typos@9023c1f779400877cafdd98052113fc777e2cfdc # v1.51.1
 
+  # Release image (ADR 0026): build and push the relay image once the
+  # suite that vets the baked code is green. sha-<sha> + latest follow
+  # the fleet's pattern (Flux image-automation follows latest,
+  # digest-pinned); the package is public and nothing secret ships in it.
+  # A manual dispatch with push-image pushes sha-<sha> ONLY — the
+  # bootstrap/candidate path on any branch whose image inputs differ
+  # from main; latest never moves off a merge. `needs: api` cannot be
+  # skipped under this job's gate: the docker filter is a subset of the
+  # api filter. A red wait-for-ci on main stops the operator before
+  # pinning a broken digest, exactly as the deploy runbook expects.
+  release-image:
+    name: Release image
+    needs: [check-changes, api]
+    if: >-
+      needs.check-changes.outputs.docker == 'true' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.push-image == true))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # The builder pin must carry mise.toml's Rust (ADR 0014: one
+      # version source) — assert instead of trusting the Dockerfile,
+      # the same guard Thalmyra's BEAM pins carry.
+      - name: Assert the builder image matches mise.toml's Rust pin
+        run: |
+          rust="$(scripts/ci/mise-version.sh rust)"
+          image="$(sed -n 's/^ARG RUST_IMAGE=\(.*\)$/\1/p' Dockerfile | head -1)"
+          echo "RUST_IMAGE=$image rust=$rust"
+          test -n "$rust"
+          test -n "$image"
+          echo "$image" | grep -qF "rust:$rust-bookworm@sha256:" || {
+            echo "::error::RUST_IMAGE ($image) does not match mise.toml (rust $rust) — bump the pins together"; exit 1; }
+
+      - name: Compute image tags
+        id: tags
+        # latest moves only on main merges — the Thalmyra contract;
+        # dispatches push the immutable sha tag alone
+        run: |
+          {
+            echo "tags<<TAGS"
+            echo "ghcr.io/fluxvale/pursecraft:sha-${{ github.sha }}"
+            if [ "${{ github.event_name }}" = push ]; then
+              echo "ghcr.io/fluxvale/pursecraft:latest"
+            fi
+            echo "TAGS"
+          } >>"$GITHUB_OUTPUT"
+
+      # pinned to commit — mutable tags execute unreviewed code; this
+      # job holds packages:write
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # pinned to commit — mutable tags execute unreviewed code; this
+      # job holds packages:write
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.10.0
+
+      - name: Build and push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: mode=min
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |-
+            REVISION=${{ github.sha }}
+
   # Adding a job (app or check) takes FOUR edits here, and skipping any one
   # of them removes the job from the required check silently (its job never
   # runs, or runs ungated): (a) add it to the changes filters above,
   # repeating the shared paths the existing filters carry; (b) export that
   # filter in check-changes.outputs above, or its job gate reads an empty
   # string; (c) add the job; (d) add that job to wait-for-ci.needs below.
-  # New top-level files (a future Dockerfile, compose.yaml) match no cargo
-  # filter today — add them to every relevant filter when they land, or their
+  # New top-level files (say, a future compose.yaml) can match no cargo
+  # filter — add them to every relevant filter when they land, or their
   # changes run nothing; the typos job filters on "**" (and walks hidden
   # paths via typos.toml) precisely so no file class escapes every check.
   #
@@ -357,7 +464,7 @@ jobs:
   # read "skipped" and the all() below would pass on zero checks run.
   wait-for-ci:
     name: Wait for CI
-    needs: [check-changes, core, api, cli, deny, machete, typos]
+    needs: [check-changes, core, api, cli, deny, machete, typos, release-image]
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -78,6 +78,50 @@ pub fn org_scope() -> ScopeId {
     ScopeId::Org(OrgId::new(v7(ID_MS, 2)).unwrap())
 }
 
+/// A fresh scratch directory under the temp dir, unique per call — the
+/// shared base of the in-process [`TestRelay`] and the binary-spawning
+/// [`RelayProcess`] tests. Callers clean up best-effort.
+pub fn scratch_dir(label: &str) -> PathBuf {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "pursecraft-api-{label}-{}-{}",
+        std::process::id(),
+        COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+/// The scope's log file under `dir` — the relay's naming, shared by the
+/// in-process and binary tests.
+pub fn log_path(dir: &Path, scope: ScopeId) -> PathBuf {
+    let name = match scope {
+        ScopeId::Org(id) => format!("org-{}", id.as_uuid().simple()),
+        ScopeId::Budget(id) => format!("budget-{}", id.as_uuid().simple()),
+    };
+    dir.join("logs").join(format!("{name}.pcoplog"))
+}
+
+/// One well-formed pushable op for a device (the ADR 0016 minting
+/// convention, deterministic ids) — the binary tests' single-op version
+/// of the in-process tests' simulated devices.
+pub fn a_mint_style_op(device: DeviceId, scope: ScopeId) -> pursecraft_core::ops::Op {
+    pursecraft_core::ops::Op {
+        op_id: OpId::new(v7(1 << 40, 4444)).unwrap(),
+        scope,
+        device_id: device,
+        user_id: UserId::new(v7(1 << 40, 777)).unwrap(),
+        entity_kind: pursecraft_core::domain::EntityKind::Transaction,
+        entity_id: EntityId::new(v7(1 << 40, 50)).unwrap(),
+        field: pursecraft_core::domain::Field::Transaction(
+            pursecraft_core::domain::TransactionField::Memo,
+        ),
+        value: pursecraft_core::domain::Value::Text("serving probe".into()),
+        hlc: pursecraft_core::hlc::Hlc {
+            physical_ms: 1 << 50,
+            logical: 0,
+        },
+    }
+}
+
 /// The path (and URI) segments for a scope — the routes are typed by kind
 /// (ADR 0021).
 pub fn scope_path(scope: ScopeId) -> String {
@@ -102,13 +146,7 @@ impl TestRelay {
     /// constructor — `at` is private so a `Drop` that cleans up can never
     /// delete a directory a caller handed in).
     pub fn new(label: &str) -> Self {
-        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "pursecraft-api-{label}-{}-{}",
-            std::process::id(),
-            COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        ));
-        Self::at(&dir)
+        Self::at(&scratch_dir(label))
     }
 
     fn at(dir: &Path) -> Self {
@@ -134,11 +172,7 @@ impl TestRelay {
 
     /// The path of the scope's log file — tampering tests edit this.
     pub fn log_path(&self, scope: ScopeId) -> PathBuf {
-        let name = match scope {
-            ScopeId::Org(id) => format!("org-{}", id.as_uuid().simple()),
-            ScopeId::Budget(id) => format!("budget-{}", id.as_uuid().simple()),
-        };
-        self.dir.join("logs").join(format!("{name}.pcoplog"))
+        log_path(&self.dir, scope)
     }
 
     /// One full HTTP round trip through the real router.
@@ -182,6 +216,215 @@ impl Drop for TestRelay {
     /// is best-effort anyway.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The relay binary under test (ADR 0026): spawn the real process, talk
+// raw HTTP over a socket, signal it — the data-dir and graceful-shutdown
+// contracts are process-level behaviors, not router-level ones.
+// ---------------------------------------------------------------------
+
+/// An unoccupied loopback port (bind `:0`, read the port, drop) — the
+/// tiny race between drop and the spawned relay's bind is accepted, as
+/// everywhere else that needs a test port.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind :0")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+/// The relay as a real OS process (ADR 0026): the binary Cargo builds
+/// for this test run, configured by the same env vars production rides.
+pub struct RelayProcess {
+    pub child: std::process::Child,
+    pub dir: PathBuf,
+    pub port: u16,
+}
+
+impl RelayProcess {
+    pub fn spawn(dir: &Path, port: u16) -> Self {
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_pursecraft-api"))
+            .env("PURSECRAFT_DATA_DIR", dir)
+            .env("PURSECRAFT_BIND", format!("127.0.0.1:{port}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the relay binary");
+        Self {
+            child,
+            dir: dir.to_owned(),
+            port,
+        }
+    }
+
+    /// One request-response round trip on a fresh connection
+    /// (`Connection: close`, so EOF delimits the response — no HTTP
+    /// client dependency).
+    pub fn request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, String) {
+        let mut stream = self.connect();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+        write_request(&mut stream, method, path, headers, body);
+        let raw = read_response(&mut stream);
+        parse_response(&raw)
+    }
+
+    /// Poll until `GET path` answers `status` — the binary's boot beat.
+    pub fn wait_for(&mut self, path: &str, status: u16) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", self.port)) {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .ok();
+                write_request(&mut stream, "GET", path, &[], "");
+                let raw = read_response(&mut stream);
+                if let (got, _) = parse_response(&raw)
+                    && got == status
+                {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relay never answered {status} on {path}\n{}",
+                self.stderr_after_kill(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A raw connection the test drives byte by byte — the mid-flight
+    /// request the drain test holds open across a SIGTERM.
+    pub fn connect(&self) -> std::net::TcpStream {
+        std::net::TcpStream::connect(("127.0.0.1", self.port)).expect("connect to the relay")
+    }
+
+    /// SIGTERM — the fleet's drain trigger (ADR 0026). Via `/bin/kill`
+    /// to avoid a libc dependency for one syscall the tests need.
+    #[cfg(unix)]
+    pub fn sigterm(&mut self) {
+        let pid = self.child.id().to_string();
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success(), "kill -TERM {pid}");
+    }
+
+    /// Wait for exit within `secs` — an assert on the way out dumps
+    /// stderr, the binary's own log line for what it was doing.
+    pub fn wait_exit(&mut self, secs: u64) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll the relay") {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relay did not exit within {secs}s\n{}",
+                self.stderr_after_kill(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// The captured stderr — for assertion messages; kills the child
+    /// first because a pipe reads to EOF only once the writer is gone.
+    /// Failure-path only (assert arguments evaluate lazily).
+    fn stderr_after_kill(&mut self) -> String {
+        let pid = self.child.id().to_string();
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid])
+            .status();
+        let _ = self.child.wait();
+        let mut err = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            use std::io::Read as _;
+            let _ = pipe.read_to_string(&mut err);
+        }
+        err
+    }
+}
+
+/// Write one HTTP/1.1 request — headers, then body — with
+/// `Connection: close` so the server's response ends at EOF.
+pub fn write_request(
+    stream: &mut std::net::TcpStream,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) {
+    use std::io::Write as _;
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n");
+    if !body.is_empty() {
+        request.push_str(&format!(
+            "content-type: application/json\r\ncontent-length: {}\r\n",
+            body.len()
+        ));
+    }
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write request head");
+    stream
+        .write_all(body.as_bytes())
+        .expect("write request body");
+}
+
+/// Read the response to EOF (`Connection: close` on our side).
+pub fn read_response(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read as _;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("read the response");
+    raw
+}
+
+/// `(status, body)` out of a raw HTTP/1.1 response.
+pub fn parse_response(raw: &str) -> (u16, String) {
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .expect("a status line")
+        .parse()
+        .expect("a status code");
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// Poll until fresh connects to `port` are refused — the drain test's
+/// observable for "the listener is closed, SIGTERM landed" (ADR 0026).
+#[cfg(unix)]
+pub fn wait_connect_refused(port: u16) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => drop(stream),
+            Err(_) => return,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the relay kept accepting connections after SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
