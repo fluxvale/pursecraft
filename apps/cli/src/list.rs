@@ -10,7 +10,9 @@ use pursecraft_core::date::Date;
 use pursecraft_core::domain::{Entity, Transaction};
 use pursecraft_core::ids::{EntityId, TransactionId};
 use pursecraft_core::ops::ApplyError;
-use pursecraft_core::resolve::{transaction_payee, transaction_visible};
+use pursecraft_core::resolve::{
+    CategoryResolution, transaction_category, transaction_payee, transaction_visible,
+};
 use pursecraft_core::store::{LocalStore, StoreError};
 use pursecraft_core::sync::SyncSession;
 
@@ -20,7 +22,6 @@ use crate::sync;
 
 /// How many transactions `list` shows (ADR 0023's minimal recap).
 pub const RECENT: usize = 10;
-
 /// A failed recap.
 #[derive(Debug)]
 pub enum ListError {
@@ -93,14 +94,14 @@ pub fn list(home: &Path, session: &Session) -> Result<String, ListError> {
     let pending = sync::pending_count(home, session, &identity)?;
     let path = budget_log(home, identity.budget_id);
     if !path.exists() {
-        return Ok(with_pending(EMPTY.to_owned(), pending));
+        return Ok(with_pending_sync(EMPTY.to_owned(), pending));
     }
     let store = LocalStore::open(&path)?;
     let mut replay = SyncSession::new();
     replay.apply_delta(store.delta_since(0))?;
     let state = replay.state();
 
-    let mut rows: Vec<(Option<Date>, String, String, String, TransactionId)> = Vec::new();
+    let mut rows: Vec<(Option<Date>, String, String, String, String, TransactionId)> = Vec::new();
     for entity in state.entities() {
         let Entity::Transaction(txn) = entity else {
             continue;
@@ -111,17 +112,22 @@ pub fn list(home: &Path, session: &Session) -> Result<String, ListError> {
         rows.push(row(state, txn));
     }
     if rows.is_empty() {
-        return Ok(with_pending(EMPTY.to_owned(), pending));
+        return Ok(with_pending_sync(EMPTY.to_owned(), pending));
     }
     // Newest first: date descending, then id descending (UUIDv7 is
     // chronological within clock skew — ADR 0016). Undated transactions
     // sort last.
-    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.4.cmp(&a.4)));
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.5.cmp(&a.5)));
 
     let total = rows.len();
-    let mut out = format!("{:<10}   {:<24} {:>12}\n", "DATE", "PAYEE", "AMOUNT");
-    for (_, date, payee, amount, _) in rows.iter().take(RECENT) {
-        out.push_str(&format!("{date:<10}   {payee:<24} {amount:>12}\n"));
+    let mut out = format!(
+        "{:<10}   {:<24} {:<16} {:>12}\n",
+        "DATE", "PAYEE", "CATEGORY", "AMOUNT"
+    );
+    for (_, date, payee, category, amount, _) in rows.iter().take(RECENT) {
+        out.push_str(&format!(
+            "{date:<10}   {payee:<24} {category:<16} {amount:>12}\n"
+        ));
     }
     if total > RECENT {
         out.push_str(&format!("\nshowing {RECENT} of {total} transactions\n"));
@@ -130,12 +136,14 @@ pub fn list(home: &Path, session: &Session) -> Result<String, ListError> {
     } else {
         out.push_str(&format!("\n{total} transactions\n"));
     }
-    Ok(with_pending(out, pending))
+    Ok(with_pending_sync(out, pending))
 }
 
 /// Append the pending-sync badge (ADR 0011) when captures wait for the
-/// relay; a synced home shows nothing extra (feedback first, never noise).
-fn with_pending(mut out: String, pending: u64) -> String {
+/// relay; a synced home shows nothing extra (feedback first, never
+/// noise). Shared by every read surface that renders state (`list`,
+/// `categorize`'s review, `budget`).
+pub(crate) fn with_pending_sync(mut out: String, pending: u64) -> String {
     if pending > 0 {
         if !out.ends_with('\n') {
             out.push('\n');
@@ -145,28 +153,56 @@ fn with_pending(mut out: String, pending: u64) -> String {
     out
 }
 
-/// One recap row: (date key for ordering, date cell, resolved live payee
-/// name, amount cell, id for the tiebreak). Torn cells render `?` — a
-/// missing amount must never fake a real zero capture as `0.000`.
-#[allow(clippy::type_complexity)]
-fn row(
+/// The transaction's resolved live payee name (blank when it resolves
+/// to none), shared by every row renderer (ADR 0016's "no payee").
+pub(crate) fn resolved_payee_name(
     state: &pursecraft_core::ops::ScopeState,
     txn: &Transaction,
-) -> (Option<Date>, String, String, String, TransactionId) {
-    let payee = transaction_payee(state, txn)
+) -> String {
+    transaction_payee(state, txn)
         .and_then(|payee| state.entity(&EntityId::new(payee.as_uuid()).expect("stored v7")))
         .and_then(|entity| match entity {
             Entity::Payee(p) => p.name.clone(),
             _ => None,
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// One recap row: (date key for ordering, date cell, resolved live payee
+/// name, resolved category cell, amount cell, id for the tiebreak).
+/// Torn cells render `?` — a missing amount must never fake a real zero
+/// capture as `0.000`. An unset category is NOT a tear: it is the
+/// designed ready-to-assign state and renders as the Inbox (ADR 0026).
+#[allow(clippy::type_complexity)]
+fn row(
+    state: &pursecraft_core::ops::ScopeState,
+    txn: &Transaction,
+) -> (Option<Date>, String, String, String, String, TransactionId) {
+    let payee = resolved_payee_name(state, txn);
     let date = txn
         .date
         .map(|d| d.to_string())
         .unwrap_or_else(|| "?".to_owned());
+    let category = match transaction_category(state, txn) {
+        CategoryResolution::Uncategorized => "Inbox".to_owned(),
+        CategoryResolution::Category(resolved) => {
+            let inbox = crate::category::inbox_of(state);
+            if Some(resolved) == inbox {
+                "Inbox".to_owned()
+            } else {
+                state
+                    .entity(&EntityId::new(resolved.as_uuid()).expect("stored v7"))
+                    .and_then(|entity| match entity {
+                        Entity::Category(c) => c.name.clone(),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "?".to_owned())
+            }
+        }
+    };
     let amount = txn
         .amount
         .map(|a| a.to_string())
         .unwrap_or_else(|| "?".to_owned());
-    (txn.date, date, payee, amount, txn.id)
+    (txn.date, date, payee, category, amount, txn.id)
 }

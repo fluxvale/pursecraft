@@ -25,6 +25,7 @@ use pursecraft_core::store::{LocalStore, StoreError};
 use pursecraft_core::sync::SyncSession;
 
 use crate::amount;
+use crate::category::{ensure_inbox, find_category, inbox_line, join_known};
 use crate::home::{Identity, IdentityError, budget_log, load_or_create_identity, org_log};
 use crate::idmint::mint_uuid;
 use crate::session::Session;
@@ -45,6 +46,7 @@ pub struct RawAdd<'a> {
     pub amount: &'a str,
     pub date: Option<&'a str>,
     pub account: Option<&'a str>,
+    pub category: Option<&'a str>,
 }
 
 /// What one capture stored — the confirmation line's data (ADR 0023's
@@ -53,12 +55,18 @@ pub struct RawAdd<'a> {
 pub struct Receipt {
     /// The bootstrap ran this call (identity freshly created).
     pub bootstrapped: bool,
+    /// The Inbox ensure minted the review queue's category this call
+    /// (ADR 0026 — bootstrap or a legacy world's first writing command).
+    pub created_inbox: bool,
     /// No live payee of this name existed, so one was minted.
     pub new_payee: bool,
     pub payee: String,
     pub amount: Milliunits,
     pub date: Date,
     pub account_name: String,
+    /// The category the capture filed under, when one was named (ADR
+    /// 0026: absent means the transaction stays in the Inbox bucket).
+    pub category_name: Option<String>,
 }
 
 impl Receipt {
@@ -70,9 +78,17 @@ impl Receipt {
                 "initialized org {ORG_NAME:?}, budget {BUDGET_NAME:?}, account {ACCOUNT_NAME:?}\n"
             ));
         }
+        if self.created_inbox {
+            out.push_str(&inbox_line());
+        }
         let new_payee = if self.new_payee { ", new payee" } else { "" };
+        let category = self
+            .category_name
+            .as_deref()
+            .map(|name| format!(", {name}"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "added {} {} on {} ({}{new_payee})\n",
+            "added {} {} on {} ({}{category}{new_payee})\n",
             self.payee, self.amount, self.date, self.account_name
         ));
         out
@@ -100,6 +116,12 @@ pub enum CaptureError {
     /// error, never a silent fabrication that `list` would then hide the
     /// transaction behind.
     NoDefaultAccount {
+        known: Vec<String>,
+    },
+    /// `--category` named no live category (ADR 0026); `known` lists
+    /// what exists.
+    UnknownCategory {
+        wanted: String,
         known: Vec<String>,
     },
     /// The payee positional was empty (argv rejects this; the public API
@@ -142,6 +164,11 @@ impl fmt::Display for CaptureError {
                     )
                 }
             }
+            Self::UnknownCategory { wanted, known } => write!(
+                f,
+                "unknown category {wanted:?} (known: {}; create one: pursecraft category new {wanted:?})",
+                join_known(known)
+            ),
             Self::EmptyPayee => write!(f, "payee must not be empty"),
         }
     }
@@ -189,6 +216,15 @@ impl From<std::io::Error> for CaptureError {
     }
 }
 
+impl From<crate::category::EnsureError> for CaptureError {
+    fn from(e: crate::category::EnsureError) -> Self {
+        match e {
+            crate::category::EnsureError::Store(e) => Self::Store(e),
+            crate::category::EnsureError::Apply(e) => Self::Apply(e),
+        }
+    }
+}
+
 /// Capture one transaction (ADR 0023): parse, ensure the bootstrapped
 /// world, resolve account and payee read-then-mint, append the ops through
 /// the [`sink`], return the receipt. Input parsing comes first so a bad
@@ -222,11 +258,16 @@ pub fn add(
     ensure_org(&mut minter, &mut org_store, &identity)?;
     drop(org_store);
 
-    // Budget side: ensure the account, then boot fresh for the capture.
+    // Budget side: ensure the account and the Inbox (ADR 0026), then
+    // boot fresh for the capture.
     let budget_path = budget_log(home, identity.budget_id);
     std::fs::create_dir_all(budget_path.parent().expect("store parent"))?;
     let mut budget_store = LocalStore::open(&budget_path)?;
     if ensure_account(&mut minter, &mut budget_store, &identity)? {
+        budget_store = LocalStore::open(&budget_path)?; // re-read post-writes
+    }
+    let created_inbox = ensure_inbox(&mut minter, &mut budget_store, &identity)?;
+    if created_inbox {
         budget_store = LocalStore::open(&budget_path)?; // re-read post-writes
     }
     let session = boot(&budget_store)?;
@@ -248,31 +289,56 @@ pub fn add(
             (id, true, vec![op])
         }
     };
+    // A named category resolves exactly (ADR 0026): unknown names are
+    // teaching errors, never find-or-create — a typo at capture must not
+    // mint an envelope.
+    let category = match raw.category.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(wanted) => {
+            let id = find_category(state, wanted).ok_or_else(|| CaptureError::UnknownCategory {
+                wanted: wanted.to_owned(),
+                known: crate::category::known_names(state),
+            })?;
+            let name = state
+                .entity(&id)
+                .and_then(|entity| match entity {
+                    Entity::Category(c) => c.name.clone(),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "?".to_owned());
+            Some((id, name))
+        }
+        None => None,
+    };
 
     let scope = ScopeId::Budget(identity.budget_id);
     let txn = EntityId::new(mint_uuid()).expect("minted v7");
-    let fields = [
-        (
-            Field::Transaction(TransactionField::AccountId),
-            Value::Id(account_id),
-        ),
-        (
-            Field::Transaction(TransactionField::Date),
-            Value::Date(date),
-        ),
-        (
-            Field::Transaction(TransactionField::Amount),
-            Value::Milliunits(amount),
-        ),
-        (
-            Field::Transaction(TransactionField::PayeeId),
-            Value::Id(payee_id),
-        ),
-        (
-            Field::Transaction(TransactionField::Cleared),
-            Value::Cleared(Cleared::Uncleared),
-        ),
-    ];
+    let mut fields = Vec::with_capacity(6);
+    fields.push((
+        Field::Transaction(TransactionField::AccountId),
+        Value::Id(account_id),
+    ));
+    fields.push((
+        Field::Transaction(TransactionField::Date),
+        Value::Date(date),
+    ));
+    fields.push((
+        Field::Transaction(TransactionField::Amount),
+        Value::Milliunits(amount),
+    ));
+    fields.push((
+        Field::Transaction(TransactionField::PayeeId),
+        Value::Id(payee_id),
+    ));
+    if let Some((category_id, _)) = category {
+        fields.push((
+            Field::Transaction(TransactionField::CategoryId),
+            Value::Id(category_id),
+        ));
+    }
+    fields.push((
+        Field::Transaction(TransactionField::Cleared),
+        Value::Cleared(Cleared::Uncleared),
+    ));
     let mut ops = ops;
     for (field, value) in fields {
         ops.push(minter.op_now(scope, EntityKind::Transaction, txn, field, value));
@@ -283,11 +349,13 @@ pub fn add(
 
     Ok(Receipt {
         bootstrapped,
+        created_inbox,
         new_payee,
         payee: payee.to_owned(),
         amount,
         date,
         account_name,
+        category_name: category.map(|(_, name)| name),
     })
 }
 
@@ -565,6 +633,7 @@ mod tests {
             amount,
             date: None,
             account: None,
+            category: None,
         }
     }
 
@@ -595,6 +664,8 @@ mod tests {
             receipt.confirmation(),
             format!(
                 "initialized org {ORG_NAME:?}, budget {BUDGET_NAME:?}, account {ACCOUNT_NAME:?}\n\
+                 created the \"Inbox\" category \u{2014} uncategorized captures land there \
+                 (review: pursecraft categorize)\n\
                  added coffee -4.500 on 2026-10-25 (Wallet, new payee)\n"
             )
         );
@@ -614,10 +685,10 @@ mod tests {
             Some(MembershipRole::Owner)
         );
 
-        // Budget log: account (2 ops) + payee (1) + transaction (5),
-        // replayed into exactly the captured transaction.
+        // Budget log: account (2) + inbox (1, ADR 0026) + payee (1) +
+        // transaction (5), replayed into exactly the captured transaction.
         let (_, store) = reopened(home);
-        assert_eq!(store.tip(), 8);
+        assert_eq!(store.tip(), 9);
         let mut session = SyncSession::new();
         session.apply_delta(store.delta_since(0)).unwrap();
         let state = session.state();
@@ -846,7 +917,11 @@ mod tests {
         let receipt = add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         assert!(!receipt.new_payee, "the torn attempt's payee is reused");
         let (_, store) = reopened(home);
-        assert_eq!(store.tip(), 8, "payee(1) + account(2) + transaction(5)");
+        assert_eq!(
+            store.tip(),
+            9,
+            "payee(1) + account(2) + inbox(1) + transaction(5)"
+        );
         let mut session = SyncSession::new();
         session.apply_delta(store.delta_since(0)).unwrap();
         assert_eq!(
@@ -885,10 +960,10 @@ mod tests {
 
         add_cmd(home, &raw("coffee", "-4.50")).unwrap();
         let (_, store) = reopened(home);
-        // Seeded name + emitted kind + payee + 5 transaction ops.
-        assert_eq!(store.tip(), 8);
+        // Seeded name + emitted kind + inbox + payee + 5 transaction ops.
+        assert_eq!(store.tip(), 9);
         let fresh: Vec<Op> = store.delta_since(1).map(|s| s.op.clone()).collect();
-        assert_eq!(fresh.len(), 7, "only the missing kind op re-lands");
+        assert_eq!(fresh.len(), 8, "only the missing kind op re-lands");
         assert!(
             !fresh.iter().any(|op| op.entity_kind == EntityKind::Account
                 && matches!(op.field, Field::Account(AccountField::Name))),
@@ -978,9 +1053,10 @@ mod tests {
             .lines()
             .find(|l| l.contains('?'))
             .unwrap_or_else(|| panic!("no torn row rendered\n{list}"));
-        // The amount column starts at 38 (10 date + 3 + 24 payee + 1).
+        // The amount column starts at 55 (10 date + 3 + 24 payee + 1 +
+        // 16 category + 1).
         assert_eq!(
-            torn_row[38..].trim(),
+            torn_row[55..].trim(),
             "?",
             "a faked amount would hide the tear\n{list}"
         );
@@ -1004,6 +1080,7 @@ mod tests {
                 amount: "-890",
                 date: Some("2026-10-24"),
                 account: Some(ACCOUNT_NAME),
+                category: None,
             },
         )
         .unwrap();
@@ -1017,6 +1094,7 @@ mod tests {
                 amount: "-1",
                 date: Some("2026-02-30"),
                 account: None,
+                category: None,
             },
         )
         .unwrap_err();
@@ -1034,6 +1112,7 @@ mod tests {
                 amount: "-4.50",
                 date: None,
                 account: Some("Nope"),
+                category: None,
             },
         )
         .unwrap_err();
@@ -1047,6 +1126,90 @@ mod tests {
         assert!(
             add_cmd(home, &raw("coffee", "4.50")).is_err(),
             "unsigned amounts are rejected"
+        );
+    }
+
+    /// Category-aware capture (issue #29 / ADR 0026): `--category` files
+    /// exactly by name; an unknown name is a teaching error listing the
+    /// known ones; bare capture still writes no category op (the Inbox
+    /// is the view of unset, never a write).
+    #[test]
+    fn category_aware_capture_files_exactly_and_bare_stays_unset() {
+        let tmp = TempDir::new("category-add");
+        let home = tmp.path();
+        let err = add_cmd(
+            home,
+            &RawAdd {
+                payee: "coffee",
+                amount: "-4.50",
+                date: None,
+                account: None,
+                category: Some("Food"),
+            },
+        )
+        .unwrap_err();
+        match err {
+            CaptureError::UnknownCategory { wanted, known } => {
+                assert_eq!(wanted, "Food");
+                assert_eq!(known, ["Inbox".to_owned()], "the ensure ran first");
+            }
+            other => panic!("expected UnknownCategory, got {other}"),
+        }
+
+        // Mint Food, then file into it; the receipt names the category.
+        crate::category::new_category(home, &session(), "Food", None).unwrap();
+        let receipt = add_cmd(
+            home,
+            &RawAdd {
+                payee: "groceries",
+                amount: "-12.25",
+                date: None,
+                account: None,
+                category: Some("Food"),
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.category_name.as_deref(), Some("Food"));
+        assert!(
+            receipt
+                .confirmation()
+                .contains("added groceries -12.250 on 2026-10-25 (Wallet, Food, new payee)")
+        );
+
+        let (_, store) = reopened(home);
+        let mut replay = SyncSession::new();
+        replay.apply_delta(store.delta_since(0)).unwrap();
+        let state = replay.state();
+        let food = crate::category::find_category(state, "Food").unwrap();
+        let txns: Vec<&Transaction> = state
+            .entities()
+            .filter_map(|e| match e {
+                Entity::Transaction(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(
+            txns[0].category_id,
+            Some(pursecraft_core::ids::CategoryId::new(food.as_uuid()).unwrap()),
+            "the CategoryId op landed"
+        );
+
+        // A bare capture on the same world stays unset — coffee is a new
+        // payee, so six ops (payee + five transaction fields), never a
+        // category write.
+        let (_, store) = reopened(home);
+        let tip = store.tip();
+        drop(store);
+        add_cmd(home, &raw("coffee", "-2")).unwrap();
+        let (_, store) = reopened(home);
+        let fresh: Vec<Op> = store.delta_since(tip).map(|s| s.op.clone()).collect();
+        assert_eq!(fresh.len(), 6);
+        assert!(
+            !fresh
+                .iter()
+                .any(|op| matches!(op.field, Field::Transaction(TransactionField::CategoryId))),
+            "no category op for a bare capture"
         );
     }
 

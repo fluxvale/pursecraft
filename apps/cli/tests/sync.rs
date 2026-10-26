@@ -301,7 +301,7 @@ fn two_devices_converge_through_a_live_relay() {
     let add = a.run("", &["add", "coffee", "-4.50"]);
     assert_eq!(add.code, 0, "{}{}", add.stdout, add.stderr);
     assert!(
-        add.stdout.contains("13 pending sync"),
+        add.stdout.contains("14 pending sync"),
         "the capture-time badge\n{}",
         add.stdout
     );
@@ -361,6 +361,123 @@ fn two_devices_converge_through_a_live_relay() {
             assert!(list.stdout.contains(payee), "{}", list.stdout);
         }
         assert!(list.stdout.contains("4 transactions"), "{}", list.stdout);
+        assert!(!list.stdout.contains("pending sync"), "{}", list.stdout);
+    }
+}
+
+/// Budgeting through two devices (issue #29): categories, capture with
+/// `--category`, offline `assign` on both sides, and a `categorize`
+/// review — converging through the live relay, with the rendered budget
+/// byte-identical on both devices (the projection is deterministic, not
+/// just the state).
+#[test]
+fn two_devices_converge_with_category_ops() {
+    let relay = LiveRelay::start("converge-budget");
+    let a = Home::new("converge-budget-a");
+    let b = Home::new("converge-budget-b");
+
+    // A enrolls, bootstraps by capture, structures the budget.
+    assert_eq!(a.login(&relay).code, 0);
+    assert_eq!(a.run("", &["add", "salary", "+5000"]).code, 0);
+    assert_eq!(
+        a.run("", &["category", "new", "Power", "--group", "Bills"])
+            .code,
+        0
+    );
+    assert_eq!(a.run("", &["category", "new", "Food"]).code, 0);
+    assert_eq!(
+        a.run("", &["add", "groceries", "-120.50", "--category", "Food"])
+            .code,
+        0
+    );
+    assert_eq!(a.run("", &["assign", "Food", "400"]).code, 0);
+    let sync = a.run("", &["sync"]);
+    assert_eq!(sync.code, 0, "{}{}", sync.stdout, sync.stderr);
+    let [org_id, org_code, budget_id, budget_code] = parse_join_line(&sync.stdout);
+
+    // B joins, then both diverge offline — B captures into Power,
+    // assigns Power, and reviews its own inbox capture into Food.
+    assert_eq!(b.login(&relay).code, 0);
+    let join = b.run("", &["join", &org_id, &org_code, &budget_id, &budget_code]);
+    assert_eq!(join.code, 0, "{}{}", join.stdout, join.stderr);
+    assert_eq!(
+        b.run("", &["add", "meralco", "-890", "--category", "Power"])
+            .code,
+        0
+    );
+    assert_eq!(
+        b.run("", &["assign", "Power", "1000", "--month", "2026-10"])
+            .code,
+        0
+    );
+    assert_eq!(b.run("", &["add", "load", "-100"]).code, 0);
+    let review = b.run("", &["categorize"]);
+    assert_eq!(review.code, 0, "{}", review.stderr);
+    assert!(review.stdout.contains("load"), "{}", review.stdout);
+    let short = review
+        .stdout
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let filed = b.run("", &["categorize", &short, "Food"]);
+    assert_eq!(filed.code, 0, "{}{}", filed.stdout, filed.stderr);
+
+    // Both drain; extra rounds are no-ops.
+    for home in [&b, &a, &b, &a] {
+        let sync = home.run("", &["sync"]);
+        assert_eq!(sync.code, 0, "{}{}", sync.stdout, sync.stderr);
+    }
+
+    // Convergence through the engine's own proofs, both logs.
+    assert_eq!(a.budget_state(), b.budget_state(), "budget states diverged");
+    assert_eq!(
+        a.budget_state(),
+        canonical_relay_state(&relay, &budget_log_name(&a)),
+        "a home diverged from the relay's canonical order"
+    );
+    assert_eq!(a.org_state(), b.org_state(), "org states diverged");
+
+    // The rendered budget is byte-identical on both devices and carries
+    // the two-device numbers: Food 400 assigned, groceries + load
+    // activity, Power 1000 − meralco, income 5000 still in the inbox as
+    // inflow (TBB 3600).
+    let (va, vb) = (a.run("", &["budget"]), b.run("", &["budget"]));
+    assert_eq!(va.code, 0, "{}", va.stderr);
+    assert_eq!(vb.code, 0, "{}", vb.stderr);
+    assert_eq!(
+        va.stdout, vb.stdout,
+        "the same state must render identically"
+    );
+    let view = &va.stdout;
+    let food = view.lines().find(|l| l.contains("Food")).unwrap();
+    assert!(
+        food.contains("400.000") && food.contains("-220.500") && food.contains("179.500"),
+        "Food: assigned 400, activity -(120.50 + 100), available 179.50\n{view}"
+    );
+    let power = view.lines().find(|l| l.contains("Power")).unwrap();
+    assert!(
+        power.contains("1000.000") && power.contains("-890.000") && power.contains("110.000"),
+        "Power: assigned 1000, activity -890, available 110\n{view}"
+    );
+    assert!(
+        view.contains("to be budgeted 3600.000"),
+        "5000 inflow − 1400 assigned\n{view}"
+    );
+    assert!(
+        !view.contains("Inbox (uncategorized)"),
+        "the bucket emptied on both sides\n{view}"
+    );
+
+    // And the recap's category column agrees on both devices.
+    for home in [&a, &b] {
+        let list = home.run("", &["list"]);
+        assert_eq!(list.code, 0);
+        assert!(list.stdout.contains("Food"), "{}", list.stdout);
+        assert!(list.stdout.contains("Power"), "{}", list.stdout);
         assert!(!list.stdout.contains("pending sync"), "{}", list.stdout);
     }
 }
@@ -545,7 +662,7 @@ fn re_login_stranded_ops_are_counted_never_hidden() {
     assert_eq!(sync.code, 0, "{}{}", sync.stdout, sync.stderr);
     assert!(
         sync.stdout
-            .contains("13 ops were minted by a previous enrollment"),
+            .contains("14 ops were minted by a previous enrollment"),
         "the stranded count is visible\n{}",
         sync.stdout
     );
