@@ -503,7 +503,7 @@ impl InstallOutcome {
         if self.installed > 0 {
             receipt
                 .notes
-                .push(format!("installed {} key records", self.installed));
+                .push(format!("installed {} key records\n", self.installed));
         }
         (!self.conflicts.is_empty()).then(|| self.conflicts.join("; "))
     }
