@@ -227,13 +227,12 @@ pub fn assign(
         if cell.deleted || cell.month != Some(month) || cell.category_id != Some(category_typed) {
             continue;
         }
-        let id = EntityId::new(cell.id.as_uuid()).expect("stored v7");
-        let budgeted = cell.budgeted;
-        match cells.binary_search_by_key(&id, |(id, _)| *id) {
-            Ok(at) => cells[at].1 = budgeted,
-            Err(at) => cells.insert(at, (id, budgeted)),
-        }
+        cells.push((
+            EntityId::new(cell.id.as_uuid()).expect("stored v7"),
+            cell.budgeted,
+        ));
     }
+    cells.sort_by_key(|(id, _)| *id);
 
     let scope = ScopeId::Budget(identity.budget_id);
     let mut ops = Vec::new();
