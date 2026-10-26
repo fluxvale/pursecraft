@@ -332,13 +332,31 @@ shared with whoever is admitted; rotation protects the future only.
   [ADR 0022](0022-client-side-e2ee.md) already states. Until then the honest
   claim is "the relay cannot read the data", not "the relay cannot disrupt
   the key channel".
-- **Install conflicts are loud, and that includes the crash story.** A wrap
+- **Install conflicts are loud, and loud must not mean fatal.** A wrap
   addressed to this device that lands in a slot already holding different
-  material fails as `WrongKeySlot` — surfaced, not skipped. The one window
-  that is *not* loud is a wrap sealed to a key this device no longer has:
-  losing `device.key` loses the world, and a torn keyring is completed by the
-  next capture (a founder) or the next `sync` (a joiner), because both mints
-  are idempotent and re-run. Those resumability claims are pinned by tests.
+  material fails as `WrongKeySlot`, never a silent skip. But the relay's
+  record set is append-only and readable by every granted device, so a
+  *poisoned record is not allowed to stop the data path*: the records that
+  open install, the ops still push and pull, and the conflicts are reported
+  at the end (a non-zero exit naming them). A member can therefore plant a
+  visible nuisance, not a permanent org-wide sync kill. A log wrap that fails
+  authentication on a device that is not its addressee is the ordinary
+  misroute/mislabel case and is skipped; the loud path is reserved for a wrap
+  that actually opened for this device and conflicted.
+  The remaining window that is *not* recoverable is a wrap sealed to a key
+  this device no longer has: losing `device.key` loses the world, and the
+  honest answer is a `DeviceKeyMismatch` naming the file to restore — never a
+  fresh key minted beside the dead wraps. Torn **keyrings** (a key present,
+  some records not yet written) *are* recovered: a founder's mint re-runs on
+  every capture and a joiner's on the next `sync`, because both are idempotent.
+  All of this is pinned by tests.
+- **Coverage is persisted, not inferred.** The wraps a device mints for a peer
+  are written into its own keyring (they appear in `unpublished` until the
+  relay serves them), which is what makes the `to` bookkeeping real: without
+  it every sync re-wrapped every peer, and since the relay's record set is
+  append-only that grew toward `MAX_KEY_RECORDS`, where `Full` is a permanent
+  sync failure for the org. An idle sync now mints nothing, and a test holds
+  the record count stable across repeated syncs.
 - **Competing wraps for one slot adopt in relay order.** When two survivors
   mint an epoch concurrently (rotation, later slice), installs conflict
   loudly ([ADR 0022](0022-client-side-e2ee.md)) but *which* one a device

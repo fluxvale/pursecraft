@@ -521,7 +521,7 @@ fn a_joiner_torn_before_its_device_key_resumes_on_sync() {
 #[test]
 fn a_conflicting_wrap_is_loud_not_skipped() {
     use pursecraft_cli::keys::{KeysError, World};
-    use pursecraft_core::ids::{OrgId, ScopeId};
+    use pursecraft_core::ids::OrgId;
     use pursecraft_crypto::{CryptoError, DeviceKeypair, KeyChain};
 
     let home = Home::new("e2ee-conflict");
@@ -569,5 +569,148 @@ fn a_conflicting_wrap_is_loud_not_skipped() {
         matches!(&err, KeysError::Crypto(CryptoError::WrongKeySlot)),
         "{err}"
     );
-    let _ = ScopeId::Org(org);
+}
+
+/// Idle syncs mint nothing (ADR 0028's coverage rule). The relay's record set
+/// is append-only, so a re-wrap per sync would grow without bound toward the
+/// cap — the record count must be stable across repeated syncs.
+#[test]
+fn idle_syncs_do_not_re_wrap_peers() {
+    use pursecraft_cli::session;
+
+    let relay = LiveRelay::start("e2ee-stable");
+    let a = Home::new("e2ee-stable-a");
+    let b = Home::new("e2ee-stable-b");
+    assert_eq!(a.login(&relay).code, 0);
+    assert_eq!(a.run("", &["add", "coffee", "-4.50"]).code, 0);
+    let sync = a.run("", &["sync"]);
+    assert_eq!(sync.code, 0, "{}{}", sync.stdout, sync.stderr);
+    let [org_id, org_code, budget_id, budget_code] = parse_join_line(&sync.stdout);
+    assert_eq!(b.login(&relay).code, 0);
+    assert_eq!(
+        b.run("", &["join", &org_id, &org_code, &budget_id, &budget_code])
+            .code,
+        0
+    );
+    // Settle: A wraps B, B installs and joins.
+    assert_eq!(a.run("", &["sync"]).code, 0);
+    assert_eq!(b.run("", &["sync"]).code, 0);
+
+    let key_file = relay
+        .dir
+        .join("keys")
+        .join(format!("org-{}.json", org_id.replace('-', "")));
+    let count = || -> usize {
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&key_file).unwrap()).unwrap();
+        value["keys"].as_array().unwrap().len()
+    };
+    let settled = count();
+    // Three idle rounds on both devices: no new records, either side.
+    for _ in 0..3 {
+        assert_eq!(a.run("", &["sync"]).code, 0);
+        assert_eq!(b.run("", &["sync"]).code, 0);
+        assert_eq!(count(), settled, "an idle sync minted a wrap");
+    }
+    let _ = session::load(a.path());
+}
+
+/// One member's poisoned record must not wedge everyone's sync (ADR 0028):
+/// the data still syncs, and the conflict is reported loudly rather than
+/// silently swallowed or made permanent.
+#[test]
+fn a_poisoned_key_record_reports_but_does_not_wedge_the_data_sync() {
+    use pursecraft_cli::relay::Relay;
+    use pursecraft_cli::session;
+    use pursecraft_core::ids::OrgId;
+
+    let relay = LiveRelay::start("e2ee-poison");
+    let a = Home::new("e2ee-poison-a");
+    let b = Home::new("e2ee-poison-b");
+    assert_eq!(a.login(&relay).code, 0);
+    assert_eq!(a.run("", &["add", "coffee", "-4.50"]).code, 0);
+    let sync = a.run("", &["sync"]);
+    assert_eq!(sync.code, 0, "{}{}", sync.stdout, sync.stderr);
+    let [org_id, org_code, budget_id, budget_code] = parse_join_line(&sync.stdout);
+    assert_eq!(b.login(&relay).code, 0);
+    assert_eq!(
+        b.run("", &["join", &org_id, &org_code, &budget_id, &budget_code])
+            .code,
+        0
+    );
+    assert_eq!(a.run("", &["sync"]).code, 0);
+    assert_eq!(b.run("", &["sync"]).code, 0);
+
+    // B (a granted member) plants a tampered log wrap: log wraps are addressed
+    // to nobody, so every holder tries to open it and fails.
+    let org = OrgId::new(uuid::Uuid::parse_str(&org_id).unwrap()).unwrap();
+    let token = session::load(b.path()).unwrap().expect("enrolled").token;
+    let client = Relay::new(&relay.url, &token);
+    let tampered = r#"{"v":1,"kind":"log","wrap":{"v":1,"scope":{"Org":""#.to_owned()
+        + &org_id
+        + r#""},"epoch":0,"n":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","c":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#;
+    client
+        .publish_keys(org, &[tampered])
+        .expect("a granted member can publish");
+
+    // B captures and syncs: the op still reaches the relay, and the poison is
+    // reported, not fatal to the data path.
+    assert_eq!(b.run("", &["add", "lunch", "-6"]).code, 0);
+    let poisoned = b.run("", &["sync"]);
+    assert_eq!(
+        poisoned.code, 1,
+        "a poisoned record is loud\n{}{}",
+        poisoned.stdout, poisoned.stderr
+    );
+    assert!(
+        poisoned.stderr.contains("did not install"),
+        "the report names the conflict\n{}",
+        poisoned.stderr
+    );
+    // A still syncs the new op: the poison is B's report, not an org-wide kill.
+    let a_sync = a.run("", &["sync"]);
+    assert_eq!(a_sync.code, 1, "A also reports the planted record");
+    let list_a = a.run("", &["list"]);
+    assert_eq!(list_a.code, 0, "{}", list_a.stderr);
+    assert!(
+        list_a.stdout.contains("lunch"),
+        "the data sync ran despite the poison\n{}",
+        list_a.stdout
+    );
+}
+
+/// A founder torn inside the very first key init — keyring published, device
+/// key not — heals on the next capture. The gate must let `add` through for a
+/// founding home, or the only command that can heal it is blocked (ADR 0028).
+#[test]
+fn a_founder_torn_before_its_device_key_heals_on_the_next_capture() {
+    let home = Home::new("e2ee-founder-early-tear");
+    let relay = LiveRelay::start("e2ee-founder-early-tear-relay");
+    assert_eq!(home.login(&relay).code, 0);
+    assert_eq!(home.run("", &["add", "coffee", "-4.50"]).code, 0);
+
+    // Remove the device key but keep the founding keyring and its records:
+    // the crash window between `Keys::init`'s two publishes.
+    std::fs::remove_file(home.path().join("device.key")).unwrap();
+    let list = home.run("", &["list"]);
+    assert_eq!(list.code, 1, "no key, no read\n{}", list.stdout);
+
+    // The gate lets `add` through for a founding home (that is the fix), and
+    // the mint then refuses loudly: the world's org wrap is sealed to a device
+    // key that no longer exists, so the honest answer is "restore the key",
+    // never a silent second world.
+    let add = home.run("", &["add", "bread", "-2"]);
+    assert_eq!(add.code, 1, "{}{}", add.stdout, add.stderr);
+    assert!(
+        add.stderr.contains("does not open this home's keyring"),
+        "a founding home reaches its healing command and is told the real cause\n{}",
+        add.stderr
+    );
+    // The blocked-before-fix symptom was the joiner message, which is wrong
+    // here: this home founded the world.
+    assert!(
+        !add.stderr.contains("run pursecraft sync on a device"),
+        "a founding home is not told to find another device\n{}",
+        add.stderr
+    );
 }

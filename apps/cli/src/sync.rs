@@ -85,6 +85,11 @@ pub enum SyncError {
     AlreadyHasWorld,
     /// A join bundle that does not hold together (bad ids, dead org).
     BadBundle(String),
+    /// Key records that would not install — the rotation race or poison
+    /// (ADR 0028). The data sync still ran; this is the loud report.
+    KeyConflict {
+        detail: String,
+    },
 }
 
 impl fmt::Display for SyncError {
@@ -123,6 +128,11 @@ impl fmt::Display for SyncError {
                 "this home already holds a budget; join is for a fresh device (identity.json exists)"
             ),
             Self::BadBundle(message) => write!(f, "{message}"),
+            Self::KeyConflict { detail } => write!(
+                f,
+                "key records did not install: {detail} — this device's keys disagree with the \
+                 relay's; a rotation may have raced, and the data sync still ran"
+            ),
         }
     }
 }
@@ -283,6 +293,7 @@ pub fn sync(
     let mut file = load_sync_file(home)?;
     let mut receipt = SyncReceipt::new(&session.server);
     let mut stranded_total: u64 = 0;
+    let mut key_conflict: Option<String> = None;
     for (scope, label) in scopes_of(identity) {
         let key = scope_key(scope);
         let mut cursors = file.scopes.get(&key).copied().unwrap_or_default();
@@ -317,9 +328,14 @@ pub fn sync(
 
         // The key channel runs once the org's grant exists and before its log
         // is opened (ADR 0028): a device that arrives with no keys yet must
-        // install them before its store can be read at all.
-        if matches!(scope, ScopeId::Org(_)) && world.is_sealed() {
-            sync_keys(world, &relay, session, identity, &mut receipt)?;
+        // install them before its store can be read at all. Its conflicts are
+        // held until the data sync finishes — a planted record must never
+        // stop captures from reaching the relay.
+        if matches!(scope, ScopeId::Org(_))
+            && world.is_sealed()
+            && let Some(conflict) = sync_keys(world, &relay, session, identity, &mut receipt)?
+        {
+            key_conflict = Some(conflict);
         }
 
         let mut store = world.open_log(scope)?;
@@ -378,6 +394,9 @@ pub fn sync(
              (the relay refuses another device's ops); they stay in the local log"
         ));
     }
+    if let Some(detail) = key_conflict {
+        return Err(SyncError::KeyConflict { detail });
+    }
     Ok(receipt)
 }
 
@@ -400,14 +419,19 @@ pub fn resume_join(world: &mut World, session: &Session) -> Result<SyncReceipt, 
         // is the only command the gate lets a keyless joiner run.
         world.join()?;
         let relay = Relay::new(&session.server, &session.token);
-        publish_and_install(world, &relay, session, mark.org_id)?;
-        if !world.holds_log_key(ScopeId::Org(mark.org_id)) {
+        let outcome = publish_and_install(world, &relay, session, mark.org_id)?;
+        let mut receipt = if world.holds_log_key(ScopeId::Org(mark.org_id)) {
+            let joined = complete_join(world, session, mark.org_id, mark.budget_id)?;
+            SyncReceipt::joined(joined)
+        } else {
             // Still keyless: nothing to finish with, and the marker keeps the
             // home resumable.
-            return Ok(SyncReceipt::waiting_for_keys(&session.server, mark.org_id));
-        }
-        let joined = complete_join(world, session, mark.org_id, mark.budget_id)?;
-        return Ok(SyncReceipt::joined(joined));
+            SyncReceipt::waiting_for_keys(&session.server, mark.org_id)
+        };
+        return match outcome.finish(&mut receipt) {
+            Some(detail) => Err(SyncError::KeyConflict { detail }),
+            None => Ok(receipt),
+        };
     }
     let joined = complete_join(world, session, mark.org_id, mark.budget_id)?;
     Ok(SyncReceipt::joined(joined))
@@ -416,12 +440,19 @@ pub fn resume_join(world: &mut World, session: &Session) -> Result<SyncReceipt, 
 /// Publish this device's public key and install every record addressed to it
 /// (ADR 0028). The key channel's pull half, shared by `join`, `sync`, and a
 /// resumed join.
+///
+/// A failing **install** is collected, not fatal: the relay's record set is
+/// append-only and readable by every granted device, so one member's poisoned
+/// record must not become a permanent org-wide sync kill. The records that
+/// open are installed, the data sync runs, and the failures surface loudly at
+/// the end (a non-zero exit naming them) — visible, but never a wedge a
+/// hostile member can plant.
 fn publish_and_install(
     world: &World,
     relay: &Relay<'_>,
     session: &Session,
     org: OrgId,
-) -> Result<usize, SyncError> {
+) -> Result<InstallOutcome, SyncError> {
     if let Some(record) = world.device_record(session.device_id) {
         relay.publish_keys(org, &[record])?;
     }
@@ -430,18 +461,52 @@ fn publish_and_install(
     // same-epoch epoch key (ADR 0022), so the relay's record order — which is
     // push order, not dependency order — cannot be trusted for installs.
     let mut installed = 0usize;
+    let mut conflicts = Vec::new();
     for org_pass in [true, false] {
         for wire in &pulled {
             let is_org_wrap = matches!(
                 pursecraft_crypto::KeyRecord::parse(&wire.record).ok(),
                 Some(pursecraft_crypto::KeyRecord::Org { .. })
             );
-            if is_org_wrap == org_pass && world.install(&wire.record, org)? {
-                installed += 1;
+            if is_org_wrap != org_pass {
+                continue;
+            }
+            match world.install(&wire.record, org) {
+                Ok(true) => installed += 1,
+                Ok(false) => {}
+                Err(e) => conflicts.push(format!("{e} (record from {})", wire.pushed_by)),
             }
         }
     }
-    Ok(installed)
+    Ok(InstallOutcome {
+        installed,
+        pulled,
+        conflicts,
+    })
+}
+
+/// What one key-channel pull produced (ADR 0028).
+struct InstallOutcome {
+    installed: usize,
+    pulled: Vec<crate::relay::KeyRecordWire>,
+    /// Records that would not install — a slot conflict above all, which is
+    /// the rotation race ADR 0022 refuses to resolve silently. Reported, never
+    /// swallowed, and never fatal to the data sync.
+    conflicts: Vec<String>,
+}
+
+impl InstallOutcome {
+    /// Note what landed on the receipt and hand back the conflicts, if any.
+    /// The caller reports them after the data sync — loud, never a silent
+    /// swallow, and never a wedge a hostile member can plant.
+    fn finish(self, receipt: &mut SyncReceipt) -> Option<String> {
+        if self.installed > 0 {
+            receipt
+                .notes
+                .push(format!("installed {} key records", self.installed));
+        }
+        (!self.conflicts.is_empty()).then(|| self.conflicts.join("; "))
+    }
 }
 
 /// One pass over the org's key records (ADR 0028): publish this device's own
@@ -456,41 +521,29 @@ fn sync_keys(
     session: &Session,
     identity: &Identity,
     receipt: &mut SyncReceipt,
-) -> Result<(), SyncError> {
+) -> Result<Option<String>, SyncError> {
     let org = identity.org_id;
     // A device that holds no keys yet (a fresh joiner) still registers its
     // public key and takes whatever it is addressed; a key-holding device
     // does everything.
-    let installed = publish_and_install(world, relay, session, org)?;
-    let pulled = relay.pull_keys(org)?;
-    let published: BTreeSet<String> = pulled.iter().map(|wire| wire.record.clone()).collect();
+    let outcome = publish_and_install(world, relay, session, org)?;
+    let published: BTreeSet<String> = outcome
+        .pulled
+        .iter()
+        .map(|wire| wire.record.clone())
+        .collect();
 
-    // Each registered device's public key, and — for a device a grant let in
-    // but whose record is on the relay — the wrap it is owed. A `device`
-    // record is only trusted when the relay's authenticated stamp matches its
-    // claimed id (ADR 0028): a member cannot register a key for someone else.
+    // Each registered device's public key. A `device` record is only trusted
+    // when the relay's authenticated stamp matches its claimed id (ADR 0028):
+    // a member cannot register a key for someone else.
     let mut known: Vec<(DeviceId, pursecraft_crypto::DevicePublicKey)> = Vec::new();
-    let mut covered: BTreeMap<DeviceId, BTreeSet<u64>> = BTreeMap::new();
-    for wire in &pulled {
+    for wire in &outcome.pulled {
         let record =
             pursecraft_crypto::KeyRecord::parse(&wire.record).map_err(KeysError::Crypto)?;
-        match record {
-            pursecraft_crypto::KeyRecord::Device { device, public } => {
-                if device == wire.pushed_by {
-                    known.push((device, public));
-                }
-            }
-            pursecraft_crypto::KeyRecord::Org { to, wrap } => {
-                // Coverage counts only wraps this device can actually open and
-                // that pass the slot check — i.e. ones it holds. A stranger's
-                // forged "to: X" record would otherwise let any member
-                // suppress the genuine wrap for X forever (ADR 0028's
-                // consequence, now pinned here).
-                if world.install(&wire.record, org).unwrap_or(false) {
-                    covered.entry(to).or_default().insert(wrap.epoch);
-                }
-            }
-            pursecraft_crypto::KeyRecord::Log { .. } => {}
+        if let pursecraft_crypto::KeyRecord::Device { device, public } = record
+            && device == wire.pushed_by
+        {
+            known.push((device, public));
         }
     }
     let mut owed = Vec::new();
@@ -498,22 +551,17 @@ fn sync_keys(
         if device == session.device_id {
             continue;
         }
-        let already: BTreeSet<u64> = covered.remove(&device).unwrap_or_default();
-        owed.extend(world.wraps_for(org, device, public, &already)?);
+        // Coverage is this device's own keyring (ADR 0028), so a peer is
+        // wrapped once per epoch, however many syncs follow.
+        owed.extend(world.wraps_for(org, device, public, &BTreeSet::new())?);
     }
     // Our own held records the relay does not serve yet (the founder's org
     // wrap and log wraps, or a rotation's output).
-    let unpublished = world.unpublished(&published);
-    owed.extend(unpublished);
+    owed.extend(world.unpublished(&published));
     if !owed.is_empty() {
         relay.publish_keys(org, &owed)?;
     }
-    if installed > 0 {
-        receipt
-            .notes
-            .push(format!("installed {installed} key records"));
-    }
-    Ok(())
+    Ok(outcome.finish(receipt))
 }
 
 /// Mint fresh pairing codes for both scopes and render the join command

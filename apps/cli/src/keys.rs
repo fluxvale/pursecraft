@@ -60,6 +60,13 @@ pub enum KeysError {
         path: PathBuf,
         len: usize,
     },
+    /// The keyring holds records for this org that this device key cannot
+    /// open — the key is not the one the world was created (or admitted)
+    /// under. Every wrap is sealed to that key, so this is unrecoverable
+    /// locally and must never be papered over with a fresh key.
+    DeviceKeyMismatch {
+        path: PathBuf,
+    },
     /// `keyring.json` does not decode, or speaks another version.
     BadKeyring {
         path: PathBuf,
@@ -100,6 +107,13 @@ impl fmt::Display for KeysError {
             Self::BadDeviceKey { path, len } => write!(
                 f,
                 "{path:?} is not a device key ({len} bytes, want 32) — restore it from a backup"
+            ),
+            Self::DeviceKeyMismatch { path } => write!(
+                f,
+                "{path:?} does not open this home's keyring — every key wrap is sealed to the \
+                 device key that was there when the world was created, so this one is not it; \
+                 restore device.key from a backup (re-minting it would make the world unreadable \
+                 to every device, this one included)"
             ),
             Self::BadKeyring { path, detail } => {
                 write!(f, "{path:?} is not a usable keyring: {detail}")
@@ -373,29 +387,43 @@ impl World {
             .collect()
     }
 
-    /// Wrap the org's held epoch keys to `to`, skipping the epochs it already
-    /// has published wraps for (ADR 0028: `to` is coverage bookkeeping —
-    /// without it every sync would mint a fresh wrap).
+    /// Wrap the org's held epoch keys to `to`, skipping the epochs this device
+    /// has already wrapped for it (ADR 0028: coverage is real bookkeeping —
+    /// without it every sync would mint a fresh wrap, and the relay's record
+    /// set is append-only, so that would grow without bound toward the cap).
+    ///
+    /// The minted wraps are recorded in the keyring, which is what makes the
+    /// next sync's coverage real. Coverage is read from this device's own
+    /// keyring only, never from records the relay serves: a member could
+    /// otherwise pre-empt a peer's wrap with a forged `to` and starve it.
     pub fn wraps_for(
         &self,
         org: OrgId,
         to: DeviceId,
         public: DevicePublicKey,
-        covered: &BTreeSet<u64>,
+        _covered: &BTreeSet<u64>,
     ) -> Result<Vec<String>, KeysError> {
         let Mode::Sealed(keys) = &self.mode else {
             return Ok(Vec::new());
         };
+        let covered = self.wrapped_epochs_for(org, to);
         let wraps = keys
             .sealed
             .chain
             .borrow()
             .wrap_org_keys_to(&org, &public, Grant::AllEpochs)?;
-        Ok(wraps
-            .into_iter()
-            .filter(|wrap| !covered.contains(&wrap.epoch))
-            .map(|wrap| KeyRecord::Org { to, wrap }.to_wire())
-            .collect())
+        let mut minted = Vec::new();
+        for wrap in wraps {
+            if covered.contains(&wrap.epoch) {
+                continue;
+            }
+            let record = KeyRecord::Org { to, wrap };
+            // Persist the mint: the next sync's coverage, and the record that
+            // gets published, both come from here.
+            keys.record(&self.home, Some(org), record.clone())?;
+            minted.push(record.to_wire());
+        }
+        Ok(minted)
     }
 
     /// Install one pulled key record, persisting the keyring if it landed.
@@ -418,8 +446,12 @@ impl World {
                 .borrow()
                 .iter()
                 .filter(|entry| {
-                    !entry.wire.starts_with(r#"{"v":1,"kind":"device""#)
-                        && !published.contains(&entry.wire)
+                    // The keyring never holds a device record (they are not key
+                    // material), but the parse makes the intent explicit.
+                    !matches!(
+                        KeyRecord::parse(&entry.wire).ok(),
+                        Some(KeyRecord::Device { .. })
+                    ) && !published.contains(&entry.wire)
                 })
                 .map(|entry| entry.wire.clone())
                 .collect(),
@@ -457,9 +489,13 @@ fn load_mode(home: &Path, e2ee: bool) -> Result<Mode, KeysError> {
         return Ok(Mode::Absent { joining: false });
     }
     let (founded, stored) = read_keyring(&keyring_path)?;
-    if !founded && device.is_none() {
-        // A joiner's keyring before its device key — `join` completes it.
-        return Ok(Mode::Absent { joining: true });
+    if device.is_none() {
+        // The crash window inside `Keys::init` (keyring first, device key
+        // second). A founding home completes it with the next capture; a
+        // joiner completes it with the next `sync` (ADR 0028) — so the gate
+        // must treat the two differently, or a founding home is locked out of
+        // the very command that heals it.
+        return Ok(Mode::Absent { joining: !founded });
     }
     let Some(device) = device else {
         if stored.is_empty() {
@@ -544,6 +580,21 @@ impl Keys {
         }
         let org = identity.org_id;
         if self.sealed.chain.borrow().current_epoch(&org).is_none() {
+            // A keyring that names this org while the chain holds no key for
+            // it was sealed to a different device key. Minting a fresh epoch 0
+            // would produce a world no peer (and no earlier op) can read, so
+            // refuse and name the real problem (ADR 0028).
+            if self
+                .sealed
+                .records
+                .borrow()
+                .iter()
+                .any(|entry| entry.org == Some(org))
+            {
+                return Err(KeysError::DeviceKeyMismatch {
+                    path: home.join(DEVICE_FILE),
+                });
+            }
             let wrap = self.sealed.chain.borrow_mut().create_org(org)?;
             self.record(home, Some(org), KeyRecord::Org { to: device, wrap })?;
         }
@@ -706,6 +757,12 @@ impl PayloadCipher for WorldCipher {
     }
 }
 
+/// Fold one keyring record back into the chain at load (ADR 0028).
+///
+/// The keyring also holds wraps this device **minted for peers** — that is what
+/// makes coverage real — and those do not open here. `Auth` is therefore the
+/// ordinary "not addressed to me" answer and skips; everything else (a held
+/// slot with different material above all) stays loud.
 fn install_any(
     chain: &mut KeyChain,
     record: &KeyRecord,
@@ -713,12 +770,18 @@ fn install_any(
 ) -> Result<(), CryptoError> {
     match record {
         KeyRecord::Device { .. } => Ok(()),
-        KeyRecord::Org { wrap, .. } => chain.install_org_wrap(wrap),
+        KeyRecord::Org { wrap, .. } => match chain.install_org_wrap(wrap) {
+            Ok(()) | Err(CryptoError::Auth) => Ok(()),
+            Err(other) => Err(other),
+        },
         KeyRecord::Log { wrap } => {
             let org = org
                 .or_else(|| record.org())
                 .ok_or(CryptoError::WrongKeySlot)?;
-            chain.install_log_wrap_for_org(wrap, &org)
+            match chain.install_log_wrap_for_org(wrap, &org) {
+                Ok(()) | Err(CryptoError::Auth) => Ok(()),
+                Err(other) => Err(other),
+            }
         }
     }
 }
@@ -755,9 +818,10 @@ fn read_device_key(path: &Path) -> Result<Option<DeviceKeypair>, KeysError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    // Validation reads the length before anything copies the secret; the
-    // bytes are never printed and live only as long as this frame.
+    // The raw bytes are zeroized on drop; `StaticSecret` holds its own copy
+    // (ADR 0022's hygiene clause).
     let len = bytes.len();
+    let bytes = pursecraft_crypto::Zeroizing::new(bytes);
     let secret: [u8; 32] = bytes
         .as_slice()
         .try_into()
