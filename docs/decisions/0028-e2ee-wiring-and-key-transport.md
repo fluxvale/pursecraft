@@ -352,7 +352,12 @@ shared with whoever is admitted; rotation protects the future only.
   records loses the world. That is a `MissingDeviceKey` naming the file to
   restore, on every command, and the key is **never** re-minted over a
   populated keyring; an *empty* keyring with no key is the crash window and is
-  completed (the key binds nothing yet). Torn **keyrings** (a key present,
+  completed (the key binds nothing yet). A **joiner** that ends up with a
+  wrong-but-valid `device.key` is the same loss seen from the other side: it
+  stays keyless with the ordinary "keys are not here yet" teaching rather than
+  a mismatch error, because nothing on that device can tell a substituted key
+  from one the world has simply not wrapped yet — only a key-holding device
+  knows, and it knows nothing until the joiner's public key is reported. Torn **keyrings** (a key present,
   some records not yet written) *are* recovered: a founder's mint re-runs on
   every capture and a joiner's on the next `sync`, because both are idempotent.
   All of this is pinned by tests.
