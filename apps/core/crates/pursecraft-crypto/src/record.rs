@@ -211,9 +211,33 @@ mod tests {
         );
     }
 
-    /// A budget log's wrap names no org (ADR 0021) — the caller supplies it.
+    /// A device record names no org, an org-log record names its own, and a
+    /// budget-log record names none (ADR 0021) — the caller supplies it.
     #[test]
     fn a_budget_log_record_has_no_derivable_org() {
+        let keypair = DeviceKeypair::from_secret_bytes([7; 32]);
+        assert_eq!(
+            KeyRecord::Device {
+                device: device(),
+                public: keypair.public(),
+            }
+            .org(),
+            None
+        );
+        assert_eq!(
+            KeyRecord::Log {
+                wrap: wrap_log_key(
+                    &DataKey::new([3; 32]),
+                    &ScopeId::Org(org()),
+                    0,
+                    &DataKey::new([4; 32]),
+                )
+                .unwrap(),
+            }
+            .org(),
+            Some(org())
+        );
+
         let record = KeyRecord::Log {
             wrap: wrap_log_key(
                 &DataKey::new([3; 32]),
