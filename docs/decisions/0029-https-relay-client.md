@@ -32,8 +32,9 @@ ureq 2's cookie-era feature set, re-examined below) — are re-decided here on
 
 ### 1. TLS backend: replace minreq with ureq 3 (rustls, ring, webpki-roots)
 
-**minreq is disqualifying for TLS, not merely inconvenient.** Its 2.14.x TLS
-features pin `rustls 0.21` / `rustls-webpki 0.101` / `webpki-roots 0.25`, a
+**minreq (the pinned 2.14.x) is disqualifying for TLS, not merely
+inconvenient.** Its TLS features pin `rustls 0.21` / `rustls-webpki 0.101`
+/ `webpki-roots 0.25`, a
 stack with live RustSec vulnerabilities whose fixes are unreachable through
 those pins — `cargo deny check advisories` on the minimal `https` feature
 reports RUSTSEC-2026-0346 and -0349 (rustls; fixed 0.23.46), -0098, -0099,
@@ -42,9 +43,10 @@ reports RUSTSEC-2026-0346 and -0349 (rustls; fixed 0.23.46), -0098, -0099,
 `https-rustls-probe`. Several say "no safe upgrade is available"; deny.toml's
 own rule (advisory ignores are documented, *temporary* exceptions) cannot
 honestly cover an unfixable TLS vulnerability in a money app's transport.
-minreq 2.14.1 additionally exposes no way to inject trust anchors (a static
-internal `ClientConfig`), so even a hermetic self-signed https test would be
-impossible.
+And no minreq version — 2.14.x or 3.0.0 — exposes a way to inject trust
+anchors (a static internal `ClientConfig` either way), so even a hermetic
+self-signed https test would be impossible (see the alternatives below for
+the 3.0.0 audit).
 
 **ureq 3, minimal cut** — `ureq = { version = "3", default-features = false,
 features = ["rustls", "json"] }`:
@@ -54,10 +56,19 @@ features = ["rustls", "json"] }`:
   `cc`; no aws-lc-rs, no cmake, no perl, keeping [ADR 0026]'s
   one-toolchain instinct).
 - **Lean in the ways that are still free**: this feature cut pulls no `url`,
-  no idna/ICU (those are ureq's optional cookies/url features, which stay
-  off), no gzip. The CLI's compiled dependency tree grows **79 → 82
-  packages** — the honest price of a maintained TLS stack, versus minreq's
-  zero in the plain-http world [ADR 0025] was designed for.
+  no idna/ICU, no gzip in the **shipped tree** (those are ureq's optional
+  cookies/url features, which stay off). Measured with
+  `cargo tree -p pursecraft-cli -e normal --target x86_64-unknown-linux-gnu
+  --prefix none | sed 's/ (\*)$//' | sort -u | wc -l`: **49 → 64 unique
+  packages** on unix (+16 third-party added — ureq, ureq-proto, http,
+  httparse, rustls, rustls-pki-types, rustls-webpki, webpki-roots, ring,
+  and ring's small companions — minus minreq: **+15 net**). The Cargo.lock
+  grows further (+82 entries) because the resolver records every optional
+  edge: ureq's never-enabled cookies feature makes `url`/`idna`/`icu_*`
+  *resolvable*, and the dev-only test scaffolding (`rcgen`, `tokio-rustls`)
+  adds `x509-parser`, `asn1-rs`, `der-parser`, `pem`, `time`, `yasna`.
+  None of that compiles into the shipped binary — but it is what
+  cargo-deny grades, so the cost is stated here rather than discovered.
 - **Supply chain stays green, with one conscious license addition**:
   webpki-roots ships its certificate data under `CDLA-Permissive-2.0` (a
   permissive data license: use, distribute, modify; share-alike applies to
@@ -77,13 +88,21 @@ features = ["rustls", "json"] }`:
 
 **Strictness posture, carried over exactly** — the agent is configured to
 behave like minreq did, no more: `max_redirects(0)` (a 3xx — including the
-http→https 308 the fleet answers — surfaces as a loud error envelope, never
-a silently-followed ride; **no http fallback behind an https URL**),
-`http_status_as_error(false)` (statuses flow into the existing
-teaching-shaped `decode_body` arms), `timeout_global(30s)` (the old
-`TIMEOUT_SECS`). ureq's inherited environment-proxy default
-(`https_proxy` etc.) is left at the library's default behavior; proxy
-*configuration* remains out of scope ([issue #34]).
+bodiless http→https 308 the fleet's edge answers — is surfaced loudly as
+its own redirect error naming the destination, never a silently-followed
+ride; **no http fallback behind an https URL**), `http_status_as_error
+(false)` (statuses flow into the existing teaching-shaped `decode_body`
+arms), `timeout_global(30s)` (the old `TIMEOUT_SECS`), and
+`.proxy(None)`: **no environment proxy lookup, ever**. ureq's inherited
+default (`Proxy::try_from_env`) would route every request — loopback
+`http://` relays included — through `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`
+when set, a behavior minreq never had: it silently breaks local relays on
+proxy-configured machines and lets the environment choose the peer a
+cleartext bearer token is sent to. The pin restores minreq's behavior
+exactly; a deliberate, `NO_PROXY`-aware proxy opt-in is a future decision
+if a self-hoster asks for it — proxy *configuration* remains out of scope
+([issue #34]), and the no-proxy default is pinned by a regression test
+that runs the real binary with every proxy variable aimed at a dead port.
 
 ### 2. `normalize_server`: the accepted grammar
 
@@ -111,7 +130,12 @@ scheme://host[:port][/prefix]
 - **Trailing slashes are trimmed before validation** (the pre-existing
   behavior: `http://host/` → `http://host`,
   `https://pursecraft.com/api/` → `https://pursecraft.com/api`), then no
-  further `/` may appear.
+  further `/` may appear. One inherited asymmetry, stated plainly: the
+  trim eats *all* trailing slashes (`http://host//` → `http://host`,
+  exactly as the pre-ADR-0025 trim already did), while a doubled slash
+  before a segment (`http://host//api`) is refused — where the slash sits
+  decides, because the trim runs first. Unchanged from the old behavior
+  and covered by the table tests.
 
 Old shapes behave byte-for-byte as today: `http://127.0.0.1:8099` and
 `http://host` normalize unchanged; `https://…`, paths, queries, and garbage
@@ -142,8 +166,20 @@ table tests plus the nested-`/api` round-trip below.
    with an `rcgen`-minted self-signed certificate (both dev-dependencies),
    driven through a `Relay` built with `RootCerts::Specific` on the test
    CA. A real client-server TLS round trip in CI; the live relay is the
-   final acceptance step, never a CI dependency.
-4. **Live acceptance** — `pursecraft login https://pursecraft.com/api`
+   final acceptance step, never a CI dependency. The test pins the
+   shipped `default_agent` itself — its three strictness settings at the
+   config level, and its refusal of the self-signed server asserted
+   specifically as a certificate failure — so loosening the production
+   agent (following redirects, statuses-as-errors, skipping certificate
+   verification) turns it red.
+4. **No-proxy regression** — the real `pursecraft` binary run against a
+   live local relay with every proxy environment variable aimed at a
+   dead port: login, capture, and sync must all succeed through the
+   hostile environment (`.proxy(None)` is what makes this true).
+5. **Redirect teaching** — a raw-socket bodiless-308 stand-in answers a
+   login probe; the error names the destination and says the client does
+   not follow redirects, never "answered strangely".
+6. **Live acceptance** — `pursecraft login https://pursecraft.com/api`
    plus a capture + `sync` round-trip against production, transcript
    recorded with the enrollment secret redacted (requires the operator's
    secret at run time).
@@ -153,9 +189,20 @@ configuration, retry-policy changes.
 
 ## Alternatives considered
 
-- **minreq + any TLS feature** — rejected: unfixable RustSec set measured
-  above; also no trust-anchor injection, so no hermetic https test. The
-  zero-transitive-deps property [ADR 0025] chose it for dies with TLS.
+- **minreq + any TLS feature** — rejected on two independent grounds.
+  minreq **2.14.x** (what this repo pinned): its TLS features pin
+  `rustls 0.21` / `rustls-webpki 0.101` / `webpki-roots 0.25` — a stack
+  with seven live, unfixable-within-those-pins RustSec advisories
+  (measured in-repo, Oct 2026). minreq **3.0.0** since resolves the
+  patched rustls 0.23 / webpki-roots 1.x stack and grades green under
+  `cargo deny check advisories` — but it still exposes **no way to inject
+  trust anchors**: its TLS config is a module-static
+  `LazyLock<Result<Arc<ClientConfig>, _>>` with no constructor hook
+  (`src/connection/rustls_stream.rs`), so the hermetic self-signed https
+  round-trip this slice's test story requires would be impossible with
+  any minreq version. That, plus ureq's configurable agent (redirects,
+  status handling, timeout, no-proxy — none of which minreq exposes),
+  settles the choice on the merits, not only on advisories.
 - **ureq 2** — rejected: advisories equally green, but the `url`/idna/ICU
   tree (+~20 compiled packages) is exactly what [ADR 0025] objected to;
   ureq 3's minimal cut avoids it entirely.
@@ -178,9 +225,11 @@ configuration, retry-policy changes.
 
 - The CLI speaks the deployed relay URL; dogfooding through
   `https://pursecraft.com/api` is unblocked.
-- One direct dependency swap (`minreq` → `ureq 3`), three compiled
-  packages net, one deny.toml license entry, two dev-dependencies for the
-  TLS test (`rcgen`, `tokio-rustls`).
+- One direct dependency swap (`minreq` → `ureq 3`): the shipped tree
+  grows +15 net compiled packages (49 → 64, command in §1), the lockfile
+  +82 entries (optional edges and dev-only test scaffolding, also §1),
+  one deny.toml license entry, two dev-dependencies for the TLS test
+  (`rcgen`, `tokio-rustls`).
 - `Relay` gains an injectable-agent constructor for the https test; the
   minreq `HttpsFeatureNotEnabled` teaching arm is deleted with its cause.
 - Sessions are forward- and back-compatible by construction (string shape

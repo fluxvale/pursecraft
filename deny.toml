@@ -34,15 +34,13 @@ allow = [
     # any future BSD-3-Clause dep is admitted identically — adding one
     # is a supply-chain decision to make consciously, not silently.
     "BSD-3-Clause",
-    # minreq 2.14 (the CLI's relay client, ADR 0025) is ISC — the
-    # MIT-equivalent permissive license (OpenBSD, musl). Same conscious
-    # shape as BSD-3-Clause above.
+    # Originally added for minreq 2.14 (ADR 0025, since replaced by ureq,
+    # ADR 0029); still load-bearing: rustls-webpki and untrusted (via
+    # ureq's rustls feature) are ISC too.
     "ISC",
     # webpki-roots 1.x (Mozilla's CA bundle, via ureq's rustls feature,
     # ADR 0029) ships its certificate DATA under CDLA-Permissive-2.0 —
     # a permissive data license (use, distribute, modify; share-alike
-    # applies to the data itself only, no source disclosure). The minreq
-    # entry above is retained: it stays in git history and may return
-    # via other transitive paths.
+    # applies to the data itself only, no source disclosure).
     "CDLA-Permissive-2.0",
 ]

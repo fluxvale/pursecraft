@@ -2,10 +2,12 @@
 //! real TLS — tokio-rustls serving a fresh rcgen-minted self-signed
 //! certificate — driven by the CLI's real ureq client. The client agent
 //! trusts exactly the test certificate (`RootCerts::Specific`), and the
-//! test first proves the production posture holds: the default Mozilla
-//! roots REFUSE this server, so TLS verification is on, never disabled
-//! for the test's sake. The live relay remains the final acceptance
-//! step, never a CI dependency.
+//! test first proves the production posture holds on the SHIPPED
+//! `default_agent` — its strictness pinned at the config level, and its
+//! refusal of this server asserted specifically as a certificate
+//! failure, so TLS verification is provably on, never disabled for the
+//! test's sake. The live relay remains the final acceptance step, never
+//! a CI dependency.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -165,16 +167,6 @@ fn test_agent(cert_pem: &[u8]) -> ureq::Agent {
         .new_agent()
 }
 
-/// The production trust posture: default Mozilla roots, nothing injected.
-fn mozilla_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .build()
-        .new_agent()
-}
-
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -246,15 +238,32 @@ fn enroll_push_and_pull_round_trip_over_tls() {
     let relay = TlsRelay::start("roundtrip");
     let secret = relay.enrollment_secret();
 
-    // The production posture refuses a self-signed server: verification
-    // is never loosened to make the test pass.
-    let refused = relay::enroll_with_agent(&mozilla_agent(), &relay.url, &secret);
+    // The shipped agent's strictness, pinned on the constructor itself —
+    // mutating `default_agent` toward lenience (following redirects,
+    // statuses-as-errors, env proxies) turns these red.
+    let shipped = relay::default_agent();
+    let config = shipped.config();
+    assert_eq!(config.max_redirects(), 0, "redirects are never followed");
+    assert!(
+        !config.http_status_as_error(),
+        "statuses flow to the teaching decoder"
+    );
+    assert!(
+        config.proxy().is_none(),
+        "no environment proxy lookup, ever"
+    );
+
+    // The production posture refuses a self-signed server — asserted on
+    // the shipped agent, and specifically as a certificate refusal (a
+    // dead port or DNS failure must NOT satisfy this). Verification is
+    // never loosened to make the test pass.
+    let refused = relay::enroll_with_agent(&shipped, &relay.url, &secret);
     let detail = refused
-        .expect_err("Mozilla roots must refuse the self-signed relay")
+        .expect_err("the shipped agent must refuse the self-signed relay")
         .to_string();
     assert!(
-        detail.contains("cannot reach") || detail.to_lowercase().contains("certificate"),
-        "a TLS refusal, not something else: {detail}"
+        detail.contains("invalid peer certificate"),
+        "a TLS certificate refusal, not any transport failure: {detail}"
     );
 
     // Enroll over TLS through the test-CA agent.

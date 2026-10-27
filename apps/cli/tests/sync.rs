@@ -306,6 +306,39 @@ fn login_enrolls_once_and_refuses_wrong_secrets() {
 }
 
 #[test]
+fn a_bodiless_redirect_teaches_the_redirect_not_a_strange_answer() {
+    // Hostile review P3-4: the fleet's edge answers a plain-http probe
+    // with a bodiless 308. The client never follows it (ADR 0029), and
+    // the error must say what happened — the destination and the no-
+    // following — not "answered strangely".
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let thread = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut scratch = [0u8; 1024];
+        let _ = stream.read(&mut scratch); // drain the request head/body
+        let response = "HTTP/1.1 308 Permanent Redirect\r\n\
+                        Location: https://pursecraft.com/api\r\n\
+                        Content-Length: 0\r\n\
+                        \r\n";
+        let _ = stream.write_all(response.as_bytes());
+    });
+    let url = format!("http://{addr}");
+    let home = Home::new("redirect");
+    let out = home.run("s\n", &["login", &url]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("redirected to https://pursecraft.com/api"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("does not follow"), "{}", out.stderr);
+    thread.join().unwrap();
+}
+
+#[test]
 fn login_and_sync_round_trip_through_a_base_path() {
     // The deployed shape (issue #34, ADR 0029): the fleet serves the
     // relay under /api; `nest` strips the prefix exactly as the proxy
@@ -343,6 +376,76 @@ fn login_and_sync_round_trip_through_a_base_path() {
         canonical_relay_state(&relay, &budget_log_name(&a)),
         "base-path sync diverged from the relay's canonical replay"
     );
+}
+
+#[test]
+fn proxy_environment_variables_never_hijack_the_relay() {
+    // ADR 0029: the agent pins `.proxy(None)`, so ureq's environment
+    // lookup (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY and lowercase) is never
+    // consulted — a behavior minreq never had, kept exactly (hostile
+    // review P2-1). The library itself never reads the environment (the
+    // workspace's no-env rule), so the only place these vars could leak
+    // in is the transport: prove it by running the REAL binary with
+    // every proxy var aimed at a dead port against a live relay.
+    let relay = LiveRelay::start("proxy-env");
+    let home = Home::new("proxy-env");
+    let command = |args: &[&str]| -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_pursecraft"));
+        cmd.env("PURSECRAFT_HOME", home.path())
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("http_proxy", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("https_proxy", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("all_proxy", "http://127.0.0.1:9")
+            .args(args);
+        cmd
+    };
+
+    // Login (secret on stdin), capture, sync — all through the hostile
+    // environment.
+    let secret = relay.enrollment_secret();
+    let mut login = command(&["login", &relay.url])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the real binary");
+    {
+        use std::io::Write;
+        login
+            .stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(format!("{secret}\n").as_bytes())
+            .expect("feed the secret");
+    }
+    let out = login.wait_with_output().expect("login finishes");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "login ignores the proxy env\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for args in [&["add", "coffee", "-4.50"][..], &["sync"][..]] {
+        let out = command(args).output().expect("binary runs");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{} ignores the proxy env\n{}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The sync was real: the pending badge is gone.
+    let list = command(&["list"]).output().expect("binary runs");
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert_eq!(list.status.code(), Some(0), "{stdout}");
+    assert!(!stdout.contains("pending sync"), "{stdout}");
 }
 
 // ---------------------------------------------------------------------

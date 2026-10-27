@@ -358,7 +358,9 @@ fn normalize_server(server: &str) -> Result<String, LoginError> {
     };
 
     // host[:port] or [v6][:port], kept verbatim in the canonical form.
-    if authority.is_empty() {
+    // Userinfo (`u:p@host`) is a form error, not a port error — the `@`
+    // is checked before any colon is mistaken for a port separator.
+    if authority.is_empty() || authority.contains('@') {
         return Err(LoginError::BadServer(FORM.into()));
     }
     if let Some(inner) = authority.strip_prefix('[') {
@@ -581,6 +583,13 @@ mod tests {
         }
         assert!(
             normalize_server("https://user@host")
+                .unwrap_err()
+                .to_string()
+                .contains("must look like")
+        );
+        // Userinfo with a colon must teach the FORM, not the port.
+        assert!(
+            normalize_server("http://u:p@host")
                 .unwrap_err()
                 .to_string()
                 .contains("must look like")

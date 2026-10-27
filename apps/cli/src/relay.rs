@@ -22,16 +22,21 @@ use ureq::Agent;
 const TIMEOUT_SECS: u64 = 30;
 
 /// The strict agent (ADR 0029): `max_redirects(0)` — a 3xx (the fleet's
-/// http→https 308 included) surfaces as the relay's error envelope, never
-/// a silently-followed ride; `http_status_as_error(false)` — statuses flow
-/// to this module's teaching decoder; one bounded timeout per call.
+/// http→https 308 included) surfaces as a loud redirect error, never a
+/// silently-followed ride; `http_status_as_error(false)` — statuses flow
+/// to this module's teaching decoder; one bounded timeout per call;
+/// `.proxy(None)` — no environment proxy lookup, ever: the environment
+/// must not choose the peer a cleartext bearer token is sent to, and a
+/// `HTTP_PROXY` var on a laptop must not silently break a loopback relay
+/// (minreq never read these vars; this keeps that behavior exactly).
 /// Trust is the default Mozilla root bundle; the https test injects a
 /// test CA instead through [`Relay::with_agent`].
-fn default_agent() -> Agent {
+pub fn default_agent() -> Agent {
     Agent::config_builder()
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(TIMEOUT_SECS)))
+        .proxy(None)
         .build()
         .new_agent()
 }
@@ -396,12 +401,32 @@ fn map_transport(
     })
 }
 
-/// Non-OK statuses become the relay's `{"error", "message"}` envelope.
+/// Non-OK statuses become the relay's `{"error", "message"}` envelope —
+/// except a 3xx, which this client never follows (ADR 0029): it is its
+/// own loud answer naming the destination, because the bodiless 308 a
+/// plain-`http` probe of the fleet's edge earns is the deployed world's
+/// most likely misconfiguration.
 fn decode_body(
     server: &str,
     response: ureq::http::Response<ureq::Body>,
 ) -> Result<serde_json::Value, RelayError> {
     let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("an unstated destination");
+        return Err(RelayError::Status {
+            server: server.to_owned(),
+            code: status,
+            error: "redirect".into(),
+            message: format!(
+                "the relay redirected to {location}; pursecraft does not follow \
+                 redirects — check the relay url (the hosted relay is https://…/api)"
+            ),
+        });
+    }
     if !(200..300).contains(&status) {
         let mut body = response.into_body();
         let body: serde_json::Value = body.read_json().map_err(|e| {
