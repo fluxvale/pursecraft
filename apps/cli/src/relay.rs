@@ -1,22 +1,40 @@
-//! The relay client (ADR 0025): plain HTTP/1.1 to the rendezvous relay's
-//! v1 routes (ADR 0024) — enroll, scope create/pair, push, pull. The wire
-//! is exactly the relay's envelopes; payloads stay the choke-point strings
-//! ([ADR 0017] `encode_payload`/`decode_payload`), opaque to the transport.
+//! The relay client (ADR 0025): HTTP/1.1 to the rendezvous relay's v1
+//! routes (ADR 0024) — enroll, scope create/pair, push, pull — over plain
+//! `http` or TLS via ureq/rustls (ADR 0029: the deployed relay is
+//! `https://pursecraft.com/api`). The wire is exactly the relay's
+//! envelopes; payloads stay the choke-point strings ([ADR 0017]
+//! `encode_payload`/`decode_payload`), opaque to the transport.
 //!
 //! Errors are teaching-shaped (ADR 0025): a refused token says to re-enroll,
 //! an unreachable relay says captures stay queued. The token appears only
 //! in the `Authorization` header, never in an error or output.
 
 use std::fmt;
+use std::time::Duration;
 
-use minreq::{Error as HttpError, Response};
 use pursecraft_core::ids::{DeviceId, OpId, OrgId, ScopeId};
 use pursecraft_core::ops::Op;
 use pursecraft_core::wire::{OpMeta, PayloadCipher};
+use ureq::Agent;
 
-/// Request/response timeout, seconds (a household relay is fast; a hung
-/// socket must not hang a one-shot command).
+/// Whole-call timeout, seconds (a household relay is fast; a hung socket
+/// must not hang a one-shot command).
 const TIMEOUT_SECS: u64 = 30;
+
+/// The strict agent (ADR 0029): `max_redirects(0)` — a 3xx (the fleet's
+/// http→https 308 included) surfaces as the relay's error envelope, never
+/// a silently-followed ride; `http_status_as_error(false)` — statuses flow
+/// to this module's teaching decoder; one bounded timeout per call.
+/// Trust is the default Mozilla root bundle; the https test injects a
+/// test CA instead through [`Relay::with_agent`].
+fn default_agent() -> Agent {
+    Agent::config_builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(TIMEOUT_SECS)))
+        .build()
+        .new_agent()
+}
 
 /// A relay call failed — transport, refusal, or a malformed answer.
 ///
@@ -86,21 +104,34 @@ impl fmt::Display for RelayError {
 impl std::error::Error for RelayError {}
 
 /// One authenticated relay connection: base URL plus the bearer token
-/// (ADR 0025's session).
+/// (ADR 0025's session), carried by one strict agent (ADR 0029).
 pub struct Relay<'a> {
     server: &'a str,
     token: &'a str,
+    agent: Agent,
 }
 
 impl<'a> Relay<'a> {
     pub fn new(server: &'a str, token: &'a str) -> Self {
-        Self { server, token }
+        Self::with_agent(server, token, default_agent())
+    }
+
+    /// The test seam (ADR 0029): a caller-built agent. The https
+    /// round-trip test trusts exactly its self-signed test CA
+    /// (`ureq::tls::RootCerts::Specific`); production keeps
+    /// `default_agent`'s Mozilla roots.
+    pub fn with_agent(server: &'a str, token: &'a str, agent: Agent) -> Self {
+        Self {
+            server,
+            token,
+            agent,
+        }
     }
 
     /// `POST /v1/{kind}/{id}` — create the scope; the creator is granted
     /// and one single-use pairing code is minted (ADR 0024).
     pub fn create_scope(&self, scope: ScopeId) -> Result<String, RelayError> {
-        let resp = self.send(minreq::post(self.scope_url(scope)), None)?;
+        let resp = self.send(Method::Post, &self.scope_url(scope), None)?;
         resp.get("pairing_code")
             .and_then(|v| v.as_str())
             .map(str::to_owned)
@@ -109,7 +140,7 @@ impl<'a> Relay<'a> {
 
     /// `POST /v1/{kind}/{id}/pairing-codes` — mint a fresh single-use code.
     pub fn mint_pairing_code(&self, scope: ScopeId) -> Result<String, RelayError> {
-        self.send(minreq::post(self.pairing_url(scope)), None)
+        self.send(Method::Post, &self.pairing_url(scope), None)
             .map(|resp| {
                 resp.get("pairing_code")
                     .and_then(|v| v.as_str())
@@ -121,7 +152,7 @@ impl<'a> Relay<'a> {
     /// `POST /v1/{kind}/{id}/devices` — redeem a pairing code into a grant.
     pub fn redeem(&self, scope: ScopeId, code: &str) -> Result<(), RelayError> {
         let body = serde_json::json!({ "v": 1, "code": code });
-        self.send(minreq::post(self.devices_url(scope)), Some(&body))
+        self.send(Method::Post, &self.devices_url(scope), Some(&body))
             .map(|_| ())
     }
 
@@ -156,7 +187,7 @@ impl<'a> Relay<'a> {
             wire_ops.push(serde_json::json!({ "meta": meta_value, "payload": payload }));
         }
         let body = serde_json::json!({ "v": 1, "ops": wire_ops });
-        let resp = self.send(minreq::post(self.ops_url(scope)), Some(&body))?;
+        let resp = self.send(Method::Post, &self.ops_url(scope), Some(&body))?;
         let results = resp
             .get("results")
             .and_then(|v| v.as_array())
@@ -185,7 +216,7 @@ impl<'a> Relay<'a> {
     /// (ADR 0024: exclusive cursor, ascending, `has_more` pages).
     pub fn pull(&self, scope: ScopeId, since: u64, limit: usize) -> Result<PullPage, RelayError> {
         let url = format!("{}?since={since}&limit={limit}", self.ops_url(scope));
-        let resp = self.send(minreq::get(&url), None)?;
+        let resp = self.send(Method::Get, &url, None)?;
         let ops = resp
             .get("ops")
             .and_then(|v| v.as_array())
@@ -219,21 +250,29 @@ impl<'a> Relay<'a> {
     /// error envelope, transport failures become teaching unreachable.
     fn send(
         &self,
-        request: minreq::Request,
+        method: Method,
+        url: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, RelayError> {
-        let mut request = request
-            .with_header("Authorization", format!("Bearer {}", self.token))
-            .with_timeout(TIMEOUT_SECS);
-        if let Some(body) = body {
-            let encoded = serde_json::to_string(body)
-                .map_err(|e| RelayError::BadAnswer(format!("request does not encode: {e}")))?;
-            request = request
-                .with_header("Content-Type", "application/json")
-                .with_body(encoded);
-        }
-        let response = map_transport(self.server, request.send())?;
-        decode_body(self.server, response)
+        let auth = format!("Bearer {}", self.token);
+        let sent = match (method, body) {
+            (Method::Post, Some(value)) => self
+                .agent
+                .post(url)
+                .header("Authorization", auth.as_str())
+                .send_json(value),
+            (Method::Post, None) => self
+                .agent
+                .post(url)
+                .header("Authorization", auth.as_str())
+                .send_empty(),
+            (Method::Get, _) => self
+                .agent
+                .get(url)
+                .header("Authorization", auth.as_str())
+                .call(),
+        };
+        decode_body(self.server, map_transport(self.server, sent)?)
     }
 
     /// `POST /v1/orgs/{id}/keys` — publish key records the relay stores and
@@ -241,7 +280,7 @@ impl<'a> Relay<'a> {
     /// relay never parses one.
     pub fn publish_keys(&self, org: OrgId, records: &[String]) -> Result<(), RelayError> {
         let body = serde_json::json!({ "v": 1, "keys": records });
-        let resp = self.send(minreq::post(self.keys_url(org)), Some(&body))?;
+        let resp = self.send(Method::Post, &self.keys_url(org), Some(&body))?;
         let stored = resp
             .get("stored")
             .and_then(|v| v.as_u64())
@@ -260,7 +299,7 @@ impl<'a> Relay<'a> {
     /// `GET /v1/orgs/{id}/keys` — every key record the org holds, each with
     /// the authenticated device that pushed it (ADR 0028's provenance).
     pub fn pull_keys(&self, org: OrgId) -> Result<Vec<KeyRecordWire>, RelayError> {
-        let resp = self.send(minreq::get(self.keys_url(org)), None)?;
+        let resp = self.send(Method::Get, &self.keys_url(org), None)?;
         let keys = resp
             .get("keys")
             .and_then(|v| v.as_array())
@@ -303,14 +342,22 @@ impl<'a> Relay<'a> {
 /// `POST /v1/devices` — enroll with the operator's secret; the device id
 /// and token are minted server-side and shown exactly once (ADR 0024).
 pub fn enroll(server: &str, secret: &str) -> Result<(DeviceId, String), RelayError> {
+    enroll_with_agent(&default_agent(), server, secret)
+}
+
+/// The agent seam for enrollment, as [`Relay::with_agent`] is for the
+/// authenticated calls (ADR 0029's https test enrolls through its
+/// test-CA agent before it ever syncs).
+pub fn enroll_with_agent(
+    agent: &Agent,
+    server: &str,
+    secret: &str,
+) -> Result<(DeviceId, String), RelayError> {
     let body = serde_json::json!({ "v": 1, "enrollment_secret": secret });
-    let encoded = serde_json::to_string(&body)
-        .map_err(|e| RelayError::BadAnswer(format!("request does not encode: {e}")))?;
-    let request = minreq::post(format!("{server}/v1/devices"))
-        .with_header("Content-Type", "application/json")
-        .with_body(encoded)
-        .with_timeout(TIMEOUT_SECS);
-    let response = map_transport(server, request.send())?;
+    let response = map_transport(
+        server,
+        agent.post(format!("{server}/v1/devices")).send_json(&body),
+    )?;
     let value = decode_body(server, response)?;
     let device_id: DeviceId = serde_json::from_value(value["device_id"].clone())
         .map_err(|e| RelayError::BadAnswer(format!("enroll answer device_id: {e}")))?;
@@ -321,6 +368,13 @@ pub fn enroll(server: &str, secret: &str) -> Result<(DeviceId, String), RelayErr
     Ok((device_id, token))
 }
 
+/// The request verbs [`Relay::send`] speaks — the relay's v1 surface is
+/// GET and POST, nothing else.
+enum Method {
+    Get,
+    Post,
+}
+
 /// The `{kind}/{id}` route segments for a scope (ADR 0021's typed routes).
 fn scope_path(scope: ScopeId) -> String {
     match scope {
@@ -329,32 +383,28 @@ fn scope_path(scope: ScopeId) -> String {
     }
 }
 
-/// Transport failures teach, including the TLS posture (ADR 0025: v1 is
-/// plain http; https is the deployment slice's).
+/// Transport failures teach (ADR 0025): connection refused, DNS, TLS
+/// handshake, timeout — every ureq error maps to unreachable, with the
+/// library's own detail; the capture queue survives.
 fn map_transport(
     server: &str,
-    result: Result<Response, HttpError>,
-) -> Result<Response, RelayError> {
-    match result {
-        Ok(response) => Ok(response),
-        Err(HttpError::HttpsFeatureNotEnabled) => Err(RelayError::Unreachable {
-            server: server.to_owned(),
-            detail:
-                "v1 speaks plain http to a local relay; TLS arrives with the hosted-relay slice"
-                    .into(),
-        }),
-        Err(e) => Err(RelayError::Unreachable {
-            server: server.to_owned(),
-            detail: e.to_string(),
-        }),
-    }
+    result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<ureq::http::Response<ureq::Body>, RelayError> {
+    result.map_err(|e| RelayError::Unreachable {
+        server: server.to_owned(),
+        detail: e.to_string(),
+    })
 }
 
 /// Non-OK statuses become the relay's `{"error", "message"}` envelope.
-fn decode_body(server: &str, response: Response) -> Result<serde_json::Value, RelayError> {
-    let status = u16::try_from(response.status_code).unwrap_or(0);
+fn decode_body(
+    server: &str,
+    response: ureq::http::Response<ureq::Body>,
+) -> Result<serde_json::Value, RelayError> {
+    let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        let body: serde_json::Value = response.json().map_err(|e| {
+        let mut body = response.into_body();
+        let body: serde_json::Value = body.read_json().map_err(|e| {
             RelayError::BadAnswer(format!("status {status} with no error body: {e}"))
         })?;
         return Err(RelayError::Status {
@@ -364,8 +414,8 @@ fn decode_body(server: &str, response: Response) -> Result<serde_json::Value, Re
             message: body["message"].as_str().unwrap_or("no message").to_owned(),
         });
     }
-    response
-        .json()
+    let mut body = response.into_body();
+    body.read_json()
         .map_err(|e| RelayError::BadAnswer(format!("a 2xx body does not decode: {e}")))
 }
 

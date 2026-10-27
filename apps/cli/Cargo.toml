@@ -20,20 +20,26 @@ serde_json = "1"
 # Local civil date for the `today` default (ADR 0023): std-only — pulls just
 # jiff-core on unix. License `Unlicense OR MIT`, satisfied by deny.toml's MIT.
 jiff = { version = "0.2", default-features = false, features = ["std"] }
-# The relay's plain-HTTP client (ADR 0025): no default features and no TLS —
-# the relay is plain HTTP (ADR 0024), and this adds ZERO transitive crates
-# (ureq would drag the `url`/ICU tree for a localhost call). License ISC —
-# deny.toml's one conscious addition for this slice. TLS arrives with the
-# deployment slice (ADR 0013).
-minreq = { version = "2", default-features = false, features = ["json-using-serde"] }
+# The relay's HTTP client (ADR 0029 replaces ADR 0025's minreq): ureq 3,
+# minimal cut — rustls TLS (ring provider; no aws-lc-rs, no cmake) and
+# JSON, no url/ICU tree (that is ureq's optional cookies feature, off).
+# minreq's own TLS features pin an unfixably vulnerable rustls 0.21 stack
+# (7 live RustSec advisories, measured Oct 2026); ureq ships rustls 0.23.
+# The agent is built strict: no redirects, no status-as-error, 30s cap.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [dev-dependencies]
 # Integration tests (ADR 0025) drive the real relay router over a real
-# localhost socket: the axum server the CLI's minreq client talks to.
+# localhost socket: the axum server the CLI's ureq client talks to.
 pursecraft-api = { path = "../api" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync"] }
 uuid = { version = "1", features = ["v4"] }
+# The https round-trip test (ADR 0029): serve the real axum router over
+# TLS with a fresh rcgen-minted self-signed certificate, trusted by the
+# client through a test-only ureq agent (RootCerts::Specific).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [[bin]]
 name = "pursecraft"

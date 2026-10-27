@@ -27,7 +27,8 @@ const SESSION_VERSION: u16 = 1;
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub version: u16,
-    /// The relay base URL (`http://host:port`, no path — ADR 0025).
+    /// The relay base URL in ADR 0029's canonical form
+    /// (`http(s)://host[:port][/prefix]`).
     pub server: String,
     /// The device the relay knows; ops are minted under it.
     pub device_id: DeviceId,

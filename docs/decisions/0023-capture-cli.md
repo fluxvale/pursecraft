@@ -178,7 +178,11 @@ other-target dependencies).
 *(Amended by [ADR 0025](0025-authenticated-first-clients.md): `minreq`
 (no default features, `json-using-serde` only — zero new transitive
 dependencies, license ISC per deny.toml) joins for the relay's plain-HTTP
-sync surface.)*
+sync surface. **Superseded by
+[ADR 0029](0029-https-relay-client.md)**: the client is `ureq` 3
+(`rustls` + `json`) — minreq's TLS features pin an unfixably vulnerable
+rustls stack, so the swap is what makes the deployed https relay
+speakable.)*
 No floats (workspace guard), no `unsafe`
 (workspace forbid) — which rules out `std::env::set_var` in tests, so the
 library is fully injectable: explicit home paths, explicit `today`, argv as

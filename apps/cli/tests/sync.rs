@@ -40,10 +40,23 @@ impl LiveRelay {
         Self::start_on(scratch_dir(label))
     }
 
+    /// Serve the router nested under one base-path segment — the fleet's
+    /// `/api` shape (ADR 0029): the proxy strips the prefix exactly as
+    /// `nest` does, so the client's composed URLs meet the real routes.
+    fn start_under_api(label: &str) -> Self {
+        let dir = scratch_dir(label);
+        let state = Arc::new(AppState::open(&dir).expect("open relay state"));
+        let app = axum::Router::new().nest("/api", router(state));
+        Self::spawn_serving(dir, app, "/api")
+    }
+
     /// Serve the real router over `dir` on an ephemeral localhost port.
     fn start_on(dir: PathBuf) -> Self {
         let state = Arc::new(AppState::open(&dir).expect("open relay state"));
-        let app = router(state);
+        Self::spawn_serving(dir, router(state), "")
+    }
+
+    fn spawn_serving(dir: PathBuf, app: axum::Router, url_prefix: &str) -> Self {
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -70,7 +83,7 @@ impl LiveRelay {
         let addr = addr_rx.recv().expect("relay bound");
         Self {
             dir,
-            url: format!("http://{addr}"),
+            url: format!("http://{addr}{url_prefix}"),
             stop: Some(stop_tx),
             thread: Some(thread),
             owns_dir: true,
@@ -272,14 +285,16 @@ fn login_enrolls_once_and_refuses_wrong_secrets() {
     assert!(!ok.stdout.contains(&enrolled.token), "{}", ok.stdout);
     assert_eq!(enrolled.server, relay.url);
 
-    // A dead relay and an https url teach rather than crash.
+    // A dead relay and an https url teach rather than crash: https is
+    // accepted grammar now (ADR 0029), so the refusal is the unreachable
+    // relay — a dead local port keeps the test hermetic (no DNS).
     let dead = Home::new("login-dead");
     let out = dead.run("s\n", &["login", "http://127.0.0.1:9"]);
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("cannot reach"), "{}", out.stderr);
-    let tls = dead.run("s\n", &["login", "https://relay.example"]);
+    let tls = dead.run("s\n", &["login", "https://127.0.0.1:9"]);
     assert_eq!(tls.code, 1);
-    assert!(tls.stderr.contains("plain http"), "{}", tls.stderr);
+    assert!(tls.stderr.contains("cannot reach"), "{}", tls.stderr);
     let empty = dead.run("", &["login", "http://127.0.0.1:9"]);
     assert_eq!(empty.code, 1);
     assert!(
@@ -288,6 +303,46 @@ fn login_enrolls_once_and_refuses_wrong_secrets() {
         empty.stderr
     );
     relay.stop();
+}
+
+#[test]
+fn login_and_sync_round_trip_through_a_base_path() {
+    // The deployed shape (issue #34, ADR 0029): the fleet serves the
+    // relay under /api; `nest` strips the prefix exactly as the proxy
+    // does, so this exercises the client's composed URLs end to end —
+    // enroll, capture, sync, and convergence against the relay's own
+    // replay — with every route carrying the prefix.
+    let relay = LiveRelay::start_under_api("basepath");
+    let a = Home::new("basepath-a");
+
+    assert_eq!(a.login(&relay).code, 0);
+    let session = a.session();
+    assert_eq!(
+        session.server, relay.url,
+        "the prefixed url stores verbatim"
+    );
+    assert!(session.server.ends_with("/api"), "{}", session.server);
+
+    assert_eq!(a.run("", &["add", "coffee", "-4.50"]).code, 0);
+    let sync = a.run("", &["sync"]);
+    assert_eq!(sync.code, 0, "{}{}", sync.stdout, sync.stderr);
+    assert!(
+        sync.stdout.contains("created the org and budget scopes"),
+        "{}",
+        sync.stdout
+    );
+
+    // The badge clears only if pull worked too — push alone would leave
+    // the home blind to its own round trip.
+    let list = a.run("", &["list"]);
+    assert!(!list.stdout.contains("pending sync"), "{}", list.stdout);
+
+    let state = a.budget_state();
+    assert_eq!(
+        state,
+        canonical_relay_state(&relay, &budget_log_name(&a)),
+        "base-path sync diverged from the relay's canonical replay"
+    );
 }
 
 // ---------------------------------------------------------------------

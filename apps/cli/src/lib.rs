@@ -314,26 +314,97 @@ fn login(home: &Path, server: &str, stdin: &str) -> Result<String, LoginError> {
     Ok(format!("enrolled with {server} — capture is unlocked\n"))
 }
 
-/// Validate and normalize a relay URL (ADR 0025): plain `http`, host and
-/// optional port, no path — TLS arrives with the hosted-relay slice.
+/// Validate and normalize a relay URL (ADR 0029): `http` or `https`,
+/// `host[:port]` (name, IPv4, or bracketed IPv6), and at most one
+/// base-path segment — the deployed `https://pursecraft.com/api`.
+/// Strictness is the point: the typed scheme is the scheme used (no
+/// silent fallback, no followed redirects), and anything else — deeper
+/// paths, queries, fragments, userinfo — is a teaching error, never a
+/// guess. The returned canonical form is what `session.json` stores;
+/// `relay.rs` composes routes by plain concatenation against it.
 fn normalize_server(server: &str) -> Result<String, LoginError> {
+    const FORM: &str = "the relay url must look like https://pursecraft.com/api \
+         or http://127.0.0.1:8099 — a host[:port], optionally under https";
+    const PATH: &str = "the relay url may carry at most one base-path segment \
+         (e.g. /api): ASCII letters, digits, '-', '_', interior dots only";
+    const PORT: &str = "the relay url's port must be digits in 1..=65535, \
+         e.g. http://127.0.0.1:8099";
+
     let server = server.trim().trim_end_matches('/');
-    if server.starts_with("https://") {
-        return Err(LoginError::BadServer(
-            "v1 speaks plain http to a local relay; TLS arrives with the hosted-relay slice".into(),
-        ));
-    }
-    let Some(rest) = server.strip_prefix("http://") else {
-        return Err(LoginError::BadServer(
-            "the relay url must look like http://host:port".into(),
-        ));
+    let (scheme, rest) = if let Some(rest) = server.strip_prefix("https://") {
+        ("https://", rest)
+    } else if let Some(rest) = server.strip_prefix("http://") {
+        ("http://", rest)
+    } else {
+        return Err(LoginError::BadServer(FORM.into()));
     };
-    if rest.is_empty() || rest.contains('/') {
-        return Err(LoginError::BadServer(
-            "the relay url must be a bare http://host:port (no path)".into(),
-        ));
+
+    // authority[/prefix]: one optional segment, nothing deeper.
+    let (authority, prefix) = match rest.split_once('/') {
+        None => (rest, None),
+        Some((authority, prefix)) => {
+            let segment_ok = !prefix.is_empty()
+                && !prefix.starts_with('.')
+                && !prefix.ends_with('.')
+                && !prefix.contains("..")
+                && prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+            if !segment_ok {
+                return Err(LoginError::BadServer(PATH.into()));
+            }
+            (authority, Some(prefix))
+        }
+    };
+
+    // host[:port] or [v6][:port], kept verbatim in the canonical form.
+    if authority.is_empty() {
+        return Err(LoginError::BadServer(FORM.into()));
     }
-    Ok(server.to_owned())
+    if let Some(inner) = authority.strip_prefix('[') {
+        // A bracketed IPv6 literal, optionally with a port.
+        let Some((addr, tail)) = inner.split_once(']') else {
+            return Err(LoginError::BadServer(FORM.into()));
+        };
+        let host_ok = !addr.is_empty() && addr.bytes().all(|b| b.is_ascii_hexdigit() || b == b':');
+        let port_ok = match tail.strip_prefix(':') {
+            Some(digits) => valid_port(digits),
+            None => tail.is_empty(),
+        };
+        if !host_ok || !port_ok {
+            return Err(LoginError::BadServer(FORM.into()));
+        }
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        let host_ok = !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+        if !host_ok || !valid_port(port) {
+            return Err(LoginError::BadServer(PORT.into()));
+        }
+    } else {
+        let host_ok = authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+        if !host_ok {
+            return Err(LoginError::BadServer(FORM.into()));
+        }
+    }
+
+    Ok(match prefix {
+        Some(prefix) => format!("{scheme}{authority}/{prefix}"),
+        None => format!("{scheme}{authority}"),
+    })
+}
+
+/// A port is digits only, 1..=65535 (kept verbatim when valid — `:080`
+/// stays `:080`; canonicalization is connect-time, not rewrite-time).
+fn valid_port(digits: &str) -> bool {
+    !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && digits
+            .parse::<u32>()
+            .is_ok_and(|p| (1..=65535).contains(&p))
 }
 
 /// A failed enrollment (ADR 0025).
@@ -412,22 +483,50 @@ mod tests {
 
     #[test]
     fn server_urls_are_normalized_and_refused_with_teaching() {
+        // The old plain-http shapes, byte-identical (ADR 0025 → 0029).
         assert_eq!(
             normalize_server("http://127.0.0.1:8080").unwrap(),
             "http://127.0.0.1:8080"
         );
         assert_eq!(normalize_server(" http://host/ ").unwrap(), "http://host");
-        assert!(
-            normalize_server("https://host")
-                .unwrap_err()
-                .to_string()
-                .contains("plain http")
+        assert_eq!(
+            normalize_server("http://[::1]:8099").unwrap(),
+            "http://[::1]:8099"
         );
+
+        // The deployed shapes (ADR 0029): https, base path, defaults.
+        assert_eq!(
+            normalize_server("https://pursecraft.com/api").unwrap(),
+            "https://pursecraft.com/api"
+        );
+        assert_eq!(
+            normalize_server("https://pursecraft.com/api/").unwrap(),
+            "https://pursecraft.com/api"
+        );
+        assert_eq!(normalize_server("https://host").unwrap(), "https://host");
+        assert_eq!(
+            normalize_server("https://host:8443/base-1_a.2").unwrap(),
+            "https://host:8443/base-1_a.2"
+        );
+
+        // No scheme guessing, no case-insensitive spelling.
         assert!(
             normalize_server("host:8080")
                 .unwrap_err()
                 .to_string()
-                .contains("http://host:port")
+                .contains("must look like")
+        );
+        assert!(
+            normalize_server("HTTPS://host")
+                .unwrap_err()
+                .to_string()
+                .contains("must look like")
+        );
+        assert!(
+            normalize_server("ftp://host")
+                .unwrap_err()
+                .to_string()
+                .contains("must look like")
         );
         // "http://" loses its slashes to the trailing-slash trim and is
         // caught by the scheme check — same teaching outcome.
@@ -435,13 +534,56 @@ mod tests {
             normalize_server("http://")
                 .unwrap_err()
                 .to_string()
-                .contains("http://host:port")
+                .contains("must look like")
         );
+
+        // Ports are digits in range or a teaching error.
         assert!(
-            normalize_server("http://h/p")
+            normalize_server("http://host:zero")
                 .unwrap_err()
                 .to_string()
-                .contains("no path")
+                .contains("port")
+        );
+        assert!(
+            normalize_server("http://host:99999")
+                .unwrap_err()
+                .to_string()
+                .contains("port")
+        );
+        assert!(
+            normalize_server("http://host:0")
+                .unwrap_err()
+                .to_string()
+                .contains("port")
+        );
+
+        // At most one base-path segment, and it stays boring: no deeper
+        // paths, no traversal, no junk characters, no queries, fragments,
+        // or userinfo hiding in the tail.
+        for junk in [
+            "https://h/p/q",
+            "https://h/.",
+            "https://h/..",
+            "https://h/a..b",
+            "https://h/.a",
+            "https://h/a.",
+            "https://h/p?q=1",
+            "https://h/p#f",
+            "https://h/%20",
+            "https://h/p q",
+        ] {
+            let message = normalize_server(junk).unwrap_err().to_string();
+            assert!(
+                message.contains("base-path") || message.contains("must look like"),
+                "{junk}: {message}"
+            );
+            assert!(normalize_server(junk).is_err(), "{junk} refused");
+        }
+        assert!(
+            normalize_server("https://user@host")
+                .unwrap_err()
+                .to_string()
+                .contains("must look like")
         );
     }
 }

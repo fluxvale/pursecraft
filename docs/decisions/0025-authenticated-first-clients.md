@@ -11,6 +11,9 @@
   [ADR 0024](0024-rendezvous-sync-relay.md)
 - **Amends (in part):** [ADR 0023](0023-capture-cli.md) — the zero-setup
   bootstrap clause: first capture now follows one-time enrollment.
+- **Amended (in part) by:** [ADR 0029](0029-https-relay-client.md) — the
+  transport choice (minreq → ureq 3/rustls) and the "v1 speaks plain http"
+  clause; https URLs are accepted grammar now.
 
 ## Context
 
@@ -66,6 +69,9 @@ atomic discipline ([ADR 0023]) and mode 0600 (the token is a credential).
   plain HTTP ([ADR 0024]); TLS termination is the deployment slice's
   concern ([ADR 0013]). A non-`http` URL is refused at login with that
   explanation, not discovered as a transport error mid-sync.
+  *(Superseded by [ADR 0029](0029-https-relay-client.md): `https` is
+  accepted grammar — TLS terminates at the fleet's edge, and the CLI
+  speaks it; `http` to a local relay is unchanged.)*
 - **Re-login re-enrolls**: a new device record replaces the session (a
   wiped relay is the realistic cause of a dead token). The local world —
   identity, stores — is untouched; see "stranded ops" below for the one
@@ -236,12 +242,18 @@ data directory.
   call; a tokio client is a runtime in a sync one-shot CLI. `minreq`
   (no TLS, `json-using-serde`) adds **zero** new transitive deps — the
   repo's lean-deps discipline ([ADR 0023]) keeps its teeth.
+  *(Re-decided by [ADR 0029](0029-https-relay-client.md): the https era
+  requires a maintained TLS stack; minreq's own TLS features pin
+  unfixably vulnerable rustls 0.21-era crates, and ureq 3's minimal cut
+  avoids the url/ICU tree that motivated this rejection.)*
 - **Hand-rolled HTTP/1.1 on `std::net`** — rejected: chunked transfer and
   proxy semantics are correctness traps; `minreq` is small, tested, and
   ISC-licensed (deny.toml's one conscious license addition for this slice).
 - **HTTPS now** — rejected: the relay is plain HTTP by decision ([ADR
   0024]); TLS arrives with the deployment/hosted slice. `login` refuses
-  non-`http` URLs with that explanation.
+  non-`http` URLs with that explanation. *(Superseded by
+  [ADR 0029](0029-https-relay-client.md): the deployment slice is live —
+  `login` accepts `https://` and the fleet terminates TLS at its edge.)*
 - **Server-side changes for join** — rejected: pairing codes, grants, and
   per-scope routes already cover the flow ([ADR 0024]); the relay is
   untouched by this slice.

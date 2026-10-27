@@ -38,4 +38,11 @@ allow = [
     # MIT-equivalent permissive license (OpenBSD, musl). Same conscious
     # shape as BSD-3-Clause above.
     "ISC",
+    # webpki-roots 1.x (Mozilla's CA bundle, via ureq's rustls feature,
+    # ADR 0029) ships its certificate DATA under CDLA-Permissive-2.0 —
+    # a permissive data license (use, distribute, modify; share-alike
+    # applies to the data itself only, no source disclosure). The minreq
+    # entry above is retained: it stays in git history and may return
+    # via other transitive paths.
+    "CDLA-Permissive-2.0",
 ]

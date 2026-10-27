@@ -1,6 +1,6 @@
 # 0029 — HTTPS Relay Client: ureq/rustls and Base-Path Server URLs
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-27
 - **Builds on:** [ADR 0013](0013-deployment-topology.md),
   [ADR 0023](0023-capture-cli.md),
