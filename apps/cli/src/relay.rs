@@ -21,7 +21,9 @@ use ureq::Agent;
 /// must not hang a one-shot command).
 const TIMEOUT_SECS: u64 = 30;
 
-/// The strict agent (ADR 0029): `max_redirects(0)` — a 3xx (the fleet's
+/// The strictness settings of every agent this CLI builds (ADR 0029) —
+/// ONE chain, so a test agent cannot drift from the shipped one
+/// (hostile review round 2): `max_redirects(0)` — a 3xx (the fleet's
 /// http→https 308 included) surfaces as a loud redirect error, never a
 /// silently-followed ride; `http_status_as_error(false)` — statuses flow
 /// to this module's teaching decoder; one bounded timeout per call;
@@ -29,14 +31,26 @@ const TIMEOUT_SECS: u64 = 30;
 /// must not choose the peer a cleartext bearer token is sent to, and a
 /// `HTTP_PROXY` var on a laptop must not silently break a loopback relay
 /// (minreq never read these vars; this keeps that behavior exactly).
-/// Trust is the default Mozilla root bundle; the https test injects a
-/// test CA instead through [`Relay::with_agent`].
-pub fn default_agent() -> Agent {
+fn strict_builder() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
     Agent::config_builder()
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(TIMEOUT_SECS)))
         .proxy(None)
+}
+
+/// The shipped agent (ADR 0029): the strict chain with the default
+/// Mozilla root bundle — no other setting differs, by construction.
+pub fn default_agent() -> Agent {
+    strict_builder().build().new_agent()
+}
+
+/// The test seam (ADR 0029's hermetic https round trip): the SAME strict
+/// chain with test-only trust roots — the only difference from
+/// [`default_agent`] is the roots, because the builder is shared.
+pub fn agent_with_roots(roots: ureq::tls::RootCerts) -> Agent {
+    strict_builder()
+        .tls_config(ureq::tls::TlsConfig::builder().root_certs(roots).build())
         .build()
         .new_agent()
 }

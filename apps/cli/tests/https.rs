@@ -151,20 +151,13 @@ impl Listener for TlsListener {
 // The client side: agents, homes, and stores.
 // ---------------------------------------------------------------------
 
-/// An agent shaped like the CLI's strict one, but trusting ONLY the test
-/// certificate — the injectable seam of ADR 0029.
+/// The test client (ADR 0029): the SHIPPED strict chain (via
+/// [`relay::agent_with_roots`]) with the test certificate as the only
+/// trust root — no builder is duplicated here, so the test agent cannot
+/// drift from the production one (hostile review round 2).
 fn test_agent(cert_pem: &[u8]) -> ureq::Agent {
     let certificate = ureq::tls::Certificate::from_pem(cert_pem).expect("test cert parses");
-    let tls = ureq::tls::TlsConfig::builder()
-        .root_certs(ureq::tls::RootCerts::new_with_certs(&[certificate]))
-        .build();
-    ureq::Agent::config_builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .tls_config(tls)
-        .build()
-        .new_agent()
+    relay::agent_with_roots(ureq::tls::RootCerts::new_with_certs(&[certificate]))
 }
 
 struct TempDir(PathBuf);

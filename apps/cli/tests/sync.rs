@@ -398,6 +398,11 @@ fn proxy_environment_variables_never_hijack_the_relay() {
             .env("https_proxy", "http://127.0.0.1:9")
             .env("ALL_PROXY", "http://127.0.0.1:9")
             .env("all_proxy", "http://127.0.0.1:9")
+            // An inherited NO_PROXY (corporate default: `localhost,127.0.0.1`
+            // or `*`) would mask the very regression this test guards — the
+            // child must see the proxy vars with NO exclusion in force.
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
             .args(args);
         cmd
     };

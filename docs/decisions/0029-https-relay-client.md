@@ -63,12 +63,14 @@ features = ["rustls", "json"] }`:
   packages** on unix (+16 third-party added — ureq, ureq-proto, http,
   httparse, rustls, rustls-pki-types, rustls-webpki, webpki-roots, ring,
   and ring's small companions — minus minreq: **+15 net**). The Cargo.lock
-  grows further (+82 entries) because the resolver records every optional
-  edge: ureq's never-enabled cookies feature makes `url`/`idna`/`icu_*`
-  *resolvable*, and the dev-only test scaffolding (`rcgen`, `tokio-rustls`)
-  adds `x509-parser`, `asn1-rs`, `der-parser`, `pem`, `time`, `yasna`.
-  None of that compiles into the shipped binary — but it is what
-  cargo-deny grades, so the cost is stated here rather than discovered.
+  grows further (**82 entries added, one — minreq — removed: net 81**),
+  and the split matters: the dev-only test scaffolding (`rcgen`,
+  `tokio-rustls`, and their trees) is part of cargo-deny's resolved
+  graph, while ureq's never-enabled optional edges (`url`, `idna`,
+  `icu_*`, `cookie_store`) are merely *resolvable* — never resolved, so
+  compiled into nothing and graded by no gate; they ride in Cargo.lock
+  alone. None of it reaches the shipped binary; the cost is stated here
+  rather than discovered.
 - **Supply chain stays green, with one conscious license addition**:
   webpki-roots ships its certificate data under `CDLA-Permissive-2.0` (a
   permissive data license: use, distribute, modify; share-alike applies to
@@ -227,8 +229,8 @@ configuration, retry-policy changes.
   `https://pursecraft.com/api` is unblocked.
 - One direct dependency swap (`minreq` → `ureq 3`): the shipped tree
   grows +15 net compiled packages (49 → 64, command in §1), the lockfile
-  +82 entries (optional edges and dev-only test scaffolding, also §1),
-  one deny.toml license entry, two dev-dependencies for the TLS test
+  82 added / 1 removed (minreq) for net 81 (attribution in §1), one
+  deny.toml license entry, two dev-dependencies for the TLS test
   (`rcgen`, `tokio-rustls`).
 - `Relay` gains an injectable-agent constructor for the https test; the
   minreq `HttpsFeatureNotEnabled` teaching arm is deleted with its cause.
