@@ -50,3 +50,5 @@ their replacement.
 | [0025](0025-authenticated-first-clients.md) | Authenticated-first clients: enrollment gate and first sync | Accepted |
 | [0026](0026-relay-containerization.md) | Relay containerization: one image, two-route health, bounded drain | Accepted |
 | [0027](0027-budgeting-semantics-cli.md) | Budgeting semantics in the CLI: categories, inbox, allocation, balances | Accepted |
+| [0028](0028-e2ee-wiring-and-key-transport.md) | E2EE wiring: device keys, key records, and their transport | Accepted |
+| [0029](0029-https-relay-client.md) | HTTPS relay client: ureq/rustls and base-path server URLs | Proposed |
