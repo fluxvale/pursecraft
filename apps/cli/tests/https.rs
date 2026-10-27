@@ -317,3 +317,67 @@ fn wire_payload(op: &Op) -> String {
     let (_, payload) = op.clone().into_parts();
     pursecraft_core::wire::encode_payload(&payload).expect("encode payload")
 }
+
+#[test]
+fn agent_with_roots_shares_the_shipped_strictness_field_by_field() {
+    // Opportunistic close (hostile review's non-blocking P3):
+    // `agent_with_roots` is shipped public API — a second closure that
+    // could drift. Its OUTPUT is pinned to the shipped agent on the
+    // reviewer's six-field set (max_redirects, status-as-error, proxy,
+    // timeout, disable_verification, sni), so a future edit inside the
+    // seam cannot quietly loosen the test client while `default_agent`
+    // stays strict. The seam may differ from production in trust roots
+    // ONLY.
+    let key = rcgen::KeyPair::generate().expect("key pair");
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .expect("cert params")
+        .self_signed(&key)
+        .expect("cert");
+    let certificate = ureq::tls::Certificate::from_pem(cert.pem().as_bytes()).expect("pem");
+    let seam = relay::agent_with_roots(ureq::tls::RootCerts::new_with_certs(&[certificate]));
+    let shipped = relay::default_agent();
+    let (seam_config, shipped_config) = (seam.config(), shipped.config());
+
+    // Field-by-field equality with the shipped agent.
+    assert_eq!(
+        seam_config.max_redirects(),
+        shipped_config.max_redirects(),
+        "redirects drift in the seam"
+    );
+    assert_eq!(
+        seam_config.http_status_as_error(),
+        shipped_config.http_status_as_error(),
+        "status handling drift in the seam"
+    );
+    assert_eq!(
+        seam_config.proxy().is_none(),
+        shipped_config.proxy().is_none(),
+        "proxy pin drift in the seam"
+    );
+    assert_eq!(
+        seam_config.timeouts().global,
+        shipped_config.timeouts().global,
+        "timeout drift in the seam"
+    );
+    let (seam_tls, shipped_tls) = (seam_config.tls_config(), shipped_config.tls_config());
+    assert_eq!(
+        seam_tls.disable_verification(),
+        shipped_tls.disable_verification(),
+        "verification drift in the seam"
+    );
+    assert!(!seam_tls.disable_verification(), "verification stays on");
+    assert_eq!(
+        seam_tls.use_sni(),
+        shipped_tls.use_sni(),
+        "sni drift in the seam"
+    );
+
+    // The three strict pins as literals, so lenience is caught even if
+    // both agents were ever loosened together.
+    assert_eq!(seam_config.max_redirects(), 0, "no redirects, ever");
+    assert!(
+        !seam_config.http_status_as_error(),
+        "statuses flow to the teaching decoder"
+    );
+    assert!(seam_config.proxy().is_none(), "no environment proxy, ever");
+}
