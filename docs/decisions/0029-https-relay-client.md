@@ -10,6 +10,9 @@
 - **Amends (in part):** [ADR 0025](0025-authenticated-first-clients.md) — the
   transport choice (minreq → ureq) and the "v1 speaks plain http" clause; the
   enrollment gate, session shape, and sync contract are untouched.
+- **Amended (in part) by:** [ADR 0030](0030-interactive-login-hosted-default.md)
+  — the login UX surface only (bare interactive login / `--server`); the
+  grammar, transport, and representation decided here stand exactly.
 - **Issue:** [#34](https://github.com/fluxvale/pursecraft/issues/34)
 
 ## Context
@@ -181,10 +184,12 @@ table tests plus the nested-`/api` round-trip below.
 5. **Redirect teaching** — a raw-socket bodiless-308 stand-in answers a
    login probe; the error names the destination and says the client does
    not follow redirects, never "answered strangely".
-6. **Live acceptance** — `pursecraft login https://pursecraft.com/api`
-   plus a capture + `sync` round-trip against production, transcript
-   recorded with the enrollment secret redacted (requires the operator's
-   secret at run time).
+6. **Live acceptance** — the interactive form or
+   `pursecraft login --server https://pursecraft.com/api` (command line
+   amended by [ADR 0030](0030-interactive-login-hosted-default.md)), plus a
+   capture + `sync` round-trip against production, transcript recorded with
+   the enrollment secret redacted (requires the operator's secret at run
+   time).
 
 Out of scope, unchanged from [issue #34]: certificate pinning, proxy
 configuration, retry-policy changes.

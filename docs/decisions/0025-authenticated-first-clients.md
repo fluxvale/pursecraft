@@ -14,6 +14,10 @@
 - **Amended (in part) by:** [ADR 0029](0029-https-relay-client.md) — the
   transport choice (minreq → ureq 3/rustls) and the "v1 speaks plain http"
   clause; https URLs are accepted grammar now.
+  [ADR 0030](0030-interactive-login-hosted-default.md) — the `login
+  <server-url>` command shape (bare interactive / `--server`) and the
+  secret's channel (hidden prompt on a tty); the enrollment gate itself
+  stands.
 
 ## Context
 
