@@ -100,20 +100,22 @@ impl fmt::Display for RelayError {
                 ),
                 403 if message.contains("enrollment") => write!(
                     f,
-                    "the relay refused the enrollment secret — it lives in the relay's data directory (enrollment.secret)"
+                    "the relay at {server} refused the enrollment secret — it lives in the \
+                     relay's data directory (enrollment.secret)"
                 ),
                 403 if message.contains("granted") => write!(
                     f,
-                    "the relay refused: {message} — to bring a fresh device into this world, \
+                    "the relay at {server} refused: {message} — to bring a fresh device into this world, \
                      run pursecraft pair on a granted device and pursecraft join here; \
                      to restore a backup, copy the whole data home (session.json included)"
                 ),
                 403 if message.contains("expired") => write!(
                     f,
-                    "the relay refused the pairing code: {message} — mint a fresh one on a granted device: pursecraft pair"
+                    "the relay at {server} refused the pairing code: {message} — mint a fresh \
+                     one on a granted device: pursecraft pair"
                 ),
-                403 => write!(f, "the relay refused: {message}"),
-                409 => write!(f, "the relay refused: {message}"),
+                403 => write!(f, "the relay at {server} refused: {message}"),
+                409 => write!(f, "the relay at {server} refused: {message}"),
                 _ => write!(
                     f,
                     "the relay at {server} answered {code} ({error}): {message}"
@@ -455,7 +457,11 @@ pub fn probe(server: &str) -> Result<(), ProbeError> {
             detail: e.to_string(),
         })?;
     let status = response.status().as_u16();
-    if (200..300).contains(&status) || status == 405 {
+    // 405 ONLY (hostile review round 3): the route is POST-only in the v1
+    // contract, so every relay answers 405 for a GET — a 2xx here is a
+    // catch-all page (a parked domain, an SPA fallback), not a relay, and
+    // must not see the secret.
+    if status == 405 {
         Ok(())
     } else if (300..400).contains(&status) {
         let location = response
