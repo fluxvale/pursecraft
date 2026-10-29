@@ -45,25 +45,36 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(out.code).unwrap_or(1))
 }
 
-/// The real terminal (ADR 0030 §3, as amended): the form lives on ONE
-/// stream — the controlling terminal (`/dev/tty`), where the hidden read
-/// happens — so a redirected stderr cannot hide the questions or split
-/// the conversation. Lines echo (nothing secret in them); the enrollment
-/// secret is read hidden via rpassword (echo off, same tty). Without a
-/// controlling terminal the lines fall back to stderr and the hidden
-/// read fails loudly on its own. Reads ride stdin — the tty the
-/// `IsTerminal` gate saw. stdout keeps only the final answer.
+/// The real terminal (ADR 0030 §3/§6, fix round 2): the form lives on
+/// ONE descriptor — the controlling terminal (`/dev/tty`), opened once
+/// for reading and writing. Everything the form shows goes there, every
+/// answer (echoed lines and the hidden secret) is read from there, and
+/// the echo-off span around the probe (`tcsetattr`) plus the drain
+/// before the hidden read (`tcflush`) ride the same tty — stdin's
+/// terminal-ness only decides whether the form runs at all, so a stdin
+/// that happens to be a different tty can neither capture the secret nor
+/// split the conversation. Without a controlling terminal the lines fall
+/// back to stderr/stdin and the hidden read fails loudly on its own.
+/// stdout keeps only the final answer. (The echo span is unix termios;
+/// elsewhere the span is a no-op and rpassword's own hidden read is the
+/// whole guarantee.)
 struct StdinTerminal {
     tty: Option<std::fs::File>,
+    /// The termios state to restore after the hidden span (fix round 2).
+    #[cfg(unix)]
+    saved_termios: Option<nix::sys::termios::Termios>,
 }
 
 impl StdinTerminal {
     fn new() -> Self {
         Self {
             tty: std::fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .open("/dev/tty")
                 .ok(),
+            #[cfg(unix)]
+            saved_termios: None,
         }
     }
 
@@ -71,11 +82,13 @@ impl StdinTerminal {
     fn put(&self, text: &str) -> std::io::Result<()> {
         match &self.tty {
             Some(tty) => {
+                use std::io::Write;
                 let mut tty = tty;
                 tty.write_all(text.as_bytes())?;
                 tty.flush()
             }
             None => {
+                use std::io::Write;
                 let mut stderr = std::io::stderr().lock();
                 stderr.write_all(text.as_bytes())?;
                 stderr.flush()
@@ -90,14 +103,68 @@ impl Terminal for StdinTerminal {
     }
 
     fn read_line(&mut self, prompt: &str) -> std::io::Result<String> {
+        use std::io::BufRead;
         self.put(prompt)?;
+        let Some(tty) = self.tty.as_ref() else {
+            // No controlling terminal: read stdin, as before — the hidden
+            // read will fail loudly if this ever mattered.
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            return Ok(line);
+        };
+        let mut reader = std::io::BufReader::new(tty.try_clone()?);
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
+        reader.read_line(&mut line)?;
         Ok(line)
     }
 
+    fn hide_input(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use nix::sys::termios::{self as t, LocalFlags, SetArg};
+            let Some(tty) = self.tty.as_ref() else {
+                return Ok(()); // nothing to control; reads fail loudly later
+            };
+            let saved = t::tcgetattr(tty)?;
+            let mut quiet = saved.clone();
+            quiet.local_flags &= !LocalFlags::ECHO;
+            t::tcsetattr(tty, SetArg::TCSANOW, &quiet)?;
+            self.saved_termios = Some(saved);
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+
+    fn show_input(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use nix::sys::termios::SetArg;
+            if let (Some(saved), Some(tty)) = (self.saved_termios.take(), self.tty.as_ref()) {
+                nix::sys::termios::tcsetattr(tty, SetArg::TCSANOW, &saved)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+
     fn read_secret(&mut self, prompt: &str) -> std::io::Result<String> {
-        rpassword::prompt_password(prompt)
+        // Drain everything that arrived while echo was off (§6): those
+        // bytes were never echoed and are discarded — never the secret.
+        #[cfg(unix)]
+        if let Some(tty) = self.tty.as_ref() {
+            nix::sys::termios::tcflush(tty, nix::sys::termios::FlushArg::TCIFLUSH)?;
+        }
+        let secret = rpassword::prompt_password(prompt);
+        // The hidden read restores what IT saved (echo-off); restore the
+        // pre-span state so the terminal is exactly as the user left it.
+        let _ = self.show_input();
+        secret
     }
 }
 

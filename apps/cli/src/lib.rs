@@ -28,15 +28,27 @@ use pursecraft_core::date::Date;
 
 /// The interactive terminal (ADR 0030): `login`'s form channel, present
 /// only when stdin is a terminal. The library never touches the process
-/// environment — the thin binary wires the real terminal (prompts to
-/// stderr, secrets hidden), and tests script a fake to assert the
-/// conversation, not just the outcome.
+/// environment — the thin binary wires the real terminal (one stream —
+/// the controlling terminal — for everything the form shows and reads),
+/// and tests script a fake to assert the conversation, not just the
+/// outcome.
 pub trait Terminal {
     /// Say one informational line (the derived-url echo).
     fn say(&mut self, line: &str) -> std::io::Result<()>;
     /// Read one line, echoed — nothing secret is asked this way.
     fn read_line(&mut self, prompt: &str) -> std::io::Result<String>;
-    /// Read one line, hidden — the enrollment secret.
+    /// Turn input echo OFF from here (ADR 0030 §6, fix round 2): the
+    /// probe that follows exposes no echo window — bytes typed while it
+    /// runs are neither echoed nor able to become the secret. Undone by
+    /// [`Terminal::read_secret`] (which also drains them) or
+    /// [`Terminal::show_input`].
+    fn hide_input(&mut self) -> std::io::Result<()>;
+    /// Undo [`Terminal::hide_input`] without reading — the probe-failure
+    /// path; the terminal must never be left echo-off.
+    fn show_input(&mut self) -> std::io::Result<()>;
+    /// Drain whatever arrived since [`Terminal::hide_input`] (it is
+    /// discarded, never the secret), then read one line hidden — the
+    /// enrollment secret — and restore echo.
     fn read_secret(&mut self, prompt: &str) -> std::io::Result<String>;
 }
 
@@ -390,19 +402,21 @@ fn is_loopback(host: &str) -> bool {
 
 /// Enroll this device (ADR 0025; the surface reshaped by ADR 0030).
 /// Resolve the server — the `--server` flag wins, no terminal defaults to
-/// the hosted relay, a terminal gets the choice form — then the probe and
-/// the secret, ordered per path (ADR 0030 §5–§6, as amended):
+/// the hosted relay, a terminal gets the choice form — then, in this
+/// order (ADR 0030 §5–§6, fix round 2):
 ///
-/// - **tty:** the hidden secret read happens BEFORE the probe — nothing
-///   network-shaped sits between the form and the hidden read, so there is
-///   no waiting window that invites typing the secret into an echoing
-///   terminal. The secret is held in the process and only ever SENT after
-///   the probe passes; a failed probe discards it unread-to-network.
-/// - **piped:** the probe runs before the secret's source is even called —
-///   a dead relay answers before the process blocks on the writer's pipe.
+/// 1. **The fingerprint probe** (`GET <server>/v1/devices`): a relay is
+///    proven present — 405/2xx — before any secret is COLLECTED (tty) or
+///    CONSUMED (pipe). A dead URL, a mistyped-but-answering domain, a 3xx
+///    or a 5xx all fail HERE, naming the URL (and the typed domain).
+/// 2. **The secret** — on a tty, echo went OFF before the probe (no echo
+///    window spans it), the hidden read drains whatever was typed during
+///    the probe (discarded, never the secret), and the prompt appears
+///    only after the probe passed — a dead relay never demands the
+///    secret. Piped, the lazy source is first called now.
+/// 3. **Enroll** — the secret's only network use, on the proven URL.
 ///
-/// With the relay proven reachable, enroll and publish the session. The
-/// secret and the returned token never appear in the output.
+/// The secret and the returned token never appear in the output.
 fn login(
     home: &Path,
     server_arg: Option<&str>,
@@ -410,17 +424,33 @@ fn login(
     terminal: &mut Option<Box<dyn Terminal>>,
 ) -> Result<String, LoginError> {
     let (server, typed_domain) = resolve_server(server_arg, terminal)?;
-    let tty_secret = match terminal.as_mut() {
-        Some(term) => Some(
-            term.read_secret("enrollment secret: ")
-                .map_err(LoginError::Io)?
-                .trim()
-                .to_owned(),
-        ),
-        None => None,
+    // Echo off across the probe (§6): on a tty there is no echo-on window
+    // between the form's last echoed answer and the end of the hidden
+    // read — the probe in between exposes nothing to echo.
+    if let Some(term) = terminal.as_mut() {
+        term.hide_input().map_err(LoginError::Io)?;
+    }
+    let probed = relay::probe(&server);
+    let secret = match terminal.as_mut() {
+        Some(term) => match probed {
+            Ok(()) => Some(
+                term.read_secret("enrollment secret: ")
+                    .map_err(LoginError::Io)?
+                    .trim()
+                    .to_owned(),
+            ),
+            Err(e) => {
+                // Never leave the terminal echo-off (§6's own rule).
+                let _ = term.show_input();
+                return Err(LoginError::Probe(e, typed_domain));
+            }
+        },
+        None => {
+            probed.map_err(|e| LoginError::Probe(e, typed_domain))?;
+            None
+        }
     };
-    relay::probe_health(&server).map_err(|e| LoginError::Probe(e, typed_domain))?;
-    let secret = match tty_secret {
+    let secret = match secret {
         Some(secret) => secret,
         None => piped_secret
             .take()
@@ -684,6 +714,7 @@ pub(crate) mod testsupport {
     /// reading the transcript after the form consumed the channel.
     pub(crate) struct ScriptedTerminal {
         pub(crate) transcript: Vec<String>,
+        pub(crate) secret_read_at: Option<std::time::Instant>,
         answers: std::collections::VecDeque<String>,
     }
 
@@ -691,6 +722,7 @@ pub(crate) mod testsupport {
         pub(crate) fn new(answers: &[&str]) -> Self {
             Self {
                 transcript: Vec::new(),
+                secret_read_at: None,
                 answers: answers.iter().map(|a| (*a).to_owned()).collect(),
             }
         }
@@ -712,8 +744,25 @@ pub(crate) mod testsupport {
             Ok(script.answers.pop_front().unwrap_or_default())
         }
 
+        fn hide_input(&mut self) -> std::io::Result<()> {
+            self.0
+                .borrow_mut()
+                .transcript
+                .push("<echo off>\n".to_owned());
+            Ok(())
+        }
+
+        fn show_input(&mut self) -> std::io::Result<()> {
+            self.0
+                .borrow_mut()
+                .transcript
+                .push("<echo on>\n".to_owned());
+            Ok(())
+        }
+
         fn read_secret(&mut self, prompt: &str) -> std::io::Result<String> {
             let mut script = self.0.borrow_mut();
+            script.secret_read_at = Some(std::time::Instant::now());
             script.transcript.push(format!("{prompt}<hidden>\n"));
             Ok(script.answers.pop_front().unwrap_or_default())
         }

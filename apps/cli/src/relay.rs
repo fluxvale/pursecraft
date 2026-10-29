@@ -114,7 +114,10 @@ impl fmt::Display for RelayError {
                 ),
                 403 => write!(f, "the relay refused: {message}"),
                 409 => write!(f, "the relay refused: {message}"),
-                _ => write!(f, "relay error {code} ({error}): {message}"),
+                _ => write!(
+                    f,
+                    "the relay at {server} answered {code} ({error}): {message}"
+                ),
             },
             Self::BadAnswer(detail) => write!(f, "the relay answered strangely: {detail}"),
         }
@@ -365,21 +368,20 @@ pub fn enroll(server: &str, secret: &str) -> Result<(DeviceId, String), RelayErr
     enroll_with_agent(&default_agent(), server, secret)
 }
 
-/// A `/health` probe failure (ADR 0030, as amended): what went wrong
-/// establishing that SOMETHING speaks HTTP at the URL before login asks
-/// for anything secret. Teaching-shaped like [`RelayError`], but its own
-/// type — the probe answers "is a relay reachable here", not "did this
-/// call succeed", and its errors must not promise captures stay queued
-/// (login has captured nothing yet).
+/// A probe failure (ADR 0030, fix round 2): what went wrong establishing
+/// that a RELAY serves the URL before login collects or consumes any
+/// secret. Teaching-shaped like [`RelayError`], but its own type — the
+/// probe answers "is a relay here", not "did this call succeed", and its
+/// errors must not promise captures stay queued (login has captured
+/// nothing yet).
 #[derive(Debug)]
 pub enum ProbeError {
     /// No HTTP conversation happened (connection refused, timeout, DNS,
-    /// TLS handshake) — the fail-early case: dead URL, typo, wrong port.
+    /// TLS handshake) — the dead-URL case: fail early, secret held.
     Unreachable { server: String, detail: String },
-    /// Something answered, but it is not a relay: a 3xx is never followed
-    /// (ADR 0029) and the destination is named; a non-2xx/404/405 at
-    /// `/health` that is not a missing route means an edge answered where
-    /// no healthy relay serves.
+    /// Something answered, but no relay serves this URL: a 404 at the
+    /// fingerprint route is any web host; another answered status is an
+    /// edge answering where no healthy relay serves.
     NotThere { server: String, status: u16 },
     /// A 3xx — never followed (ADR 0029); the destination is named.
     Redirect {
@@ -395,9 +397,16 @@ impl fmt::Display for ProbeError {
             Self::Unreachable { server, detail } => {
                 write!(f, "cannot reach the relay at {server} ({detail})")
             }
+            Self::NotThere {
+                server,
+                status: 404,
+            } => write!(
+                f,
+                "the host at {server} answered 404 at /v1/devices — no relay serves this url"
+            ),
             Self::NotThere { server, status } => write!(
                 f,
-                "the edge at {server} answered {status} at /health — something is \
+                "the edge at {server} answered {status} at /v1/devices — something is \
                  listening there, but no healthy relay"
             ),
             Self::Redirect {
@@ -420,31 +429,33 @@ impl std::error::Error for ProbeError {}
 /// 30 s before it says so.
 const PROBE_TIMEOUT_SECS: u64 = 5;
 
-/// The login reachability probe (ADR 0030, as amended): `GET
-/// <server>/health` — the relay's unauthenticated liveness route (ADR
-/// 0026), which touches nothing — on the strict chain with the probe's
-/// own short budget. The route is the fleet's, NOT the client's contract:
-/// reachability is the question, so **2xx, 404, and 405 all pass** (a
-/// `/v1`-only edge or a proxy that allow-lists `/v1` still enrolls,
-/// exactly as before this probe existed); transport failures and 3xx
-/// still fail enrollment immediately, naming the URL so a typo is
-/// obvious. The probe runs exactly once per invocation and its result is
-/// never reused — enrollment always makes its own round-trip.
-pub fn probe_health(server: &str) -> Result<(), ProbeError> {
+/// The login fingerprint probe (ADR 0030, fix round 2): `GET
+/// <server>/v1/devices` — a route only a relay serves (it is part of the
+/// v1 wire contract, ADR 0024; every relay image and every `/v1`-only
+/// proxy routes it) — on the strict chain with the probe's own short
+/// budget. **405 (the relay's answer for a GET on a POST-only route) and
+/// any 2xx pass**: a relay is proven present before any secret is
+/// collected or consumed. **404 fails as "no relay serves this url"** —
+/// every plain web host answers 404, so it is exactly the mistyped-domain
+/// case the probe exists to stop. Transport failures and 3xx still fail
+/// immediately; other answered statuses mean an edge answered where no
+/// healthy relay serves. The probe runs exactly once per invocation, its
+/// result is never cached (not within the invocation, not across), and
+/// enrollment always makes its own round-trip.
+pub fn probe(server: &str) -> Result<(), ProbeError> {
     let agent = strict_builder()
         .timeout_global(Some(Duration::from_secs(PROBE_TIMEOUT_SECS)))
         .build()
         .new_agent();
-    let response =
-        agent
-            .get(format!("{server}/health"))
-            .call()
-            .map_err(|e| ProbeError::Unreachable {
-                server: server.to_owned(),
-                detail: e.to_string(),
-            })?;
+    let response = agent
+        .get(format!("{server}/v1/devices"))
+        .call()
+        .map_err(|e| ProbeError::Unreachable {
+            server: server.to_owned(),
+            detail: e.to_string(),
+        })?;
     let status = response.status().as_u16();
-    if (200..300).contains(&status) || status == 404 || status == 405 {
+    if (200..300).contains(&status) || status == 405 {
         Ok(())
     } else if (300..400).contains(&status) {
         let location = response

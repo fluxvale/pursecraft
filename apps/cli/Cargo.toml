@@ -31,6 +31,11 @@ ureq = { version = "3", default-features = false, features = ["rustls", "json"] 
 # off. Apache-2.0 (deny.toml already allows it); adds only itself and its
 # sibling rtoolbox to the unix tree (libc already ships via ring).
 rpassword = "7.5"
+# The echo-off span around the login probe (ADR 0030 §6, fix round 2):
+# tcgetattr/tcsetattr/tcflush on the controlling terminal, through nix's
+# safe termios API — this workspace forbids unsafe code, so the termios
+# calls must not be hand-rolled over libc.
+nix = { version = "0.30", default-features = false, features = ["term"] }
 
 [dev-dependencies]
 # Integration tests (ADR 0025) drive the real relay router over a real

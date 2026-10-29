@@ -186,6 +186,22 @@ impl Terminal for SharedTerminal {
         Ok(script.answers.pop_front().unwrap_or_default())
     }
 
+    fn hide_input(&mut self) -> std::io::Result<()> {
+        self.0
+            .borrow_mut()
+            .transcript
+            .push("<echo off>\n".to_owned());
+        Ok(())
+    }
+
+    fn show_input(&mut self) -> std::io::Result<()> {
+        self.0
+            .borrow_mut()
+            .transcript
+            .push("<echo on>\n".to_owned());
+        Ok(())
+    }
+
     fn read_secret(&mut self, prompt: &str) -> std::io::Result<String> {
         let mut script = self.0.borrow_mut();
         script.secret_read_at = Some(std::time::Instant::now());
@@ -438,7 +454,8 @@ fn the_form_enrolls_from_a_domain_and_the_transcript_orders_everything() {
         "the session stores the derived url, not the typed answer"
     );
     // The whole conversation, in order: choice (endpoint shown), domain,
-    // derived url, and only then — after the probe passed — the secret.
+    // derived url, echo OFF across the probe (§6's span), and only then —
+    // after the probe passed — the secret prompt, echo restored after.
     assert_eq!(
         transcript,
         vec![
@@ -450,26 +467,33 @@ fn the_form_enrolls_from_a_domain_and_the_transcript_orders_everything() {
             ),
             "Your relay domain (e.g. example.com or 127.0.0.1:8099): ".to_owned(),
             format!("relay url: {derived}\n"),
+            "<echo off>\n".to_owned(),
             "enrollment secret: <hidden>\n".to_owned(),
         ]
     );
     // The secret surfaces nowhere in the output.
     assert!(!out.stdout.contains(&secret), "{}", out.stdout);
 
-    // The flag on a terminal asks only the secret (the server was given).
+    // The flag on a terminal asks only the secret (the server was given):
+    // echo off, probe, hidden read.
     let second = Home::new("form-flag");
     let (out, transcript, _) = second.run_form(&[&secret], &["login", "--server", &relay.url]);
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
-    assert_eq!(transcript, vec!["enrollment secret: <hidden>\n"]);
+    assert_eq!(
+        transcript,
+        vec![
+            "<echo off>\n".to_owned(),
+            "enrollment secret: <hidden>\n".to_owned()
+        ]
+    );
     relay.stop();
 }
 
-/// ADR 0030 §5, as amended (hostile review P2c): a 404 at `/health` is
-/// REACHABLE — the route is the fleet's, not the client's contract — so
-/// the wrong-base-path URL passes the probe and dies at enrollment, where
-/// the error must still name the URL.
+/// ADR 0030 §5, fix round 2: the fingerprint probe — a wrong base path is
+/// a 404 at `/v1/devices` ("no relay serves this url"), so it fails
+/// EARLY again, naming the URL, before any secret is collected.
 #[test]
-fn a_wrong_base_path_passes_the_probe_and_fails_loudly_at_enrollment() {
+fn a_wrong_base_path_fails_early_at_the_fingerprint_naming_the_url() {
     let mut relay = LiveRelay::start("wrong-path"); // serves at the root
     let home = Home::new("wrong-path");
     let wrong = format!("{}/api", relay.url.trim_end_matches('/'));
@@ -477,26 +501,188 @@ fn a_wrong_base_path_passes_the_probe_and_fails_loudly_at_enrollment() {
     let out = home.run("the-secret\n", &["login", "--server", &wrong]);
     assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
     assert!(
-        out.stderr.contains(&format!("status 404 from {wrong}")),
-        "the enrollment error names the URL\n{}",
-        out.stderr
-    );
-    assert!(
-        !out.stderr.contains("/health"),
-        "the probe passed — the 404 is the enrollment's, not the probe's\n{}",
+        out.stderr.contains(&format!(
+            "the host at {wrong} answered 404 at /v1/devices — no relay serves this url"
+        )),
+        "the fingerprint error names the URL\n{}",
         out.stderr
     );
     assert!(
         session::load(home.path()).unwrap().is_none(),
-        "a failed enrollment enrolls nothing"
+        "a failed fingerprint enrolls nothing"
     );
     relay.stop();
 }
 
-/// Hostile review P2c's compatibility case: a `/v1`-only edge (an older
-/// image, or a proxy that allow-lists `/v1` but not `/health`) enrolls
-/// exactly as it did before the probe existed. Hand-rolled HTTP: the
-/// probe's 404, then a real-shaped enroll answer.
+/// Hostile review round 2's P1 pin, the ADR's own typo case: a host that
+/// answers 404 at everything (any web server — `pursecraf.com` in the
+/// wild) must never see a POST, never receive the secret, and the error
+/// must name what was typed. Both paths: the form (typed domain) and the
+/// piped `--server`.
+#[test]
+fn a_404_answering_host_never_receives_the_secret() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    /// The wire log: (request line, body) per connection.
+    type Wire = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen: Wire = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let thread = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let Ok(mut stream) = stream else { continue };
+            let mut scratch = [0u8; 8192];
+            let _ = stream.read(&mut scratch);
+            let text = String::from_utf8_lossy(&scratch);
+            let request_line = text.lines().next().unwrap_or_default().to_owned();
+            // The read buffer is larger than the request: trim at the
+            // first NUL so an empty body IS empty.
+            let body = text
+                .split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or("")
+                .split('\0')
+                .next()
+                .unwrap_or("")
+                .as_bytes()
+                .to_vec();
+            log.lock().unwrap().push((request_line, body));
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+
+    // The form path: the user types just the domain; the probe alone runs.
+    let home = Home::new("404-host-form");
+    let domain = url.trim_start_matches("http://").to_owned();
+    let (out, transcript, _) = home.run_form(&["2", &domain, "the-secret"], &["login"]);
+    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains(&format!(
+            "the host at {url} answered 404 at /v1/devices — no relay serves this url"
+        )),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr
+            .contains(&format!("derived from domain \"{domain}\"")),
+        "the error names what was typed\n{}",
+        out.stderr
+    );
+    // The secret was never demanded: echo off, probe, echo back — no
+    // hidden read in the transcript.
+    assert!(
+        transcript.contains(&"<echo off>\n".to_owned())
+            && transcript.contains(&"<echo on>\n".to_owned())
+            && !transcript.iter().any(|l| l.contains("enrollment secret")),
+        "a 404 host never gets to ask for the secret: {transcript:?}"
+    );
+
+    // The piped path: same URL, same guarantee — the source is never read.
+    let piped_home = Home::new("404-host-piped");
+    let out = piped_home.run("the-secret\n", &["login", "--server", &url]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(
+        out.stderr.contains("no relay serves this url"),
+        "{}",
+        out.stderr
+    );
+
+    // And the wire: exactly the fingerprint GET(s), never a POST, never
+    // a body — the secret never left the process.
+    let requests = seen.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .all(|(line, body)| { line.starts_with("GET /v1/devices") && body.is_empty() }),
+        "only the fingerprint GET, no POST, no body: {requests:?}"
+    );
+    thread.join().unwrap();
+}
+
+/// Hostile review round 2's P2 arm: an enrollment failure names the URL
+/// in EVERY response shape — here a JSON-bodied 404 (a CDN or app error
+/// page), where the status arm used to drop the URL entirely.
+#[test]
+fn a_json_bodied_404_at_enrollment_names_the_url() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let thread = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let Ok(mut stream) = stream else { continue };
+            let mut scratch = [0u8; 8192];
+            let _ = stream.read(&mut scratch);
+            let head = String::from_utf8_lossy(&scratch);
+            let response = if head.starts_with("GET /v1/devices") {
+                // The fingerprint: this stand-in IS relay-shaped (405).
+                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_owned()
+            } else {
+                // Enrollment: a JSON error envelope, edge-style.
+                let body = "{\"error\":\"not_found\",\"message\":\"no such route\"}";
+                format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    let home = Home::new("json-404");
+    let out = home.run("the-secret\n", &["login", "--server", &url]);
+    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains(&format!(
+            "the relay at {url} answered 404 (not_found): no such route"
+        )),
+        "the JSON-bodied status arm names the URL\n{}",
+        out.stderr
+    );
+    assert!(session::load(home.path()).unwrap().is_none());
+    thread.join().unwrap();
+}
+
+/// Hostile review N12/N14 pins: the probe's answered-status teachings are
+/// contract, not prose — a 5xx at the fingerprint says exactly this.
+#[test]
+fn a_5xx_at_the_fingerprint_teaches_with_the_url_named() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let thread = std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            let Ok(mut stream) = stream else { continue };
+            let mut scratch = [0u8; 4096];
+            let _ = stream.read(&mut scratch);
+            let _ = stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let home = Home::new("probe-5xx");
+    let out = home.run("the-secret\n", &["login", "--server", &url]);
+    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains(&format!(
+            "the edge at {url} answered 503 at /v1/devices — something is \
+             listening there, but no healthy relay"
+        )),
+        "the 5xx teaching, verbatim\n{}",
+        out.stderr
+    );
+    thread.join().unwrap();
+}
+
+/// Hostile review P2c's compatibility case, fix-round-2 shape: a
+/// `/v1`-only edge enrolls because the fingerprint route IS the v1
+/// contract — a proxy that forwards `/v1/*` (but not `/health`) still
+/// answers 405 at `GET /v1/devices`. Hand-rolled HTTP: the fingerprint's
+/// 405, then a real-shaped enroll answer.
 #[test]
 fn a_v1_only_edge_still_enrolls() {
     use std::io::{Read, Write};
@@ -511,8 +697,9 @@ fn a_v1_only_edge_still_enrolls() {
             let mut scratch = [0u8; 4096];
             let _ = stream.read(&mut scratch);
             let head = String::from_utf8_lossy(&scratch);
-            let response = if head.starts_with("GET /health") {
-                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned()
+            let response = if head.starts_with("GET /v1/devices") {
+                // The relay's answer for a GET on a POST-only route.
+                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n".to_owned()
             } else {
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
@@ -565,21 +752,21 @@ fn the_probe_has_its_own_short_budget() {
     );
 }
 
-/// ADR 0030 §6, as amended (hostile review P2b): on a tty the hidden read
-/// happens BEFORE the probe — no network window sits between the form and
-/// the hidden read, so nothing invites typing the secret into an echoing
-/// terminal. A slow relay answers slowly; the timestamped terminal proves
-/// the secret was read first; the counting socket proves the probe ran
-/// exactly once (never cached, never retried).
+/// ADR 0030 §5–§6, fix round 2 (hostile review round 2's P2a goal
+/// state): the fingerprint probe PRECEDES the hidden read — the secret is
+/// never demanded before the relay is proven — and echo was already off
+/// across the probe. A slow fingerprint answers slowly; the timestamped
+/// terminal proves the read came after; the counting socket proves the
+/// probe ran exactly once (never cached, never retried).
 #[test]
-fn the_hidden_read_precedes_the_probe_and_the_probe_runs_once() {
+fn the_probe_precedes_the_hidden_read_and_runs_once() {
     use std::io::{Read, Write};
     use std::sync::mpsc;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (answered_tx, answered_rx) = mpsc::channel::<std::time::Instant>();
-    let health_hits = std::sync::Arc::new(std::sync::Mutex::new(0u32));
-    let hits = health_hits.clone();
+    let probe_hits = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+    let hits = probe_hits.clone();
     let device = uuid::Uuid::new_v4();
     let thread = std::thread::spawn(move || {
         let body = format!("{{\"device_id\":\"{device}\",\"token\":\"tok_1\"}}");
@@ -588,14 +775,17 @@ fn the_hidden_read_precedes_the_probe_and_the_probe_runs_once() {
             let mut scratch = [0u8; 4096];
             let _ = stream.read(&mut scratch);
             let head = String::from_utf8_lossy(&scratch);
-            if head.starts_with("GET /health") {
+            if head.starts_with("GET /v1/devices") {
                 *hits.lock().unwrap() += 1;
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                // Timestamp BEFORE the write: the client cannot see the
+                // answer before this instant, so the hidden read (which
+                // follows the answer) is strictly later.
+                let answered = std::time::Instant::now();
                 let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                      Content-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
-                let _ = answered_tx.send(std::time::Instant::now());
+                let _ = answered_tx.send(answered);
             } else {
                 let _ = stream.write_all(
                     format!(
@@ -616,12 +806,45 @@ fn the_hidden_read_precedes_the_probe_and_the_probe_runs_once() {
     let probe_answered_at = answered_rx.recv().expect("the probe ran");
     let secret_at = secret_at.expect("the hidden read happened");
     assert!(
-        secret_at + std::time::Duration::from_millis(1500) < probe_answered_at,
-        "the hidden read must precede the probe's answer by more than the \
-         probe's own latency margin"
+        probe_answered_at < secret_at,
+        "the probe's answer must precede the hidden read (the 2 s slow \
+         fingerprint makes the order unambiguous)"
     );
-    assert_eq!(*health_hits.lock().unwrap(), 1, "the probe runs once");
+    assert_eq!(*probe_hits.lock().unwrap(), 1, "the probe runs once");
     thread.join().unwrap();
+}
+
+/// The dead-relay-before-secret regression pin (hostile review round 2's
+/// P2a-a): on a tty against a dead URL, echo goes off, the probe fails,
+/// echo is RESTORED, the error names the URL — and the hidden read never
+/// happens. A dead relay never demands the secret.
+#[test]
+fn a_dead_relay_never_demands_the_secret_and_restores_echo() {
+    let home = Home::new("dead-first");
+    let (out, transcript, secret_at) = home.run_form(&["2", "127.0.0.1:9", "a-secret"], &["login"]);
+    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr
+            .contains("cannot reach the relay at http://127.0.0.1:9"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("derived from domain \"127.0.0.1:9\""),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        transcript.contains(&"<echo off>\n".to_owned())
+            && transcript.contains(&"<echo on>\n".to_owned()),
+        "the span closed on failure — the terminal is never left echo-off: {transcript:?}"
+    );
+    assert!(
+        !transcript.iter().any(|l| l.contains("enrollment secret")),
+        "the dead relay never asked for the secret: {transcript:?}"
+    );
+    assert!(secret_at.is_none(), "no hidden read happened");
+    assert!(session::load(home.path()).unwrap().is_none());
 }
 
 /// Hostile review M7+M8 (the class the suite could not see): run the REAL
@@ -689,6 +912,117 @@ fn the_real_binary_under_a_pty_takes_the_form_and_hides_the_secret() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(home.session().server, format!("http://{domain}"));
     relay.stop();
+}
+
+/// Hostile review round 2's P2a goal state, end to end under a REAL pty:
+/// echo is OFF across the whole probe (bytes typed during it are neither
+/// echoed nor the secret — the drain discards them), the secret prompt
+/// appears only after the probe passed, and the relay receives exactly
+/// the secret the user typed at the hidden prompt. A slow fingerprint
+/// stand-in (1.5 s) creates the window the old orders leaked into.
+#[test]
+fn typed_during_the_probe_is_neither_echoed_nor_the_secret() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let domain = url.trim_start_matches("http://").to_owned();
+    let secret = "enroll_the-real-secret-value";
+    let posted_body = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let body_log = posted_body.clone();
+    let device = uuid::Uuid::new_v4();
+    let thread = std::thread::spawn(move || {
+        let body = format!("{{\"device_id\":\"{device}\",\"token\":\"tok_1\"}}");
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            let mut scratch = [0u8; 8192];
+            let mut read = stream.read(&mut scratch).unwrap_or(0);
+            let mut text = String::from_utf8_lossy(&scratch[..read]).into_owned();
+            if text.starts_with("GET /v1/devices") {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            } else {
+                // The body may follow the head: keep reading until the
+                // enrollment JSON is complete.
+                while !text.contains("enrollment_secret") {
+                    read = stream.read(&mut scratch).unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    text.push_str(&String::from_utf8_lossy(&scratch[..read]));
+                }
+                *body_log.lock().unwrap() = text
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('\0')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    });
+
+    let home = Home::new("pty-window");
+    let capture = scratch_dir("pty-window").join("capture.log");
+    let mut child = std::process::Command::new("script")
+        .arg("-qec")
+        .arg(format!("{} login", env!("CARGO_BIN_EXE_pursecraft")))
+        .arg(&capture)
+        .env("PURSECRAFT_HOME", home.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("script(1) allocates a pty");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin piped");
+        let mut feed = |line: &str, wait_ms: u64| {
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            stdin.write_all(line.as_bytes()).expect("feed the form");
+        };
+        feed("2\n", 800); // the choice
+        feed(&format!("{domain}\n"), 400); // the domain — the probe starts after this
+        // Typed DURING the probe, into the echo-off span: discarded.
+        feed("MARKER-XYZ-ECHO-PROBE\n", 600);
+        // The probe (1.5 s) is done; the hidden prompt is up. The real
+        // secret, typed where echo is off and the queue was drained.
+        feed(&format!("{secret}\n"), 1200);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    }
+    let out = child.wait_with_output().expect("login finishes");
+    let screen = std::fs::read_to_string(&capture).expect("the pty capture");
+
+    // The marker was typed during the probe: echo was off — it never
+    // appeared — and the drain discarded it — it is not the secret.
+    assert!(
+        !screen.contains("MARKER-XYZ-ECHO-PROBE"),
+        "typed during the probe: not echoed\n{screen}"
+    );
+    assert!(
+        !screen.contains(secret),
+        "the secret stayed hidden\n{screen}"
+    );
+    assert!(
+        screen.contains(&format!("enrolled with http://{domain}")),
+        "the enrollment landed\n{screen}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let posted = posted_body.lock().unwrap().clone();
+    assert!(
+        posted.contains(secret) && !posted.contains("MARKER-XYZ"),
+        "the relay got exactly the typed secret, not the drained marker: {posted:?}"
+    );
+    thread.join().unwrap();
 }
 
 #[test]
