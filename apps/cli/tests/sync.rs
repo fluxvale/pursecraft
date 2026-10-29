@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pursecraft_api::{AppState, router};
+use pursecraft_cli::Terminal;
 use pursecraft_cli::home::{budget_log, load_identity, org_log};
 use pursecraft_cli::session::{self, Session};
 use pursecraft_cli::{Context, run};
@@ -137,6 +138,47 @@ fn scratch_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// The scripted terminal (ADR 0030): records every line, prompt, and
+/// secret request in one transcript, answering from a queue — tests
+/// assert the conversation (what was asked, in what order), not just the
+/// outcome.
+struct ScriptedTerminal {
+    transcript: Vec<String>,
+    answers: std::collections::VecDeque<String>,
+}
+
+impl ScriptedTerminal {
+    fn new(answers: &[&str]) -> Self {
+        Self {
+            transcript: Vec::new(),
+            answers: answers.iter().map(|a| (*a).to_owned()).collect(),
+        }
+    }
+}
+
+/// The newtype that hands a shared [`ScriptedTerminal`] to the form
+/// channel: local, so the `Terminal` impl obeys the orphan rule.
+struct SharedTerminal(std::rc::Rc<std::cell::RefCell<ScriptedTerminal>>);
+
+impl Terminal for SharedTerminal {
+    fn say(&mut self, line: &str) -> std::io::Result<()> {
+        self.0.borrow_mut().transcript.push(format!("{line}\n"));
+        Ok(())
+    }
+
+    fn read_line(&mut self, prompt: &str) -> std::io::Result<String> {
+        let mut script = self.0.borrow_mut();
+        script.transcript.push(prompt.to_owned());
+        Ok(script.answers.pop_front().unwrap_or_default())
+    }
+
+    fn read_secret(&mut self, prompt: &str) -> std::io::Result<String> {
+        let mut script = self.0.borrow_mut();
+        script.transcript.push(format!("{prompt}<hidden>\n"));
+        Ok(script.answers.pop_front().unwrap_or_default())
+    }
+}
+
 /// A CLI home: a scratch directory, run through the real dispatch.
 struct Home {
     dir: PathBuf,
@@ -166,14 +208,35 @@ impl Home {
                 today: Date::new(2026, 10, 25).unwrap(),
                 stdin: stdin.to_owned(),
                 e2ee: self.e2ee,
+                terminal: None,
             })
         })
+    }
+
+    /// Run `login` with a scripted terminal (ADR 0030): the form channel
+    /// plus its answers — the transcript comes back for ordering asserts.
+    fn run_form(&self, answers: &[&str], args: &[&str]) -> (pursecraft_cli::Output, Vec<String>) {
+        let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let script = std::rc::Rc::new(std::cell::RefCell::new(ScriptedTerminal::new(answers)));
+        let terminal: Option<Box<dyn pursecraft_cli::Terminal>> =
+            Some(Box::new(SharedTerminal(script.clone())));
+        let out = run(&argv, || {
+            Ok(Context {
+                home: self.dir.clone(),
+                today: Date::new(2026, 10, 25).unwrap(),
+                stdin: String::new(),
+                e2ee: self.e2ee,
+                terminal,
+            })
+        });
+        let transcript = script.borrow().transcript.clone();
+        (out, transcript)
     }
 
     fn login(&self, relay: &LiveRelay) -> pursecraft_cli::Output {
         self.run(
             &format!("{}\n", relay.enrollment_secret()),
-            &["login", &relay.url],
+            &["login", "--server", &relay.url],
         )
     }
 
@@ -263,7 +326,7 @@ fn login_enrolls_once_and_refuses_wrong_secrets() {
     let mut relay = LiveRelay::start("login");
     let home = Home::new("login");
 
-    let wrong = home.run("not-the-secret\n", &["login", &relay.url]);
+    let wrong = home.run("not-the-secret\n", &["login", "--server", &relay.url]);
     assert_eq!(wrong.code, 1, "{}", wrong.stderr);
     assert!(
         wrong.stderr.contains("refused the enrollment secret"),
@@ -286,21 +349,115 @@ fn login_enrolls_once_and_refuses_wrong_secrets() {
     assert_eq!(enrolled.server, relay.url);
 
     // A dead relay and an https url teach rather than crash: https is
-    // accepted grammar now (ADR 0029), so the refusal is the unreachable
-    // relay — a dead local port keeps the test hermetic (no DNS).
+    // accepted grammar now (ADR 0029), so the refusal is the probe's
+    // unreachable teaching — a dead local port keeps the test hermetic
+    // (no DNS). The probe runs before the secret is read (ADR 0030), so
+    // the piped secret is never consumed on these failures.
     let dead = Home::new("login-dead");
-    let out = dead.run("s\n", &["login", "http://127.0.0.1:9"]);
+    let out = dead.run("s\n", &["login", "--server", "http://127.0.0.1:9"]);
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("cannot reach"), "{}", out.stderr);
-    let tls = dead.run("s\n", &["login", "https://127.0.0.1:9"]);
+    assert!(
+        out.stderr.contains("http://127.0.0.1:9"),
+        "the error names the url\n{}",
+        out.stderr
+    );
+    let tls = dead.run("s\n", &["login", "--server", "https://127.0.0.1:9"]);
     assert_eq!(tls.code, 1);
     assert!(tls.stderr.contains("cannot reach"), "{}", tls.stderr);
-    let empty = dead.run("", &["login", "http://127.0.0.1:9"]);
+    // An empty piped stdin is caught after the probe (ADR 0030's order),
+    // so this needs a reachable relay — the live one above.
+    let empty = home.run("", &["login", "--server", &relay.url]);
     assert_eq!(empty.code, 1);
     assert!(
-        empty.stderr.contains("stdin"),
+        empty.stderr.contains("enrollment secret"),
         "an empty stdin teaches the shape\n{}",
         empty.stderr
+    );
+    assert!(
+        session::load(home.path()).unwrap().is_some(),
+        "the empty attempt enrolls nothing new but keeps the session"
+    );
+    relay.stop();
+}
+
+/// ADR 0030's headline: the form. A terminal, choice `2`, and nothing but
+/// a `host:port` answer — the CLI derives the URL, says it, probes it,
+/// and only then asks for the secret (hidden). The transcript — not just
+/// the outcome — is the assertion: what was asked, in what order, and
+/// that the endpoint was on screen before anything secret.
+#[test]
+fn the_form_enrolls_from_a_domain_and_the_transcript_orders_everything() {
+    let mut relay = LiveRelay::start("form");
+    let home = Home::new("form");
+
+    // What the user types: `2`, then just the local relay's host:port.
+    let domain = relay
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned();
+    let secret = relay.enrollment_secret();
+    let (out, transcript) = home.run_form(&["2", &domain, &secret], &["login"]);
+
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let derived = format!("http://{domain}"); // loopback: http, no prefix
+    assert_eq!(
+        out.stdout,
+        format!("enrolled with {derived} — capture is unlocked\n")
+    );
+    assert_eq!(
+        home.session().server,
+        derived,
+        "the session stores the derived url, not the typed answer"
+    );
+    // The whole conversation, in order: choice (endpoint shown), domain,
+    // derived url, and only then — after the probe passed — the secret.
+    assert_eq!(
+        transcript,
+        vec![
+            format!(
+                "1) Log in to pursecraft.com — the hosted relay ({})\n\
+                 2) Use my own server\n\
+                 Choose [1]: ",
+                pursecraft_cli::DEFAULT_SERVER
+            ),
+            "Your relay domain (e.g. example.com or 127.0.0.1:8099): ".to_owned(),
+            format!("relay url: {derived}\n"),
+            "enrollment secret: <hidden>\n".to_owned(),
+        ]
+    );
+    // The secret surfaces nowhere in the output.
+    assert!(!out.stdout.contains(&secret), "{}", out.stdout);
+
+    // The flag on a terminal asks only the secret (the server was given).
+    let second = Home::new("form-flag");
+    let (out, transcript) = second.run_form(&[&secret], &["login", "--server", &relay.url]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert_eq!(transcript, vec!["enrollment secret: <hidden>\n"]);
+    relay.stop();
+}
+
+/// ADR 0030 §5's wrong-base-path shape: a relay serving at the root,
+/// probed under a base path, answers 404 at /health — and login says
+/// exactly that, naming the URL, before any secret is consumed.
+#[test]
+fn a_wrong_base_path_fails_early_with_a_404_at_health() {
+    let mut relay = LiveRelay::start("wrong-path"); // serves at the root
+    let home = Home::new("wrong-path");
+    let wrong = format!("{}/api", relay.url.trim_end_matches('/'));
+
+    let out = home.run("the-secret\n", &["login", "--server", &wrong]);
+    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr
+            .contains(&format!("the relay at {wrong} answered 404 at /health")),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        session::load(home.path()).unwrap().is_none(),
+        "a failed probe enrolls nothing"
     );
     relay.stop();
 }
@@ -326,7 +483,7 @@ fn a_bodiless_redirect_teaches_the_redirect_not_a_strange_answer() {
     });
     let url = format!("http://{addr}");
     let home = Home::new("redirect");
-    let out = home.run("s\n", &["login", &url]);
+    let out = home.run("s\n", &["login", "--server", &url]);
     assert_eq!(out.code, 1, "{}", out.stderr);
     assert!(
         out.stderr
@@ -410,7 +567,7 @@ fn proxy_environment_variables_never_hijack_the_relay() {
     // Login (secret on stdin), capture, sync — all through the hostile
     // environment.
     let secret = relay.enrollment_secret();
-    let mut login = command(&["login", &relay.url])
+    let mut login = command(&["login", "--server", &relay.url])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

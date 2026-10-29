@@ -43,9 +43,13 @@ pub enum Cmd {
     /// `budget [show] [YYYY-MM]` — the balances view (ADR 0027); the
     /// optional `show` word is dropped here.
     Budget { month: Option<String> },
-    /// `login <server-url>` — enroll against the relay; the enrollment
-    /// secret rides stdin (ADR 0025).
-    Login { server: String },
+    /// `login [--server <relay-url>]` — enroll against the relay (ADR 0030):
+    /// no flag opens the choice form in a terminal (Enter = the hosted
+    /// relay, `2` = a domain-only prompt); without a terminal the hosted
+    /// relay is the default. The flag takes the full URL for scripts and
+    /// tests. The enrollment secret is prompted hidden on a terminal,
+    /// read from stdin's first line otherwise.
+    Login { server: Option<String> },
     /// `sync` — push the outbox and pull deltas through the relay
     /// (ADR 0025).
     Sync,
@@ -86,7 +90,7 @@ pub const USAGE: &str = "usage: pursecraft add <payee> <amount> [--date YYYY-MM-
                         pursecraft categorize [<txn> <category>]\n       \
                         pursecraft assign <category> <amount> [--month YYYY-MM]\n       \
                         pursecraft budget [show] [YYYY-MM]\n       \
-                        pursecraft login <relay-url>\n       \
+                        pursecraft login [--server <relay-url>]\n       \
                         pursecraft sync\n       \
                         pursecraft pair\n       \
                         pursecraft join <org-id> <org-code> <budget-id> <budget-code>";
@@ -103,7 +107,7 @@ usage:
   pursecraft categorize [<txn> <category>]
   pursecraft assign <category> <amount> [--month YYYY-MM]
   pursecraft budget [show] [YYYY-MM]
-  pursecraft login <relay-url>
+  pursecraft login [--server <relay-url>]
   pursecraft sync
   pursecraft pair
   pursecraft join <org-id> <org-code> <budget-id> <budget-code>
@@ -122,8 +126,12 @@ commands:
   budget      the can-I-buy-this view: per category assigned, activity,
               and available (assigned + activity), plus to-be-budgeted
 
-  login  enroll this device with the relay (once; the enrollment secret
-         is read from stdin, one line); capture stays fully offline
+  login  enroll this device with a relay (once); in a terminal it asks —
+         press Enter for the hosted pursecraft.com relay, or choose your
+         own server and type just its domain; scripts pass --server
+         <relay-url> with the enrollment secret piped on stdin (one line;
+         a bare non-terminal login uses the hosted relay); capture stays
+         fully offline
   sync   push captured ops to the relay and pull deltas back
   pair   print a join command (fresh single-use pairing codes) for
          another device
@@ -180,14 +188,19 @@ pub fn parse(args: &[String]) -> Result<Cmd, UsageError> {
         "assign" => parse_assign(rest),
         "budget" => parse_budget(rest),
         "login" => {
-            if rest.len() != 1 {
-                Err(UsageError(format!(
-                    "login takes exactly one relay url (http://host:port), got {rest:?}"
-                )))
-            } else {
+            if rest.is_empty() {
+                Ok(Cmd::Login { server: None })
+            } else if rest.len() == 2 && rest[0] == "--server" {
                 Ok(Cmd::Login {
-                    server: rest[0].clone(),
+                    server: Some(rest[1].clone()),
                 })
+            } else if rest.len() == 1 && rest[0] == "--server" {
+                Err(UsageError("--server needs a value".into()))
+            } else {
+                Err(UsageError(format!(
+                    "login takes --server <relay-url>, or no arguments (the interactive form \
+                     in a terminal, the hosted relay otherwise), got {rest:?}"
+                )))
             }
         }
         "sync" => {
@@ -499,10 +512,11 @@ mod tests {
     /// shapes and teach on the wrong ones.
     #[test]
     fn enrollment_commands_parse() {
+        assert_eq!(parse(&args(&["login"])), Ok(Cmd::Login { server: None }));
         assert_eq!(
-            parse(&args(&["login", "http://127.0.0.1:8080"])),
+            parse(&args(&["login", "--server", "http://127.0.0.1:8080"])),
             Ok(Cmd::Login {
-                server: "http://127.0.0.1:8080".into()
+                server: Some("http://127.0.0.1:8080".into())
             })
         );
         assert_eq!(parse(&args(&["sync"])), Ok(Cmd::Sync));
@@ -518,8 +532,14 @@ mod tests {
             }
         );
         for (line, want) in [
-            (args(&["login"]), "exactly one relay url"),
-            (args(&["login", "a", "b"]), "exactly one relay url"),
+            // The positional URL is gone (ADR 0030): a full URL rides
+            // --server; bare login is the form/default, never a positional.
+            (
+                args(&["login", "http://127.0.0.1:8080"]),
+                "login takes --server",
+            ),
+            (args(&["login", "a", "b"]), "login takes --server"),
+            (args(&["login", "--server"]), "--server needs a value"),
             (args(&["sync", "x"]), "sync takes no arguments"),
             (args(&["pair", "x"]), "pair takes no arguments"),
             (args(&["join", "a", "b", "c"]), "join takes"),

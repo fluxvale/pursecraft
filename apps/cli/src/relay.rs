@@ -364,6 +364,86 @@ pub fn enroll(server: &str, secret: &str) -> Result<(DeviceId, String), RelayErr
     enroll_with_agent(&default_agent(), server, secret)
 }
 
+/// A `/health` probe failure (ADR 0030): what went wrong reaching
+/// `<server>/health` before login asks for anything secret. Teaching-
+/// shaped like [`RelayError`], but its own type — the probe answers
+/// "is a relay here", not "did this call succeed", and its errors must
+/// not promise captures stay queued (login has captured nothing yet).
+#[derive(Debug)]
+pub enum ProbeError {
+    /// No HTTP conversation happened (connection refused, timeout, DNS,
+    /// TLS handshake).
+    Unreachable { server: String, detail: String },
+    /// The relay is not at this URL: any non-2xx at `/health`.
+    NotThere { server: String, status: u16 },
+    /// A 3xx — never followed (ADR 0029); the destination is named.
+    Redirect {
+        server: String,
+        status: u16,
+        location: String,
+    },
+}
+
+impl fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreachable { server, detail } => {
+                write!(f, "cannot reach the relay at {server} ({detail})")
+            }
+            Self::NotThere { server, status } => write!(
+                f,
+                "the relay at {server} answered {status} at /health — wrong domain or base path?"
+            ),
+            Self::Redirect {
+                server,
+                status: _,
+                location,
+            } => write!(
+                f,
+                "the relay at {server} redirected to {location}; pursecraft does not \
+                 follow redirects — check the relay url (the hosted relay is https://…/api)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProbeError {}
+
+/// The login health probe (ADR 0030): `GET <server>/health` — the relay's
+/// unauthenticated liveness route (ADR 0026), which touches nothing — on
+/// the same strict agent as every other call. Any 2xx passes; anything
+/// else fails enrollment before any secret is requested, naming the URL
+/// so a typo is obvious.
+pub fn probe_health(server: &str) -> Result<(), ProbeError> {
+    let response = default_agent()
+        .get(format!("{server}/health"))
+        .call()
+        .map_err(|e| ProbeError::Unreachable {
+            server: server.to_owned(),
+            detail: e.to_string(),
+        })?;
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        Ok(())
+    } else if (300..400).contains(&status) {
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("an unstated destination");
+        Err(ProbeError::Redirect {
+            server: server.to_owned(),
+            status,
+            location: location.to_owned(),
+        })
+    } else {
+        Err(ProbeError::NotThere {
+            server: server.to_owned(),
+            status,
+        })
+    }
+}
+
 /// The agent seam for enrollment, as [`Relay::with_agent`] is for the
 /// authenticated calls (ADR 0029's https test enrolls through its
 /// test-CA agent before it ever syncs).

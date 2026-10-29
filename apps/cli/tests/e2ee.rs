@@ -120,6 +120,7 @@ impl Home {
                 today: Date::new(2026, 10, 25).unwrap(),
                 stdin: stdin.to_owned(),
                 e2ee: true,
+                terminal: None,
             })
         })
     }
@@ -127,7 +128,7 @@ impl Home {
     fn login(&self, relay: &LiveRelay) -> pursecraft_cli::Output {
         self.run(
             &format!("{}\n", relay.enrollment_secret()),
-            &["login", &relay.url],
+            &["login", "--server", &relay.url],
         )
     }
 
@@ -348,11 +349,12 @@ fn a_plaintext_home_refuses_to_open_with_e2ee_on() {
                 today: Date::new(2026, 10, 25).unwrap(),
                 stdin: stdin.to_owned(),
                 e2ee: false,
+                terminal: None,
             })
         })
     };
     let secret = format!("{}\n", relay.enrollment_secret());
-    assert_eq!(plain(&secret, &["login", &relay.url]).code, 0);
+    assert_eq!(plain(&secret, &["login", "--server", &relay.url]).code, 0);
     assert_eq!(plain("", &["add", "coffee", "-4.50"]).code, 0);
 
     // The same home with E2EE on: refused, naming the escape (ADR 0028).
@@ -381,6 +383,7 @@ fn a_sealed_home_refuses_the_switch_off() {
             today: Date::new(2026, 10, 25).unwrap(),
             stdin: String::new(),
             e2ee: false,
+            terminal: None,
         })
     });
     assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);

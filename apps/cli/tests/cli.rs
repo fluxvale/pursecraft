@@ -65,6 +65,7 @@ fn run_with(home: &Path, stdin: &str, args: &[&str]) -> pursecraft_cli::Output {
             // The self-host mode (ADR 0028): these suites exercise the
             // plaintext path; the E2EE path has its own suite.
             e2ee: false,
+            terminal: None,
         })
     })
 }
@@ -150,10 +151,15 @@ fn gate_blocks_unenrolled() {
     }
     // The refusal creates nothing — no session, no identity, no stores.
     assert!(std::fs::read_dir(home).unwrap().next().is_none());
-    // And the door itself parses open (a real login runs in tests/sync.rs).
-    let login = run_args(home, &["login", "http://127.0.0.1:9"]);
+    // And the door itself teaches on a dead relay (ADR 0030: the probe
+    // runs before the secret is read, so an unreachable URL fails with
+    // the probe's naming error — a real login runs in tests/sync.rs).
+    let login = run_args(home, &["login", "--server", "http://127.0.0.1:9"]);
+    assert_eq!(login.code, 1, "{}", login.stderr);
     assert!(
-        login.stderr.contains("enrollment secret"),
+        login
+            .stderr
+            .contains("cannot reach the relay at http://127.0.0.1:9"),
         "{}",
         login.stderr
     );

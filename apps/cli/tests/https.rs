@@ -206,6 +206,7 @@ fn run_home(home: &Path, stdin: &str, args: &[&str]) -> pursecraft_cli::Output {
             today: Date::new(2026, 10, 25).unwrap(),
             stdin: stdin.to_owned(),
             e2ee: false,
+            terminal: None,
         })
     })
 }

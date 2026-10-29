@@ -1,6 +1,6 @@
 # 0030 — Interactive Login: Hosted Default and the Domain-Derivation Form
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-29
 - **Builds on:** [ADR 0014](0014-monorepo-and-fluxvale-cloud.md),
   [ADR 0015](0015-product-positioning.md),

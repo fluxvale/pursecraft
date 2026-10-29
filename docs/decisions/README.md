@@ -52,4 +52,4 @@ their replacement.
 | [0027](0027-budgeting-semantics-cli.md) | Budgeting semantics in the CLI: categories, inbox, allocation, balances | Accepted |
 | [0028](0028-e2ee-wiring-and-key-transport.md) | E2EE wiring: device keys, key records, and their transport | Accepted |
 | [0029](0029-https-relay-client.md) | HTTPS relay client: ureq/rustls and base-path server URLs | Accepted |
-| [0030](0030-interactive-login-hosted-default.md) | Interactive login: hosted default and the domain-derivation form | Proposed |
+| [0030](0030-interactive-login-hosted-default.md) | Interactive login: hosted default and the domain-derivation form | Accepted |

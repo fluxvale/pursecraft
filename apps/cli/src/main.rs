@@ -1,28 +1,36 @@
-//! The thin binary (ADRs 0023, 0025): the only reader of the process
+//! The thin binary (ADRs 0023, 0025, 0030): the only reader of the process
 //! environment and the wall clock; everything else is injected into the
-//! library. `login` alone reads stdin (the enrollment secret, one line —
-//! ADR 0025), so no other command ever blocks on an interactive terminal.
+//! library. `login` alone touches the interactive side: when stdin is a
+//! terminal it gets the form channel (choice screen, domain prompt, hidden
+//! secret via rpassword — prompts to stderr, stdout stays the answer), and
+//! when it is not, the enrollment secret is read from stdin and the hosted
+//! relay is the default server. No other command ever blocks on a
+//! terminal.
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-use pursecraft_cli::{Context, home, run};
+use pursecraft_cli::{Context, Terminal, home, run};
 use pursecraft_core::date::Date;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let reads_stdin = args.first().is_some_and(|first| first == "login");
+    let is_login = args.first().is_some_and(|first| first == "login");
+    // ADR 0030: the form exists only on a terminal; a piped stdin is the
+    // secret's channel and the hosted relay is the default server.
+    let stdin_is_tty = is_login && std::io::stdin().is_terminal();
     let out = run(&args, || {
         let home = home::data_home()?;
         Ok(Context {
             home,
             today: today_local(),
-            stdin: if reads_stdin {
+            stdin: if is_login && !stdin_is_tty {
                 read_stdin()
             } else {
                 String::new()
             },
             e2ee: e2ee_enabled(),
+            terminal: stdin_is_tty.then(|| Box::new(StdinTerminal) as Box<dyn Terminal>),
         })
     });
     // A closed pipe (e.g. `pursecraft list | head`) is a truncation, not a
@@ -38,9 +46,38 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(out.code).unwrap_or(1))
 }
 
+/// The real terminal (ADR 0030): form lines and prompts go to stderr —
+/// stdout keeps only the final answer — lines echo (nothing secret in
+/// them), and the enrollment secret is read hidden via rpassword, which
+/// prompts and reads the controlling TTY with echo off (`/dev/tty`, so a
+/// redirected stderr never eats the prompt).
+struct StdinTerminal;
+
+impl Terminal for StdinTerminal {
+    fn say(&mut self, line: &str) -> std::io::Result<()> {
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(line.as_bytes())?;
+        stderr.write_all(b"\n")?;
+        stderr.flush()
+    }
+
+    fn read_line(&mut self, prompt: &str) -> std::io::Result<String> {
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(prompt.as_bytes())?;
+        stderr.flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line)
+    }
+
+    fn read_secret(&mut self, prompt: &str) -> std::io::Result<String> {
+        rpassword::prompt_password(prompt)
+    }
+}
+
 /// The enrollment secret (ADR 0025): all of stdin, first line used. Read
-/// only for `login` — interactive users paste the secret and press
-/// Ctrl-D; scripts pipe it.
+/// only for a piped `login` — scripts pipe it; a terminal gets the hidden
+/// prompt instead (ADR 0030).
 fn read_stdin() -> String {
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
