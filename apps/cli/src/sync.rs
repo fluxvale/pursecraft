@@ -268,10 +268,10 @@ impl PairingBundle {
     pub fn render(&self) -> String {
         format!(
             "on another device:\n  \
-             pursecraft login {server}\n  \
+             {login}\n  \
              pursecraft join {org} {org_code} {budget} {budget_code}\n\
              (pairing codes work once and expire in 1 hour; fresh ones anytime: pursecraft pair)\n",
-            server = self.server,
+            login = crate::argv::login_command(&self.server),
             org = self.org_id.as_uuid(),
             org_code = self.org_code,
             budget = self.budget_id.as_uuid(),

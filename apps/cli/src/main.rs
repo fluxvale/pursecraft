@@ -24,13 +24,12 @@ fn main() -> ExitCode {
         Ok(Context {
             home,
             today: today_local(),
-            stdin: if is_login && !stdin_is_tty {
-                read_stdin()
-            } else {
-                String::new()
-            },
+            // LAZY (ADR 0030 §5, as amended): the source is called only
+            // after the fail-early probe passes — a dead relay answers
+            // before the process ever blocks on the writer's pipe.
+            piped_secret: (!stdin_is_tty).then(|| Box::new(read_stdin) as _),
             e2ee: e2ee_enabled(),
-            terminal: stdin_is_tty.then(|| Box::new(StdinTerminal) as Box<dyn Terminal>),
+            terminal: stdin_is_tty.then(|| Box::new(StdinTerminal::new()) as Box<dyn Terminal>),
         })
     });
     // A closed pipe (e.g. `pursecraft list | head`) is a truncation, not a
@@ -46,25 +45,52 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(out.code).unwrap_or(1))
 }
 
-/// The real terminal (ADR 0030): form lines and prompts go to stderr —
-/// stdout keeps only the final answer — lines echo (nothing secret in
-/// them), and the enrollment secret is read hidden via rpassword, which
-/// prompts and reads the controlling TTY with echo off (`/dev/tty`, so a
-/// redirected stderr never eats the prompt).
-struct StdinTerminal;
+/// The real terminal (ADR 0030 §3, as amended): the form lives on ONE
+/// stream — the controlling terminal (`/dev/tty`), where the hidden read
+/// happens — so a redirected stderr cannot hide the questions or split
+/// the conversation. Lines echo (nothing secret in them); the enrollment
+/// secret is read hidden via rpassword (echo off, same tty). Without a
+/// controlling terminal the lines fall back to stderr and the hidden
+/// read fails loudly on its own. Reads ride stdin — the tty the
+/// `IsTerminal` gate saw. stdout keeps only the final answer.
+struct StdinTerminal {
+    tty: Option<std::fs::File>,
+}
+
+impl StdinTerminal {
+    fn new() -> Self {
+        Self {
+            tty: std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/tty")
+                .ok(),
+        }
+    }
+
+    /// One write to the controlling terminal, falling back to stderr.
+    fn put(&self, text: &str) -> std::io::Result<()> {
+        match &self.tty {
+            Some(tty) => {
+                let mut tty = tty;
+                tty.write_all(text.as_bytes())?;
+                tty.flush()
+            }
+            None => {
+                let mut stderr = std::io::stderr().lock();
+                stderr.write_all(text.as_bytes())?;
+                stderr.flush()
+            }
+        }
+    }
+}
 
 impl Terminal for StdinTerminal {
     fn say(&mut self, line: &str) -> std::io::Result<()> {
-        let mut stderr = std::io::stderr().lock();
-        stderr.write_all(line.as_bytes())?;
-        stderr.write_all(b"\n")?;
-        stderr.flush()
+        self.put(&format!("{line}\n"))
     }
 
     fn read_line(&mut self, prompt: &str) -> std::io::Result<String> {
-        let mut stderr = std::io::stderr().lock();
-        stderr.write_all(prompt.as_bytes())?;
-        stderr.flush()?;
+        self.put(prompt)?;
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         Ok(line)

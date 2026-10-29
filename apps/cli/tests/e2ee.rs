@@ -114,11 +114,14 @@ impl Home {
 
     fn run(&self, stdin: &str, args: &[&str]) -> pursecraft_cli::Output {
         let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let text = stdin.to_owned();
+        let piped = (!stdin.is_empty())
+            .then(|| Box::new(move || text.clone()) as Box<dyn FnOnce() -> String>);
         run(&argv, || {
             Ok(Context {
                 home: self.dir.clone(),
                 today: Date::new(2026, 10, 25).unwrap(),
-                stdin: stdin.to_owned(),
+                piped_secret: piped,
                 e2ee: true,
                 terminal: None,
             })
@@ -343,11 +346,14 @@ fn a_plaintext_home_refuses_to_open_with_e2ee_on() {
     // A plaintext world (the switch off) with real data on disk.
     let plain = |stdin: &str, args: &[&str]| {
         let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let text = stdin.to_owned();
+        let piped = (!stdin.is_empty())
+            .then(|| Box::new(move || text.clone()) as Box<dyn FnOnce() -> String>);
         run(&argv, || {
             Ok(Context {
                 home: home.dir.clone(),
                 today: Date::new(2026, 10, 25).unwrap(),
-                stdin: stdin.to_owned(),
+                piped_secret: piped,
                 e2ee: false,
                 terminal: None,
             })
@@ -381,7 +387,7 @@ fn a_sealed_home_refuses_the_switch_off() {
         Ok(Context {
             home: home.dir.clone(),
             today: Date::new(2026, 10, 25).unwrap(),
-            stdin: String::new(),
+            piped_secret: None,
             e2ee: false,
             terminal: None,
         })

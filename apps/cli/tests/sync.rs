@@ -138,12 +138,25 @@ fn scratch_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// A lazy piped secret from a string — the test mirror of the real
+/// binary's `read_stdin` source (ADR 0030 §5): login calls it only after
+/// the probe passes. Empty means nothing piped (the empty-stdin teaching).
+fn piped(stdin: &str) -> Option<Box<dyn FnOnce() -> String>> {
+    if stdin.is_empty() {
+        return None;
+    }
+    let text = stdin.to_owned();
+    Some(Box::new(move || text))
+}
+
 /// The scripted terminal (ADR 0030): records every line, prompt, and
 /// secret request in one transcript, answering from a queue — tests
 /// assert the conversation (what was asked, in what order), not just the
-/// outcome.
+/// outcome. `secret_read_at` timestamps the hidden read (the probe-order
+/// test: the read must precede the probe's answer).
 struct ScriptedTerminal {
     transcript: Vec<String>,
+    secret_read_at: Option<std::time::Instant>,
     answers: std::collections::VecDeque<String>,
 }
 
@@ -151,6 +164,7 @@ impl ScriptedTerminal {
     fn new(answers: &[&str]) -> Self {
         Self {
             transcript: Vec::new(),
+            secret_read_at: None,
             answers: answers.iter().map(|a| (*a).to_owned()).collect(),
         }
     }
@@ -174,6 +188,7 @@ impl Terminal for SharedTerminal {
 
     fn read_secret(&mut self, prompt: &str) -> std::io::Result<String> {
         let mut script = self.0.borrow_mut();
+        script.secret_read_at = Some(std::time::Instant::now());
         script.transcript.push(format!("{prompt}<hidden>\n"));
         Ok(script.answers.pop_front().unwrap_or_default())
     }
@@ -206,7 +221,9 @@ impl Home {
             Ok(Context {
                 home: self.dir.clone(),
                 today: Date::new(2026, 10, 25).unwrap(),
-                stdin: stdin.to_owned(),
+                // Lazy, like the real binary's (ADR 0030 §5): the secret
+                // text is only handed over when login asks for it.
+                piped_secret: piped(stdin),
                 e2ee: self.e2ee,
                 terminal: None,
             })
@@ -214,8 +231,17 @@ impl Home {
     }
 
     /// Run `login` with a scripted terminal (ADR 0030): the form channel
-    /// plus its answers — the transcript comes back for ordering asserts.
-    fn run_form(&self, answers: &[&str], args: &[&str]) -> (pursecraft_cli::Output, Vec<String>) {
+    /// plus its answers — the transcript (and the hidden read's timestamp,
+    /// for the probe-order test) come back for asserts.
+    fn run_form(
+        &self,
+        answers: &[&str],
+        args: &[&str],
+    ) -> (
+        pursecraft_cli::Output,
+        Vec<String>,
+        Option<std::time::Instant>,
+    ) {
         let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         let script = std::rc::Rc::new(std::cell::RefCell::new(ScriptedTerminal::new(answers)));
         let terminal: Option<Box<dyn pursecraft_cli::Terminal>> =
@@ -224,13 +250,13 @@ impl Home {
             Ok(Context {
                 home: self.dir.clone(),
                 today: Date::new(2026, 10, 25).unwrap(),
-                stdin: String::new(),
+                piped_secret: None,
                 e2ee: self.e2ee,
                 terminal,
             })
         });
-        let transcript = script.borrow().transcript.clone();
-        (out, transcript)
+        let script = script.borrow();
+        (out, script.transcript.clone(), script.secret_read_at)
     }
 
     fn login(&self, relay: &LiveRelay) -> pursecraft_cli::Output {
@@ -398,7 +424,7 @@ fn the_form_enrolls_from_a_domain_and_the_transcript_orders_everything() {
         .trim_end_matches('/')
         .to_owned();
     let secret = relay.enrollment_secret();
-    let (out, transcript) = home.run_form(&["2", &domain, &secret], &["login"]);
+    let (out, transcript, _secret_at) = home.run_form(&["2", &domain, &secret], &["login"]);
 
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     let derived = format!("http://{domain}"); // loopback: http, no prefix
@@ -432,17 +458,18 @@ fn the_form_enrolls_from_a_domain_and_the_transcript_orders_everything() {
 
     // The flag on a terminal asks only the secret (the server was given).
     let second = Home::new("form-flag");
-    let (out, transcript) = second.run_form(&[&secret], &["login", "--server", &relay.url]);
+    let (out, transcript, _) = second.run_form(&[&secret], &["login", "--server", &relay.url]);
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     assert_eq!(transcript, vec!["enrollment secret: <hidden>\n"]);
     relay.stop();
 }
 
-/// ADR 0030 §5's wrong-base-path shape: a relay serving at the root,
-/// probed under a base path, answers 404 at /health — and login says
-/// exactly that, naming the URL, before any secret is consumed.
+/// ADR 0030 §5, as amended (hostile review P2c): a 404 at `/health` is
+/// REACHABLE — the route is the fleet's, not the client's contract — so
+/// the wrong-base-path URL passes the probe and dies at enrollment, where
+/// the error must still name the URL.
 #[test]
-fn a_wrong_base_path_fails_early_with_a_404_at_health() {
+fn a_wrong_base_path_passes_the_probe_and_fails_loudly_at_enrollment() {
     let mut relay = LiveRelay::start("wrong-path"); // serves at the root
     let home = Home::new("wrong-path");
     let wrong = format!("{}/api", relay.url.trim_end_matches('/'));
@@ -450,15 +477,217 @@ fn a_wrong_base_path_fails_early_with_a_404_at_health() {
     let out = home.run("the-secret\n", &["login", "--server", &wrong]);
     assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
     assert!(
+        out.stderr.contains(&format!("status 404 from {wrong}")),
+        "the enrollment error names the URL\n{}",
         out.stderr
-            .contains(&format!("the relay at {wrong} answered 404 at /health")),
-        "{}",
+    );
+    assert!(
+        !out.stderr.contains("/health"),
+        "the probe passed — the 404 is the enrollment's, not the probe's\n{}",
         out.stderr
     );
     assert!(
         session::load(home.path()).unwrap().is_none(),
-        "a failed probe enrolls nothing"
+        "a failed enrollment enrolls nothing"
     );
+    relay.stop();
+}
+
+/// Hostile review P2c's compatibility case: a `/v1`-only edge (an older
+/// image, or a proxy that allow-lists `/v1` but not `/health`) enrolls
+/// exactly as it did before the probe existed. Hand-rolled HTTP: the
+/// probe's 404, then a real-shaped enroll answer.
+#[test]
+fn a_v1_only_edge_still_enrolls() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let answer_device = uuid::Uuid::new_v4();
+    let thread = std::thread::spawn(move || {
+        let device = answer_device;
+        let body = format!("{{\"device_id\":\"{device}\",\"token\":\"tok_1\"}}");
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            let mut scratch = [0u8; 4096];
+            let _ = stream.read(&mut scratch);
+            let head = String::from_utf8_lossy(&scratch);
+            let response = if head.starts_with("GET /health") {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    let home = Home::new("v1-only");
+    let out = home.run("the-secret\n", &["login", "--server", &url]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let enrolled = home.session();
+    assert_eq!(enrolled.server, url);
+    assert_eq!(enrolled.device_id.as_uuid(), answer_device);
+    thread.join().unwrap();
+}
+
+/// Hostile review P2c: the probe is a pre-flight, not a transfer — a
+/// black-holed port (accept, never answer) must fail on the probe's own
+/// short budget, not the enrollment call's 30 s.
+#[test]
+fn the_probe_has_its_own_short_budget() {
+    use std::time::Instant;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        // Accept and park: a connection that never answers.
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut scratch = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut scratch);
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
+    let home = Home::new("probe-budget");
+    let start = Instant::now();
+    let out = home.run("s\n", &["login", "--server", &url]);
+    let elapsed = start.elapsed();
+    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("timeout"),
+        "the probe's own timeout, named\n{}",
+        out.stderr
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the probe budget is 5 s, not the enrollment's 30 s — took {elapsed:?}"
+    );
+}
+
+/// ADR 0030 §6, as amended (hostile review P2b): on a tty the hidden read
+/// happens BEFORE the probe — no network window sits between the form and
+/// the hidden read, so nothing invites typing the secret into an echoing
+/// terminal. A slow relay answers slowly; the timestamped terminal proves
+/// the secret was read first; the counting socket proves the probe ran
+/// exactly once (never cached, never retried).
+#[test]
+fn the_hidden_read_precedes_the_probe_and_the_probe_runs_once() {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (answered_tx, answered_rx) = mpsc::channel::<std::time::Instant>();
+    let health_hits = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+    let hits = health_hits.clone();
+    let device = uuid::Uuid::new_v4();
+    let thread = std::thread::spawn(move || {
+        let body = format!("{{\"device_id\":\"{device}\",\"token\":\"tok_1\"}}");
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            let mut scratch = [0u8; 4096];
+            let _ = stream.read(&mut scratch);
+            let head = String::from_utf8_lossy(&scratch);
+            if head.starts_with("GET /health") {
+                *hits.lock().unwrap() += 1;
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+                );
+                let _ = answered_tx.send(std::time::Instant::now());
+            } else {
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    });
+
+    let home = Home::new("probe-order");
+    let domain = url.trim_start_matches("http://").to_owned();
+    let (out, _transcript, secret_at) = home.run_form(&["2", &domain, "the-secret"], &["login"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let probe_answered_at = answered_rx.recv().expect("the probe ran");
+    let secret_at = secret_at.expect("the hidden read happened");
+    assert!(
+        secret_at + std::time::Duration::from_millis(1500) < probe_answered_at,
+        "the hidden read must precede the probe's answer by more than the \
+         probe's own latency margin"
+    );
+    assert_eq!(*health_hits.lock().unwrap(), 1, "the probe runs once");
+    thread.join().unwrap();
+}
+
+/// Hostile review M7+M8 (the class the suite could not see): run the REAL
+/// binary under a REAL pty and assert the two properties that live in
+/// `main`'s tty branch — the form appears at all (terminal wired, not the
+/// silent hosted-default fallback), and the typed secret never echoes
+/// (rpassword's hidden read, not an echoing line read). `script(1)`
+/// allocates the pty; the answers are fed line by line AFTER each prompt
+/// is on screen, so an echoing implementation has every chance to leak.
+#[test]
+fn the_real_binary_under_a_pty_takes_the_form_and_hides_the_secret() {
+    use std::io::Write;
+    let mut relay = LiveRelay::start("pty");
+    let home = Home::new("pty");
+    let domain = relay
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned();
+    let secret = relay.enrollment_secret();
+
+    let capture = scratch_dir("pty-capture").join("capture.log");
+    let mut child = std::process::Command::new("script")
+        .arg("-qec")
+        .arg(format!("{} login", env!("CARGO_BIN_EXE_pursecraft")))
+        .arg(&capture)
+        .env("PURSECRAFT_HOME", home.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("script(1) allocates a pty");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin piped");
+        for line in ["2\n", &format!("{domain}\n"), &format!("{secret}\n")] {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            stdin.write_all(line.as_bytes()).expect("feed the form");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    }
+    let out = child
+        .wait_with_output()
+        .expect("login under a pty finishes");
+    let screen = std::fs::read_to_string(&capture).expect("the pty capture");
+
+    // M7: the FORM ran — choice screen and derived line on the tty; only
+    // main's IsTerminal wiring can produce this under a pty.
+    assert!(
+        screen.contains("Choose [1]:"),
+        "the form appeared\n{screen}"
+    );
+    assert!(
+        screen.contains(&format!("relay url: http://{domain}")),
+        "the derived url line appeared\n{screen}"
+    );
+    // M8: the secret never echoes — anywhere in the capture.
+    assert!(
+        !screen.contains(&secret),
+        "the secret must not echo; capture:\n{screen}"
+    );
+    assert!(
+        screen.contains(&format!("enrolled with http://{domain}")),
+        "the enrollment landed\n{screen}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(home.session().server, format!("http://{domain}"));
     relay.stop();
 }
 
@@ -641,6 +870,25 @@ fn two_devices_converge_through_a_live_relay() {
         sync.stdout
     );
     let [org_id, org_code, budget_id, budget_code] = parse_join_line(&sync.stdout);
+
+    // The bundle's taught login line is exactly what `parse` accepts
+    // (hostile review P1: this is the second device's onboarding text).
+    {
+        let login_line = sync
+            .stdout
+            .lines()
+            .find(|line| line.trim_start().starts_with("pursecraft login"))
+            .expect("the bundle teaches the login command");
+        let words: Vec<String> = login_line.split_whitespace().map(str::to_owned).collect();
+        let rest: Vec<String> = words.iter().skip(1).cloned().collect();
+        assert_eq!(
+            pursecraft_cli::argv::parse(&rest),
+            Ok(pursecraft_cli::argv::Cmd::Login {
+                server: Some(relay.url.clone())
+            }),
+            "the bundle's taught {login_line:?} must parse"
+        );
+    }
 
     // Synced: the badge is gone (ADR 0011).
     let list = a.run("", &["list"]);
@@ -891,11 +1139,28 @@ fn a_refused_token_teaches_reenrollment() {
         "{}",
         sync.stderr
     );
-    assert!(
-        sync.stderr.contains("pursecraft login"),
-        "the error teaches the fix\n{}",
-        sync.stderr
-    );
+    // The error's taught command is exactly what `parse` accepts (hostile
+    // review P1: this line used to teach the deleted positional).
+    {
+        let taught_line = sync
+            .stderr
+            .lines()
+            .find(|line| line.contains("pursecraft login"))
+            .expect("the error teaches the fix");
+        let words: Vec<String> = taught_line.split_whitespace().map(str::to_owned).collect();
+        let rest: Vec<String> = words
+            .iter()
+            .skip_while(|w| *w != "login")
+            .cloned()
+            .collect();
+        assert_eq!(
+            pursecraft_cli::argv::parse(&rest),
+            Ok(pursecraft_cli::argv::Cmd::Login {
+                server: Some(relay.url.clone())
+            }),
+            "the taught {taught_line:?} must parse"
+        );
+    }
     // Local function is untouched (ADR 0025: the gate is not per-launch).
     let add = home.run("", &["add", "bread", "-2"]);
     assert_eq!(add.code, 0, "{}{}", add.stdout, add.stderr);

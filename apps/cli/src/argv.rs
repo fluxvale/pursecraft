@@ -95,6 +95,14 @@ pub const USAGE: &str = "usage: pursecraft add <payee> <amount> [--date YYYY-MM-
                         pursecraft pair\n       \
                         pursecraft join <org-id> <org-code> <budget-id> <budget-code>";
 
+/// The enrollment command for a known server (ADR 0030): ONE source for
+/// every place the CLI teaches re-enrollment against a specific relay —
+/// the token-refusal error, the pairing bundle — so the taught shape can
+/// never drift from the parsed one (hostile review's P1 class).
+pub fn login_command(server: &str) -> String {
+    format!("pursecraft login --server {server}")
+}
+
 /// The `--help` text.
 pub const HELP: &str = "\
 pursecraft — fast local-first budgeting
@@ -196,6 +204,16 @@ pub fn parse(args: &[String]) -> Result<Cmd, UsageError> {
                 })
             } else if rest.len() == 1 && rest[0] == "--server" {
                 Err(UsageError("--server needs a value".into()))
+            } else if rest.len() == 1 && rest[0].starts_with("--server=") {
+                match rest[0]
+                    .strip_prefix("--server=")
+                    .filter(|url| !url.is_empty())
+                {
+                    Some(url) => Ok(Cmd::Login {
+                        server: Some(url.to_owned()),
+                    }),
+                    None => Err(UsageError("--server needs a value".into())),
+                }
             } else {
                 Err(UsageError(format!(
                     "login takes --server <relay-url>, or no arguments (the interactive form \
@@ -519,6 +537,28 @@ mod tests {
                 server: Some("http://127.0.0.1:8080".into())
             })
         );
+        // The `=` spelling is the same flag (hostile review P3): a user
+        // who reaches for it is not refused.
+        assert_eq!(
+            parse(&args(&["login", "--server=http://127.0.0.1:8080"])),
+            Ok(Cmd::Login {
+                server: Some("http://127.0.0.1:8080".into())
+            })
+        );
+        // And the taught command itself parses (hostile review P1): every
+        // shape the CLI prints is a shape `parse` accepts.
+        for server in ["https://pursecraft.com/api", "http://127.0.0.1:8099"] {
+            let taught = login_command(server);
+            let mut words: Vec<String> = taught.split_whitespace().map(str::to_owned).collect();
+            let _program = words.remove(0); // `pursecraft` itself
+            assert_eq!(
+                parse(&words),
+                Ok(Cmd::Login {
+                    server: Some(server.into())
+                }),
+                "the taught {taught:?} must parse"
+            );
+        }
         assert_eq!(parse(&args(&["sync"])), Ok(Cmd::Sync));
         assert_eq!(parse(&args(&["pair"])), Ok(Cmd::Pair));
         let join = parse(&args(&["join", "o", "co", "b", "cb"])).unwrap();
@@ -540,6 +580,7 @@ mod tests {
             ),
             (args(&["login", "a", "b"]), "login takes --server"),
             (args(&["login", "--server"]), "--server needs a value"),
+            (args(&["login", "--server="]), "--server needs a value"),
             (args(&["sync", "x"]), "sync takes no arguments"),
             (args(&["pair", "x"]), "pair takes no arguments"),
             (args(&["join", "a", "b", "c"]), "join takes"),

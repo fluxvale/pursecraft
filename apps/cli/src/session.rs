@@ -77,12 +77,17 @@ impl From<std::io::Error> for SessionError {
     }
 }
 
-/// The gate's refusal (ADR 0025): one teaching block, exit 1. Every data
-/// command — `list` included — answers with this until `session.json`
-/// exists.
+/// The gate's refusal (ADR 0025; the taught command reshaped by ADR 0030):
+/// one teaching block, exit 1. Every data command — `list` included —
+/// answers with this until `session.json` exists. The taught command is
+/// the front door — bare `login` (the form in a terminal, the hosted
+/// relay otherwise) — and the exact same string `argv::parse` accepts.
 pub const GATE_MESSAGE: &str = "this pursecraft is not enrolled yet\n\
      \nenroll once — capture stays fully offline afterwards:\n\
-     \n  pursecraft login <relay-url>\n\
+     \n  pursecraft login\n\
+     \nin a terminal it asks (Enter for the hosted pursecraft.com relay, or\n\
+     your own server's domain); without one it enrolls with the hosted\n\
+     relay — a specific server: pursecraft login --server <relay-url>\n\
      \nthe enrollment secret is in the relay's data directory (enrollment.secret)";
 
 /// The session file path under `home`.

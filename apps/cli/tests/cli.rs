@@ -57,11 +57,14 @@ fn enroll(home: &Path) {
 
 fn run_with(home: &Path, stdin: &str, args: &[&str]) -> pursecraft_cli::Output {
     let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let text = stdin.to_owned();
+    let piped =
+        (!stdin.is_empty()).then(|| Box::new(move || text.clone()) as Box<dyn FnOnce() -> String>);
     run(&argv, || {
         Ok(pursecraft_cli::Context {
             home: home.to_owned(),
             today: Date::new(2026, 10, 25).unwrap(),
-            stdin: stdin.to_owned(),
+            piped_secret: piped,
             // The self-host mode (ADR 0028): these suites exercise the
             // plaintext path; the E2EE path has its own suite.
             e2ee: false,
@@ -151,6 +154,24 @@ fn gate_blocks_unenrolled() {
     }
     // The refusal creates nothing — no session, no identity, no stores.
     assert!(std::fs::read_dir(home).unwrap().next().is_none());
+    // The gate's taught command is exactly what `parse` accepts (hostile
+    // review's P1 class): the gate is the first thing a new user reads,
+    // and its instruction must never exit 2.
+    {
+        let taught = run_args(home, &["list"]);
+        let login_line = taught
+            .stderr
+            .lines()
+            .find(|line| line.trim_start().starts_with("pursecraft login"))
+            .expect("the gate teaches a login command");
+        let words: Vec<String> = login_line.split_whitespace().map(str::to_owned).collect();
+        let rest: Vec<String> = words.iter().skip(1).cloned().collect();
+        assert_eq!(
+            pursecraft_cli::argv::parse(&rest),
+            Ok(pursecraft_cli::argv::Cmd::Login { server: None }),
+            "the gate's taught {login_line:?} must parse as the bare login"
+        );
+    }
     // And the door itself teaches on a dead relay (ADR 0030: the probe
     // runs before the secret is read, so an unreachable URL fails with
     // the probe's naming error — a real login runs in tests/sync.rs).

@@ -45,7 +45,8 @@ pursecraft login --server <url>  # non-interactive: the full relay URL, explicit
   a usage error (exit 2) naming the two accepted shapes.
 - **`--server` takes the full URL** — `https://pursecraft.com/api`,
   `http://127.0.0.1:8099` — validated by `normalize_server` exactly as
-  today. No derivation applies to the flag: explicit configuration is an
+  today; the `--server=<url>` spelling is the same flag. No derivation
+  applies to the flag: explicit configuration is an
   explicit URL, and scripts/tests (which know their URL) keep byte-identical
   behavior modulo the flag spelling.
 - **Bare `login` with no terminal defaults to the hosted relay** — the same
@@ -93,7 +94,11 @@ Choose [1]:
 - **Both screens show the final URL before anything secret is requested** —
   the choice line carries the constant, and the domain screen answers with
   `relay url: https://example.com/api` — so the endpoint is never a
-  surprise. Prompts go to stderr; stdout keeps only the final
+  surprise. **The form lives on one stream**: prompts and form lines go to
+  the controlling terminal (`/dev/tty`, with a stderr fallback when there
+  is none) — the same place the hidden read happens — so a redirected
+  stderr (`2>/dev/null`, a logging harness) can neither hide the questions
+  nor split the conversation; stdout keeps only the final
   `enrolled with <server> — capture is unlocked` line.
 - **One shot, no loops.** Empty or unrecognized input is a teaching error
   (exit 1), not a re-prompt cycle: the same loud-on-ambiguity posture as
@@ -124,8 +129,10 @@ Applies only to the form's domain input — one line, trimmed:
 No silent downgrades: `http` is only ever *derived* for loopback, where no
 TLS exists to downgrade from; every other host derives `https`. A
 plain-http LAN relay (`192.168.1.10:8099`) therefore derives
-`https://…/api`, whose probe fails with a teaching error that says a
-plain-http self-hosted relay must be typed with its full URL — loud and
+`https://…/api`, whose probe fails as unreachable naming the URL, and the
+form path's teaching says it plainly: `— derived from domain
+"192.168.1.10:8099"; check the domain (the hosted relay is
+pursecraft.com; plain-http relays are typed as their full url)`. Loud and
 deliberate, never guessed.
 
 **Classification is not validation.** The derivation inspects the input
@@ -141,49 +148,82 @@ fallback path, no web-app root: the (future) web app derives its own root
 from the domain independently; inventing a discovery protocol here would be
 scope the steer never asked for.
 
-### 5. Fail-early: probe before any secret
+### 5. Fail-early: the reachability probe
 
 After the server string is resolved — constant, flag, or form — and
-normalized, and **before any secret is requested or read**:
+normalized:
 
 ```text
 GET <server>/health     (the relay's unauthenticated liveness route, ADR 0026)
 ```
 
-through the same strict agent as every other call ([ADR 0029]: no proxy
-lookup, no followed redirects, 30 s cap). **Any 2xx passes**; anything else
-fails enrollment immediately with an error that **names the final URL** (and,
-on the form path, the domain it came from), so a typo is obvious:
+on the same strict chain as every other call ([ADR 0029]: no proxy lookup,
+no followed redirects) but with **its own 5 s budget** — a pre-flight, not
+a transfer: a typo'd or black-holed URL must not cost the enrollment
+call's 30 s before it says so. The probe runs **exactly once per
+invocation and its result is never reused** — enrollment always makes its
+own round-trip.
 
-- unreachable — `cannot reach https://pursecraf.com/api (…); derived from
-  domain "pursecraf.com" — check the domain (the hosted relay is
-  pursecraft.com)`;
-- a non-2xx status — `the relay at https://host/api answered 404 at
-  /health — wrong domain or base path?` (a wrong prefix looks exactly like
-  this);
-- a 3xx — [ADR 0029]'s redirect arm, which names the destination and says
-  redirects are never followed (a plain-`http` probe of the fleet's edge
-  earns the bodiless 308 this catches).
+**Reachability is the question, not the route.** `/health` is the fleet's
+probe route ([ADR 0026]), not part of the client's v1 contract, so it is
+not a hard requirement: **2xx, 404, and 405 all pass** — a `/v1`-only edge
+(an older image, or a proxy that allow-lists `/v1` but not `/health`)
+enrolls exactly as it did before this probe existed. What fails
+enrollment immediately, naming the final URL (and, on the form path, the
+domain it came from), is:
 
-The probe runs on **every** path, `--server` included: `login` is already
-inherently online (enrollment is a network call), so the probe adds no new
-failure mode — it moves the typo diagnosis ahead of the secret and costs
-one GET on a path that already round-trips.
+- **transport failure** (refused, DNS, TLS, timeout) — `cannot reach the
+  relay at http://127.0.0.1:9999 (io: Connection refused (os error 111)) —
+  derived from domain "127.0.0.1:9999"; check the domain (the hosted relay
+  is pursecraft.com)` — the dead-URL/typo case the probe exists for, the
+  one case where fail-early saves a secret from a wrong destination;
+- **a 3xx** — [ADR 0029]'s redirect arm, which names the destination and
+  says redirects are never followed (a plain-`http` probe of the fleet's
+  edge earns the bodiless 308 this catches);
+- **another answered status** (5xx, odd 4xx) — `the edge at
+  <server> answered 503 at /health — something is listening there, but no
+  healthy relay`.
 
-### 6. The enrollment secret: hidden prompt on a tty, first line of stdin otherwise
+A URL that passes the probe on a 404 and is wrong anyway (the
+wrong-base-path shape) dies at enrollment with the URL named:
+`the relay answered strangely: status 404 from <server> without a relay
+error body`.
+
+**Ordering, per path** (amended after hostile review — the honest
+guarantee, not the aspirational one):
+
+- **piped:** the probe runs before the secret's source is even *called* —
+  stdin is a lazy read, so a dead relay answers before the process ever
+  blocks on the writer's pipe, and an invalid `--server` value fails at
+  validation without reading a byte.
+- **tty:** the hidden secret read happens *before* the probe (§6), and
+  the invariant across both paths is: **the probe precedes the secret's
+  first network use** — nothing secret is sent anywhere until the relay
+  answered `/health`.
+
+### 6. The enrollment secret: hidden prompt on a tty, lazily-read pipe otherwise
 
 - **tty (either path — form or `--server`): a hidden-input prompt**
-  (`enrollment secret:`) via `rpassword` 7.5 — typed characters are not
-  echoed to the terminal or scrollback. Recommended over stdin-only: the
-  form exists for humans, and the current to-EOF stdin read echoes a typed
-  secret in cleartext — the exact leak an interactive login should close.
+  (`enrollment secret:`) via `rpassword` 7.5, which prompts and reads the
+  controlling terminal (`/dev/tty`) with echo off. The hidden read is
+  deliberately placed **immediately after the form's last question —
+  before the probe** — so no network window sits between the domain
+  answer and the hidden read: there is nothing to wait through, so
+  nothing invites typing or pasting the secret into an echoing terminal.
+  The honest scope of the property: characters are hidden from the moment
+  the hidden prompt appears; anything typed *before* it (into an earlier,
+  echoing prompt) was echoed by the terminal at arrival, and no ordering
+  can retroactively hide it — the form's structure is the defense. The
+  secret is held in the process only until the probe passes and is only
+  ever SENT after it does; a failed probe discards it unread-to-network.
   Supply chain: `rpassword` is Apache-2.0 (already in deny.toml's allow
   list) and adds exactly two compiled packages on unix (`rpassword`,
-  `rtoolbox`; `libc` already ships via ring) — `cargo deny` gates must stay
-  green, and if one surprises, the documented fallback is stdin-only, not a
-  hand-rolled termios.
-- **non-tty: unchanged** — the secret is the first line of piped stdin,
-  exactly ADR 0025's behavior; `--server` scripts and the whole existing
+  `rtoolbox`; `libc` already ships via ring) — `cargo deny` gates must
+  stay green, and if one surprises, the documented fallback is stdin-only,
+  not a hand-rolled termios.
+- **non-tty: unchanged contract, lazy read** — the secret is the first
+  line of piped stdin, exactly ADR 0025's behavior, but the read happens
+  only after the probe passes (§5). `--server` scripts and the existing
   test suite keep their contract. Empty piped stdin keeps today's teaching
   error (after the probe, per §5's ordering).
 
@@ -211,14 +251,26 @@ handle.
    bare `login` without a handle → hosted enrollment from piped stdin;
    `--server` + piped stdin → byte-identical today-behavior; `--server` +
    handle → hidden prompt; positional `login <url>` → exit 2 teaching.
-4. **Health-probe paths**: dead port (error names URL + domain), a relay
-   serving at root probed under `/api` (404 teaching), and the existing
-   bodiless-308 raw-socket test — which now exercises the probe, message
-   unchanged.
-5. **Ordering**: an unreachable server plus a scripted terminal asserts the
-   secret prompt is never reached (probe fails first) — the fail-early
-   contract as a behavioral test, not a code-reading claim.
-6. **Live acceptance** (merge gate): the interactive form against
+4. **Probe paths and budget**: dead port (error names URL + domain); a
+   `/v1`-only edge (404 at `/health`, real enroll answer) still enrolls;
+   the wrong-base-path URL passes the probe and dies at enrollment with
+   the URL named; a black-holed port fails on the probe's own short
+   budget (elapsed « 30 s); the existing bodiless-308 raw-socket test —
+   which now exercises the probe, message unchanged.
+5. **Ordering, per path** (amended §5): the piped source is provably
+   never called on probe failure or invalid-`--server` (a recording
+   closure); a timestamped scripted terminal plus a slow `/health` socket
+   proves the hidden read precedes the probe's answer on the tty path and
+   the probe runs exactly once.
+6. **The real binary under a real pty** (`script(1)`, the suite's
+   `CARGO_BIN_EXE` harness): bare `login` shows the form (the tty branch
+   is wired, not silently the hosted default) and the typed secret never
+   appears in the capture (the hidden read is not an echoing one).
+7. **Taught commands parse** (the P1 class): the gate's line, the 401
+   re-enroll line, and the pairing bundle's login line are extracted from
+   real output and fed to `argv::parse` — a teaching that exits 2 can
+   never ship again.
+8. **Live acceptance** (merge gate): the interactive form against
    `https://pursecraft.com/api` — domain path exercised per the issue,
    transcript with the enrollment secret redacted.
 

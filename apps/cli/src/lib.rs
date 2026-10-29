@@ -41,16 +41,19 @@ pub trait Terminal {
 }
 
 /// What the environment supplies a command (ADR 0023; grown by ADR 0025 and
-/// ADR 0028): the data home, the local civil date captures default to, stdin —
-/// `login`'s enrollment secret when it is piped (read by `main` only for
-/// `login` without a terminal; every other command sees an empty string) —
-/// the self-host E2EE switch, and the interactive terminal when stdin is a
-/// tty (ADR 0030). Injected so tests (and any embedder) never touch the
-/// process environment.
+/// ADR 0028): the data home, the local civil date captures default to, the
+/// piped enrollment secret — read LAZILY, only after the fail-early probe
+/// passes (ADR 0030 §5: a dead relay answers before the process ever
+/// blocks on the writer's pipe) — the self-host E2EE switch, and the
+/// interactive terminal when stdin is a tty (ADR 0030). Injected so tests
+/// (and any embedder) never touch the process environment.
 pub struct Context {
     pub home: PathBuf,
     pub today: Date,
-    pub stdin: String,
+    /// The piped secret's source, called once, after the probe (ADR 0030
+    /// §5). `None` when there is nothing to read — the empty-stdin
+    /// teaching is the same.
+    pub piped_secret: Option<Box<dyn FnOnce() -> String>>,
     /// `false` only when `PURSECRAFT_E2EE=off` (ADR 0028): plaintext payloads,
     /// the no-E2EE self-host mode ADR 0009 allows.
     pub e2ee: bool,
@@ -108,7 +111,12 @@ pub fn run(args: &[String], ctx: impl FnOnce() -> Result<Context, home::NoHomeEr
         Ok(argv::Cmd::Version) => Output::ok(format!("pursecraft {}\n", env!("CARGO_PKG_VERSION"))),
         Ok(argv::Cmd::Login { server }) => match ctx() {
             Ok(mut ctx) => {
-                match login(&ctx.home, server.as_deref(), &ctx.stdin, &mut ctx.terminal) {
+                match login(
+                    &ctx.home,
+                    server.as_deref(),
+                    &mut ctx.piped_secret,
+                    &mut ctx.terminal,
+                ) {
                     Ok(line) => Output::ok(line),
                     Err(e) => Output::fail(format!("error: {e}\n")),
                 }
@@ -382,27 +390,47 @@ fn is_loopback(host: &str) -> bool {
 
 /// Enroll this device (ADR 0025; the surface reshaped by ADR 0030).
 /// Resolve the server — the `--server` flag wins, no terminal defaults to
-/// the hosted relay, a terminal gets the choice form — then fail early:
-/// the relay must answer `/health` BEFORE any secret is requested or
-/// read. With the relay proven reachable, present the operator's secret
-/// (hidden prompt on a terminal, first piped line otherwise) and publish
-/// the session. The secret and the returned token never appear in the
-/// output.
+/// the hosted relay, a terminal gets the choice form — then the probe and
+/// the secret, ordered per path (ADR 0030 §5–§6, as amended):
+///
+/// - **tty:** the hidden secret read happens BEFORE the probe — nothing
+///   network-shaped sits between the form and the hidden read, so there is
+///   no waiting window that invites typing the secret into an echoing
+///   terminal. The secret is held in the process and only ever SENT after
+///   the probe passes; a failed probe discards it unread-to-network.
+/// - **piped:** the probe runs before the secret's source is even called —
+///   a dead relay answers before the process blocks on the writer's pipe.
+///
+/// With the relay proven reachable, enroll and publish the session. The
+/// secret and the returned token never appear in the output.
 fn login(
     home: &Path,
     server_arg: Option<&str>,
-    stdin: &str,
+    piped_secret: &mut Option<Box<dyn FnOnce() -> String>>,
     terminal: &mut Option<Box<dyn Terminal>>,
 ) -> Result<String, LoginError> {
     let (server, typed_domain) = resolve_server(server_arg, terminal)?;
+    let tty_secret = match terminal.as_mut() {
+        Some(term) => Some(
+            term.read_secret("enrollment secret: ")
+                .map_err(LoginError::Io)?
+                .trim()
+                .to_owned(),
+        ),
+        None => None,
+    };
     relay::probe_health(&server).map_err(|e| LoginError::Probe(e, typed_domain))?;
-    let secret = match terminal.as_mut() {
-        Some(term) => term
-            .read_secret("enrollment secret: ")
-            .map_err(LoginError::Io)?
+    let secret = match tty_secret {
+        Some(secret) => secret,
+        None => piped_secret
+            .take()
+            .map(|read| read())
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or("")
             .trim()
             .to_owned(),
-        None => stdin.lines().next().unwrap_or("").trim().to_owned(),
     };
     if secret.is_empty() {
         return Err(LoginError::NoSecret);
@@ -585,7 +613,7 @@ impl std::fmt::Display for LoginError {
             Self::Probe(e, Some(domain)) => write!(
                 f,
                 "{e} — derived from domain \"{domain}\"; check the domain (the hosted \
-                 relay is pursecraft.com)"
+                 relay is pursecraft.com; plain-http relays are typed as their full url)"
             ),
             Self::Probe(e, None) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "cannot read the terminal: {e}"),
@@ -954,23 +982,74 @@ mod tests {
         assert!(resolve_server(Some("no-scheme"), &mut none).is_err());
     }
 
-    /// ADR 0030 §5, as behavior: a failed probe names the derived URL and
-    /// the typed domain — and the secret is never asked for.
+    /// ADR 0030 §5, as amended, as behavior: a failed probe names the
+    /// derived URL and the typed domain, never SENDS the tty-secret, and
+    /// never even CALLS the piped source — the probe precedes both the
+    /// secret's first network use and its lazy read.
     #[test]
-    fn a_failed_probe_names_the_url_and_never_asks_for_the_secret() {
-        let (mut terminal, script) = form(&["2", "127.0.0.1:9"]);
+    fn a_failed_probe_names_the_url_uses_no_secret_and_reads_no_pipe() {
+        // tty path: the hidden read happens (before the probe, by design),
+        // the probe fails, nothing is sent — the enrollment secret never
+        // reaches a network call.
+        let (mut terminal, _script) = form(&["2", "127.0.0.1:9", "a-secret"]);
         let home = testsupport::TempDir::new("probe-order");
-        let err = login(home.path(), None, "a-secret\n", &mut terminal)
+        let mut piped: Option<Box<dyn FnOnce() -> String>> = None;
+        let err = login(home.path(), None, &mut piped, &mut terminal)
             .unwrap_err()
             .to_string();
         assert!(err.contains("http://127.0.0.1:9"), "{err}");
         assert!(err.contains("derived from domain \"127.0.0.1:9\""), "{err}");
-        let transcript = script.borrow().transcript.clone();
         assert!(
-            !transcript
-                .iter()
-                .any(|line| line.contains("enrollment secret")),
-            "the secret was never asked for: {transcript:?}"
+            session::load(home.path()).unwrap().is_none(),
+            "nothing enrolled, nothing stored"
+        );
+
+        // piped path: the source is never called — the probe fails first.
+        let called = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = called.clone();
+        let mut piped: Option<Box<dyn FnOnce() -> String>> = Some(Box::new(move || {
+            flag.set(true);
+            "a-secret".to_owned()
+        }));
+        let mut none: Option<Box<dyn Terminal>> = None;
+        let err = login(
+            home.path(),
+            Some("http://127.0.0.1:9"),
+            &mut piped,
+            &mut none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cannot reach the relay at http://127.0.0.1:9"),
+            "{err}"
+        );
+        assert!(!called.get(), "the piped secret's source was never called");
+    }
+
+    /// ADR 0030 §5's last edge (hostile review P2a): an invalid `--server`
+    /// value fails at validation — before the pipe is ever read; the
+    /// panicking source fails the test if anything touches it early.
+    #[test]
+    fn an_invalid_server_never_reads_the_piped_secret() {
+        let args: Vec<String> = ["login", "--server", "no-scheme"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = run(&args, || {
+            Ok(Context {
+                home: testsupport::TempDir::new("usage-order").path().to_owned(),
+                today: Date::new(2026, 10, 29).unwrap(),
+                piped_secret: Some(Box::new(|| panic!("a usage error must not read the pipe"))),
+                e2ee: true,
+                terminal: None,
+            })
+        });
+        assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+        assert!(
+            out.stderr.contains("must look like"),
+            "the normalize teaching, never a read\n{}",
+            out.stderr
         );
     }
 }
